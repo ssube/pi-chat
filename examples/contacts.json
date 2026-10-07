@@ -1,0 +1,6 @@
+{
+  "peer": {
+    "room_id": "!conversation:example.invalid",
+    "user_id": "@peer:example.invalid"
+  }
+}

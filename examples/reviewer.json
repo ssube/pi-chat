@@ -1,0 +1,12 @@
+{
+  "base_url": "https://git.example.invalid",
+  "reviewer": "example_reviewer",
+  "token_env": "REVIEW_TOKEN",
+  "repositories": {"team/project": "/path/to/trusted/project"},
+  "state_dir": "/path/to/private/reviews",
+  "pi_executable": "/path/to/bin/pi",
+  "pi_agent_dir": "/path/to/private/pi",
+  "provider": "configured-provider",
+  "model": "configured-model",
+  "pi_pass_env": []
+}

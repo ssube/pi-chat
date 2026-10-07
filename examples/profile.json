@@ -1,0 +1,17 @@
+{
+  "agent": "example_agent",
+  "work_dir": "/path/to/work",
+  "state_dir": "/path/to/private/state",
+  "pi_executable": "/path/to/bin/pi",
+  "pi_agent_dir": "/path/to/private/pi",
+  "provider": "configured-provider",
+  "model": "configured-model",
+  "pi_pass_env": [],
+  "matrix": {
+    "homeserver": "https://matrix.example.invalid",
+    "user_id": "@example_agent:example.invalid",
+    "token_env": "MATRIX_TOKEN",
+    "rooms": ["!conversation:example.invalid"],
+    "wake_on_any_room_ids": []
+  }
+}

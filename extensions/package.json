@@ -1,0 +1,10 @@
+{
+  "private": true,
+  "dependencies": {
+    "typebox": "^1.3.27",
+    "undici": "^7.30.0"
+  },
+  "devDependencies": {
+    "jiti": "^2.7.0"
+  }
+}

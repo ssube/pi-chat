@@ -1,0 +1,9 @@
+{
+  "base_url": "https://git.example.invalid",
+  "reviewer": "example_reviewer",
+  "token_env": "REVIEW_TOKEN",
+  "repositories": ["team/project"],
+  "command": ["/path/to/review-command"],
+  "work_dir": "/path/to/trusted/reviewer",
+  "pass_env": ["REVIEW_TOKEN"]
+}
