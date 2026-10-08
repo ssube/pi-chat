@@ -19,7 +19,7 @@ sequenceDiagram
   D->>D: Create private inbox socket and session secret
   D->>S: Send a room message
   S->>B: acquire(room, sender, inbox, secret)
-  B->>B: Reject active room/thread work; checkpoint idle scopes
+  B->>B: Reject active room/thread work<br/>Checkpoint idle scopes
   B-->>S: Lease acquired (180 seconds)
   S->>M: Post with structured recipient mention
   M->>B: Mobile follow-up or peer reply
