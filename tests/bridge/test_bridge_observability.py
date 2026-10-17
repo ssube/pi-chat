@@ -117,6 +117,9 @@ class BridgeFailureRuntimeTests(unittest.IsolatedAsyncioTestCase):
                         return PiRunResult("Ask @absent-agent about it.")
                     raise PiRpcError("private provider context")
 
+                async def stop(self):
+                    pass
+
             async def send(key, kind, text, request_id):
                 if kind == "final":
                     raise ReplyRejected("@absent-agent is not in this room. People here: Operator.")
@@ -206,17 +209,15 @@ class BridgeFailureRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
             class RecoveringClient:
                 active = False
-
-                def __init__(self):
-                    self.prompts = 0
+                prompts = 0
 
                 async def prompt(self, message, on_event, images=None, *, on_accepted=None):
-                    self.prompts += 1
+                    type(self).prompts += 1
                     if on_accepted:
                         await on_accepted()
                     if self.prompts == 1:
                         raise PiRpcError("process exited unexpectedly")
-                    return PiRunResult("recovered without restart")
+                    return PiRunResult("recovered after restart")
 
                 async def stop(self):
                     pass
@@ -247,7 +248,7 @@ class BridgeFailureRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("PiRpcError", error_text)
             self.assertIn("Support ID:", error_text)
             final_text = next(text for kind, text, _ in outputs if kind == "final")
-            self.assertEqual(final_text, "recovered without restart")
+            self.assertEqual(final_text, "recovered after restart")
 
     async def test_provider_500_record_includes_status_and_support_id(self):
         with tempfile.TemporaryDirectory() as directory:

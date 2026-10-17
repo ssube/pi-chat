@@ -50,38 +50,12 @@ def room_lease(operation: str, room_id: str, sender: str) -> bool:
         with connection.makefile("rb") as stream:
             reply = json.loads(stream.readline())
     if reply.get("ok") is not True:
-        raise RuntimeError("interactive room lease refused; Matrix message not sent")
+        raise RuntimeError("interactive room lease refused; wait for the current session or active work to finish; Matrix message not sent")
     return reply.get("created") is True
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    route = parser.add_mutually_exclusive_group(required=True)
-    route.add_argument("--room-id")
-    route.add_argument("--contact", help="name from the private contact mapping")
-    parser.add_argument("--to", help="recipient's full Matrix user ID with --room-id")
-    parser.add_argument("--contacts-file", type=Path,
-                        default=Path.home() / ".config/pi-chat/contacts.json")
-    parser.add_argument("--message-file", type=Path)
-    parser.add_argument("--profile-file", type=Path, required=True)
-    parser.add_argument("--check", action="store_true", help="verify access without sending")
-    args = parser.parse_args()
-    if args.contact:
-        if args.to:
-            parser.error("--to cannot be combined with --contact")
-        room_id, recipient = contact_route(args.contacts_file, args.contact)
-    else:
-        if not args.to:
-            parser.error("--to is required with --room-id")
-        room_id, recipient = args.room_id, args.to
-    if not room_id.startswith("!") or ":" not in room_id:
-        parser.error("--room-id must be a full Matrix room ID")
-    if not recipient.startswith("@") or ":" not in recipient:
-        parser.error("--to must be a full Matrix user ID")
-    if not args.check and args.message_file is None:
-        parser.error("--message-file is required unless --check is set")
-
-    settings = private_json(args.profile_file).get("matrix")
+def verified_room(profile_file: Path, room_id: str, recipient: str | None) -> MatrixClient:
+    settings = private_json(profile_file).get("matrix")
     if not isinstance(settings, dict):
         raise RuntimeError("profile has no Matrix settings")
     url, user = settings.get("homeserver"), settings.get("user_id")
@@ -101,17 +75,12 @@ def main() -> int:
         raise RuntimeError("Matrix token does not match the configured sender")
     room = own
     members = room.joined_members()
-    if own.user_id not in members or recipient not in members:
+    if own.user_id not in members or recipient is not None and recipient not in members:
         raise RuntimeError("sender or recipient is not joined to this connector room")
-    if args.check:
-        print(f"ready sender={own.user_id} recipient={recipient}")
-        return 0
+    return room
 
-    message = args.message_file.read_text(encoding="utf-8").strip()
-    if not message or len(message) > 8000:
-        parser.error("message must be nonempty and at most 8000 characters")
-    if not message.startswith(recipient):
-        message = f"{recipient} {message}"
+
+def guarded_write(room: MatrixClient, write):
     expected_socket = os.environ.get("AGENT_BRIDGE_ROOM_LEASE_SOCKET")
     lease_fields = ("PI_ROOM_LEASE_INBOX", "PI_ROOM_LEASE_BRIDGE_SOCKET", "PI_ROOM_LEASE_SECRET")
     interactive = any(name in os.environ for name in lease_fields)
@@ -119,9 +88,9 @@ def main() -> int:
             expected_socket and (not interactive or
                                  os.environ.get("PI_ROOM_LEASE_BRIDGE_SOCKET") != expected_socket)):
         raise RuntimeError("configured interactive Pi room lease extension unavailable; Matrix message not sent")
-    created = room_lease("acquire", room_id, own.user_id) if interactive else False
+    created = room_lease("acquire", room.room_id, room.user_id) if interactive else False
     try:
-        event_id = room.send(message, recipient)
+        event_id = write()
     except MatrixError as error:
         # A transport failure may follow a successful Matrix PUT. Keep the
         # lease until timeout rather than route a real reply to bridge Pi.
@@ -129,10 +98,53 @@ def main() -> int:
                 "Matrix HTTP 400", "Matrix HTTP 401", "Matrix HTTP 403",
                 "Matrix HTTP 404")):
             try:
-                room_lease("release", room_id, own.user_id)
+                room_lease("release", room.room_id, room.user_id)
             except (OSError, ValueError, RuntimeError):
                 pass  # The bridge expires a stale lease automatically.
         raise
+    return event_id
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    route = parser.add_mutually_exclusive_group(required=True)
+    route.add_argument("--room-id")
+    route.add_argument("--contact", help="name from the private contact mapping")
+    parser.add_argument("--to", help="recipient's full Matrix user ID with --room-id")
+    parser.add_argument("--contacts-file", type=Path,
+                        default=Path.home() / ".config/pi-chat/contacts.json")
+    parser.add_argument("--message-file", type=Path)
+    parser.add_argument("--profile-file", type=Path, required=True)
+    parser.add_argument("--general", action="store_true", help="allow an enabled room without a recipient")
+    parser.add_argument("--check", action="store_true", help="verify access without sending")
+    args = parser.parse_args(argv)
+    if args.contact:
+        if args.to:
+            parser.error("--to cannot be combined with --contact")
+        room_id, recipient = contact_route(args.contacts_file, args.contact)
+    else:
+        if not args.to and not args.general:
+            parser.error("--to is required with --room-id")
+        room_id, recipient = args.room_id, args.to
+    if not room_id.startswith("!") or ":" not in room_id:
+        parser.error("--room-id must be a full Matrix room ID")
+    if recipient is not None and (not recipient.startswith("@") or ":" not in recipient):
+        parser.error("--to must be a full Matrix user ID")
+    if not args.check and args.message_file is None:
+        parser.error("--message-file is required unless --check is set")
+
+    room = verified_room(args.profile_file, room_id, recipient)
+    own = room
+    if args.check:
+        print(f"ready sender={own.user_id} recipient={recipient}")
+        return 0
+
+    message = args.message_file.read_text(encoding="utf-8").strip()
+    if not message or len(message) > 8000:
+        parser.error("message must be nonempty and at most 8000 characters")
+    if recipient and not message.startswith(recipient):
+        message = f"{recipient} {message}"
+    event_id = guarded_write(room, lambda: room.send(message, recipient))
     print(f"sent event={event_id}")
     return 0
 

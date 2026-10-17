@@ -290,7 +290,7 @@ class MatrixOutputTests(unittest.IsolatedAsyncioTestCase):
             runtime = matrix_runtime()
             adapter = matrix_adapter(directory, runtime)
             adapter._request = AsyncMock(side_effect=[{"event_id": "$ack-9"},
-                                                      {"event_id": "$final-9"}])
+                                                      {"event_id": "$final-9"}, {}])
             key = matrix_key()
             adapter._requesters[(key, "$e9")] = OPERATOR
             await adapter.output(key, "ack", "Working…", "$e9")
@@ -299,7 +299,8 @@ class MatrixOutputTests(unittest.IsolatedAsyncioTestCase):
             await adapter.output(key, "final", "Done, all set.", "$e9")
             self.assertNotIn((key, "$e9"), adapter._acks)
             self.assertNotIn((key, "$e9"), adapter._requesters)
-            final_put = adapter._request.await_args_list[-1]
+            final_put = adapter._request.await_args_list[-2]
+            self.assertIn("/redact/", adapter._request.await_args_list[-1].args[1])
             content = final_put.kwargs["data"]
             self.assertEqual(content["m.mentions"]["user_ids"], [OPERATOR])
             self.assertFalse(content["m.mentions"]["room"])
@@ -325,6 +326,28 @@ class MatrixOutputTests(unittest.IsolatedAsyncioTestCase):
                              "org.matrix.custom.html")
             self.assertIn("<code>Read</code>", content["m.new_content"]["formatted_body"])
 
+    async def test_ambient_cleanup_preserves_active_matrix_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = matrix_adapter(directory, matrix_runtime())
+            adapter._request = AsyncMock(return_value={"event_id": "$out"})
+            key = matrix_key()
+            adapter._acks[(key, "$direct")] = "$card"
+            adapter._requesters[(key, "$direct")] = OPERATOR
+            adapter._requesters[(key, "$ambient")] = OPERATOR
+            await adapter.output(key, "cleanup_request", "", "$ambient")
+            self.assertEqual(adapter._acks[(key, "$direct")], "$card")
+            adapter._request.assert_not_awaited()
+            await adapter.output(key, "progress", "Using `Read`…", "$direct")
+            self.assertEqual(adapter._request.await_args.kwargs["data"]["m.relates_to"]["event_id"],
+                             "$card")
+            adapter._acks[(key, "$failed-image")] = "$failed-card"
+            await adapter.output(key, "request_error", "Could not read image", "$failed-image")
+            self.assertNotIn((key, "$failed-image"), adapter._acks)
+            self.assertEqual(adapter._acks[(key, "$direct")], "$card")
+            await adapter.output(key, "final", "Done", "$direct")
+            self.assertEqual(adapter._request.await_args_list[-2].kwargs["data"]["body"], "Done")
+            self.assertIn("/redact/", adapter._request.await_args_list[-1].args[1])
+
     async def test_steered_output_drops_the_pending_requester(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = matrix_runtime()
@@ -332,8 +355,18 @@ class MatrixOutputTests(unittest.IsolatedAsyncioTestCase):
             adapter._request = AsyncMock(return_value={"event_id": "$steered-1"})
             key = matrix_key()
             adapter._requesters[(key, "$s")] = OPERATOR
+            adapter._acks[(key, "$old")] = "$old-card"
             await adapter.output(key, "steered", "Handled elsewhere.", "$s")
+            self.assertNotIn((key, "$old"), adapter._acks)
+            adapter._request.assert_awaited_once()
+            self.assertNotIn("/redact/", adapter._request.await_args.args[1])
             self.assertNotIn((key, "$s"), adapter._requesters)
+            self.assertEqual(adapter._acks[(key, "$s")], "$steered-1")
+            await adapter.output(key, "progress", "Using `Read`…", "$s")
+            self.assertEqual(adapter._request.await_args.kwargs["data"]["m.relates_to"],
+                             {"rel_type": "m.replace", "event_id": "$steered-1"})
+            await adapter.output(key, "final", "Done", "$original")
+            self.assertNotIn((key, "$s"), adapter._acks)
 
     async def test_cleanup_redacts_the_ack_card_and_tolerates_redact_failures(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -473,7 +506,7 @@ class DiscordImageTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DiscordMessageGuardsTests(unittest.IsolatedAsyncioTestCase):
-    async def test_unmentioned_bot_traffic_is_ignored(self):
+    async def test_unmentioned_bot_traffic_follows_admission_policy(self):
         runtime = matrix_runtime()
         adapter = discord_adapter(runtime)
         message = SimpleNamespace(
@@ -482,7 +515,7 @@ class DiscordMessageGuardsTests(unittest.IsolatedAsyncioTestCase):
             author=SimpleNamespace(id=7, bot=True, display_name="WebHook"),
             reply=AsyncMock())
         await adapter._on_message(message)
-        runtime.admit.assert_not_awaited()
+        runtime.admit.assert_awaited_once()
         message.reply.assert_not_awaited()
 
     async def test_submit_failure_reports_to_the_channel(self):
@@ -539,17 +572,56 @@ class DiscordOutputTests(unittest.IsolatedAsyncioTestCase):
         await adapter.output(key, "progress", "Using `Read` …", "10")
         reply.assert_awaited_once()
         await adapter.output(key, "progress", "Using `Bash` …", "10")
-        card.edit.assert_awaited_once_with(content="Using `Bash` …")
+        self.assertEqual(card.edit.await_args.kwargs["content"], "Using `Bash` …")
+        self.assertFalse(card.edit.await_args.kwargs["allowed_mentions"].everyone)
         self.assertEqual(reply.await_count, 1)
 
     async def test_steered_replies_close_the_request(self):
         adapter = discord_adapter(matrix_runtime())
         key = SessionKey("agent_two", "discord", "2")
-        reply = AsyncMock()
+        card = SimpleNamespace(edit=AsyncMock(), delete=AsyncMock())
+        reply = AsyncMock(return_value=card)
         adapter._requests[(key, "10")] = SimpleNamespace(reply=reply)
+        old_card = SimpleNamespace(delete=AsyncMock())
+        adapter._progress[(key, "9")] = old_card
         await adapter.output(key, "steered", "Handled in Matrix.", "10")
-        reply.assert_awaited_once_with("Handled in Matrix.", mention_author=False)
+        old_card.delete.assert_not_awaited()
+        self.assertNotIn((key, "9"), adapter._progress)
+        self.assertEqual(reply.await_args.args, ("Handled in Matrix.",))
+        self.assertFalse(reply.await_args.kwargs["allowed_mentions"].everyone)
+        self.assertIs(adapter._progress[(key, "10")], card)
+        await adapter.output(key, "progress", "Using `Read`…", "10")
+        card.edit.assert_awaited_once()
+        self.assertEqual(card.edit.await_args.kwargs["content"], "Handled in Matrix.\nUsing `Read`…")
+        adapter._requests[(key, "9")] = SimpleNamespace(
+            channel=FakeDiscordChannel(), reply=AsyncMock())
+        await adapter.output(key, "final", "Done", "9")
+        card.delete.assert_awaited_once()
         self.assertNotIn((key, "10"), adapter._requests)
+
+    async def test_ambient_cleanup_preserves_discord_final_delivery(self):
+        adapter = discord_adapter(matrix_runtime())
+        key = SessionKey("agent_two", "discord", "2")
+        card = SimpleNamespace(delete=AsyncMock())
+        reply = AsyncMock()
+        adapter._requests[(key, "1")] = SimpleNamespace(channel=FakeDiscordChannel(), reply=reply)
+        adapter._progress[(key, "1")] = card
+        adapter._requests[(key, "2")] = SimpleNamespace()
+        await adapter.output(key, "cleanup_request", "", "2")
+        self.assertNotIn((key, "2"), adapter._requests)
+        self.assertIn((key, "1"), adapter._requests)
+        self.assertIs(adapter._progress[(key, "1")], card)
+        card.delete.assert_not_awaited()
+        failed_card = SimpleNamespace(delete=AsyncMock())
+        adapter._requests[(key, "3")] = SimpleNamespace(channel=FakeDiscordChannel(), reply=AsyncMock())
+        adapter._progress[(key, "3")] = failed_card
+        await adapter.output(key, "request_error", "Could not read image", "3")
+        failed_card.delete.assert_awaited_once()
+        self.assertIn((key, "1"), adapter._requests)
+        card.delete.assert_not_awaited()
+        await adapter.output(key, "final", "Done", "1")
+        self.assertEqual(reply.await_args.args, ("Done",))
+        card.delete.assert_awaited_once()
 
     async def test_final_replies_chunk_and_clear_progress(self):
         runtime = matrix_runtime()

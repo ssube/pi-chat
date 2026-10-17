@@ -7,6 +7,7 @@ import hashlib
 import html
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -14,17 +15,23 @@ import time
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
 
+from bridge import __version__
 from bridge.config import MatrixSettings
 from bridge.debug import debug_status
 from bridge.activity import Activity, Presence
+from bridge.filtering import SILENT_KINDS, metadata_rejection
+from bridge.telemetry import Telemetry
+from bridge.turn_status import Indicator, TURN_EMOJI, TurnStatus
+from bridge.progress import sealed_progress
 from bridge.history_service import HistoryPage, HistoryMessage
-from bridge.mentions import Mention, plan_mentions, replace_mentions, roster_line
+from bridge.mentions import (BROADCAST_REJECTION, Member, Roster, find_mentions, has_broadcast_ping,
+                             replace_mentions)
 from bridge.room_lease import RoomLeases
 from bridge.reaction_service import ReactionRejected
 from bridge.runtime.pi_rpc import RpcImage
-from bridge.runtime.session import BridgeRuntime, Incoming, ReplyRejected
+from bridge.runtime.session import BridgeRuntime, Incoming, ReplyRejected, StopRequested
 from bridge.runtime.state import SessionKey
 
 
@@ -38,7 +45,29 @@ log = logging.getLogger("agent_bridge.matrix")
 # A rate-limited homeserver must not silently drop a reply. Retry a 429 a few
 # times, honoring the delay the server asks for, before giving up to the caller.
 MATRIX_MAX_ATTEMPTS = 4
+# The acknowledgement PUT is the one control-plane write whose failure aborts an
+# addressed request and leaves the room with "I could not start this request".
+# Homeserver rate limiting (HTTP 429) can outlive the default four-attempt budget,
+# so a 429 that identifies itself as a limiter breach is given a deeper, still
+# hint-respecting budget of its own. A 429 that carries neither an errcode nor a
+# retry hint is not a limiter -- and neither is a 5xx -- so both keep the shorter
+# budget, as do progress edits and other traffic.
+MATRIX_ACK_ATTEMPTS = 8
+# The ack is written while the runtime holds the per-scope lock, and both cancel()
+# and the emergency stop need that lock. A deeper attempt count on its own could
+# therefore hold a scope for minutes (seven 30s hints plus every request timeout),
+# so the ack's whole retry window is bounded instead: no wait may start once the
+# budget is spent, and no attempt is longer than what remains of it. Only a
+# validated limiter 429 may use the extra attempts; a 5xx backend keeps the
+# default budget.
+MATRIX_ACK_RETRY_BUDGET_SECONDS = 60.0
 MATRIX_MAX_RETRY_SECONDS = 30.0
+# A cancel or emergency stop queues on the scope lock the acknowledgement holds
+# across its retries, so the acknowledgement's backoff wait is polled at this
+# interval: the stop takes the lock instead of waiting out a 30s server hint.
+# Only a stop authorized for this request's own author is allowed to interrupt
+# it, so the poll is made with that requester.
+MATRIX_STOP_POLL_SECONDS = 0.25
 # A room roster is small and rarely changes; a short cache keeps every reply
 # from costing an extra round trip.
 ROSTER_TTL_SECONDS = 60.0
@@ -46,21 +75,43 @@ ROSTER_TTL_SECONDS = 60.0
 
 
 
-def _retry_delay(payload: Any, headers: Any, attempt: int) -> float:
-    """Seconds to wait before retrying a rate-limited request."""
+def _now() -> float:
+    """Monotonic seconds. A seam so the retry-budget tests need no real waiting."""
+    return time.monotonic()
+
+
+def _retry_hint(payload: Any, headers: Any) -> float | None:
+    """The delay the server itself asked for, or None when it asked for none.
+
+    A hint is evidence that the server knows it is limiting this client: Synapse
+    names a limiter breach with ``retry_after_ms`` (or ``Retry-After``). Its
+    absence is equally informative, see ``_is_limiter_429``.
+    """
     if isinstance(payload, dict):
         milliseconds = payload.get("retry_after_ms")
         if milliseconds is not None:
             try:
-                return min(max(float(milliseconds) / 1000.0, 0.0), MATRIX_MAX_RETRY_SECONDS)
+                seconds = float(milliseconds) / 1000.0
+                if math.isfinite(seconds):
+                    return min(max(seconds, 0.0), MATRIX_MAX_RETRY_SECONDS)
             except (TypeError, ValueError):
                 pass
     header = headers.get("Retry-After") if headers is not None else None
     if header:
         try:
-            return min(max(float(header), 0.0), MATRIX_MAX_RETRY_SECONDS)
+            seconds = float(header)
+            if math.isfinite(seconds):
+                return min(max(seconds, 0.0), MATRIX_MAX_RETRY_SECONDS)
         except ValueError:
             pass
+    return None
+
+
+def _retry_delay(payload: Any, headers: Any, attempt: int) -> float:
+    """Seconds to wait before retrying a transient request failure."""
+    hint = _retry_hint(payload, headers)
+    if hint is not None:
+        return hint
     return min(0.5 * (2 ** (attempt - 1)), MATRIX_MAX_RETRY_SECONDS)
 
 
@@ -69,6 +120,42 @@ async def _json_or_none(response: Any) -> Any:
         return await response.json(content_type=None)
     except Exception:
         return None
+
+
+def _describe_429(payload: Any) -> str:
+    """Describe a 429 body enough to tell a limiter breach from a dead backend.
+
+    Synapse answers its own limiter with ``errcode`` ``M_LIMIT_EXCEEDED`` and a
+    ``retry_after_ms`` hint. The HAProxy front door reuses 429 for
+    ``M_UNKNOWN`` / "Server is unavailable" when Synapse has no live backend.
+    The two need opposite responses, so log which one arrived instead of
+    guessing from the status code alone.
+    """
+    if not isinstance(payload, dict):
+        return "no JSON body"
+    parts = []
+    errcode = payload.get("errcode")
+    if isinstance(errcode, str) and errcode:
+        parts.append(f"errcode={errcode}")
+    error = payload.get("error")
+    if isinstance(error, str) and error:
+        parts.append(f"error={error[:120]}")
+    return ", ".join(parts) if parts else "empty JSON body"
+
+
+def _is_limiter_429(payload: Any, headers: Any) -> bool:
+    """Whether a 429 proves a limiter breach rather than an unavailable backend.
+
+    Only the homeserver's limiter identifies itself, with ``M_LIMIT_EXCEEDED``
+    and/or a retry hint. HAProxy reuses 429 with ``M_UNKNOWN``, "Server is
+    unavailable" and no hint while Synapse has no live backend; that is an
+    outage, not a limiter, and must not earn the acknowledgement's deeper
+    attempt budget.
+    """
+    errcode = payload.get("errcode") if isinstance(payload, dict) else None
+    if isinstance(errcode, str) and errcode.strip().upper() == "M_LIMIT_EXCEEDED":
+        return True
+    return _retry_hint(payload, headers) is not None
 
 
 def progress_html(text: str) -> str | None:
@@ -93,7 +180,8 @@ def leading_agent_mentions(text: str) -> list[str]:
 
 
 def matrix_scope(room_id: str, event: dict[str, Any]) -> str:
-    relates = event.get("content", {}).get("m.relates_to", {})
+    content = event.get("content", {})
+    relates = content.get("m.relates_to", {}) if isinstance(content, dict) else {}
     if isinstance(relates, dict) and relates.get("rel_type") == "m.thread":
         root = relates.get("event_id")
         if isinstance(root, str) and root:
@@ -129,14 +217,21 @@ def explicit_ping(content: dict[str, Any], user_id: str) -> bool:
                           target + r"['\"]", urllib.parse.unquote(authored), re.IGNORECASE))
 
 
-def addressed_to(event: dict[str, Any], user_id: str) -> bool:
+def addressed_to(event: dict[str, Any], user_id: str, aliases: tuple[str, ...] = ()) -> bool:
     content = event.get("content", {})
+    if not isinstance(content, dict):
+        return False
     mentions = content.get("m.mentions", {})
     user_ids = mentions.get("user_ids") if isinstance(mentions, dict) else None
     if isinstance(user_ids, list) and user_id in user_ids:
         return True
     body = content.get("body", "")
-    return isinstance(body, str) and user_id in body
+    if not isinstance(body, str):
+        return False
+    names = {user_id[1:].split(":", 1)[0].casefold(), *(alias.casefold() for alias in aliases)}
+    return any(mention.user_id == user_id or
+               (mention.server is None and mention.localpart.casefold() in names)
+               for mention in find_mentions(body, names))
 
 
 # Native room commands in every addressed spelling: bang commands for the
@@ -234,7 +329,9 @@ def targeted_pr_review(event: dict[str, Any], room_id: str,
     mentions = content.get("m.mentions", {}) if isinstance(content, dict) else {}
     user_ids = mentions.get("user_ids") if isinstance(mentions, dict) else None
     return (isinstance(content, dict) and content.get("msgtype") == "m.text" and
-            user_ids == [settings.user_id])
+            isinstance(user_ids, list) and settings.user_id in user_ids)
+
+
 
 def event_timestamp(event: dict[str, Any]) -> str:
     value = event.get("origin_server_ts")
@@ -253,7 +350,7 @@ def _context_event(event: dict[str, Any]) -> bool:
     if isinstance(relation, dict) and relation.get("rel_type") == "m.replace":
         return False
     meta = content.get(BRIDGE_META)
-    if isinstance(meta, dict) and meta.get("kind") in {"ack", "progress", "steered"}:
+    if isinstance(meta, dict) and isinstance(meta.get("kind"), str) and meta.get("kind") in SILENT_KINDS:
         return False
     return isinstance(content.get("body"), str) and bool(content["body"].strip())
 
@@ -319,6 +416,9 @@ class MatrixAdapter:
         self.agent = agent
         self.settings = settings
         self.runtime = runtime
+        telemetry = getattr(runtime, "telemetry", None)
+        self.telemetry = telemetry if isinstance(telemetry, Telemetry) else Telemetry()
+        self._input_locks: dict[str, asyncio.Lock] = {}
         self.state_dir = state_dir
         self.review_queue = review_queue
         self.room_leases = room_leases
@@ -326,6 +426,8 @@ class MatrixAdapter:
         self.session: Any = None
         self._presence_supported = True
         self._acks: dict[tuple[SessionKey, str], str] = {}
+        self._summary_cards: dict[str, str] = {}
+        self._progress_headers: dict[tuple[SessionKey, str], str] = {}
         self._requesters: dict[tuple[SessionKey, str], str] = {}
         self._scope_hops: dict[SessionKey, int] = {}
         self._rosters: dict[str, tuple[float, dict[str, dict[str, Any]]]] = {}
@@ -346,6 +448,8 @@ class MatrixAdapter:
                               self._seen_file)
         self._stopping = asyncio.Event()
         self._since_file = state_dir / "matrix-since.txt"
+        self._startup_sent = False
+        self._startup_transaction = f"bridge-startup-{os.urandom(8).hex()}"
 
     def _url(self, path: str) -> str:
         return self.settings.homeserver.rstrip("/") + path
@@ -367,19 +471,119 @@ class MatrixAdapter:
         return True
 
     async def _request(self, method: str, path: str, *, data: dict | None = None,
-                       params: dict | None = None, timeout: int = 40) -> Any:
+                       params: dict | None = None, timeout: int = 40,
+                       attempts: int = MATRIX_MAX_ATTEMPTS,
+                       budget: float | None = None,
+                       stop: Callable[[], bool] | None = None) -> Any:
+        """Send one request, retrying transient failures.
+
+        ``attempts`` raises the attempt ceiling for the acknowledgement PUT.
+        ``budget`` bounds how long that deeper ceiling may spend before the
+        caller (holding the scope lock an emergency stop needs) gets control
+        back: it confines the extra attempts to a 429 that identifies itself as a
+        limiter breach, and caps every attempt and every wait, so it is a
+        wall-clock ceiling, not a sleep allowance.
+        ``stop`` reports a cancel or emergency stop already queued on that lock,
+        which abandons the retries rather than making the stop wait them out; the
+        caller scopes the predicate to the requester authorized to stop it.
+        """
         assert self.session is not None
         import aiohttp
-        for attempt in range(1, MATRIX_MAX_ATTEMPTS + 1):
-            async with self.session.request(method, self._url(path), json=data,
-                                            params=params, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+        # Retry only methods whose identical URL/body can be replayed safely.
+        # Matrix event PUT URLs already contain a transaction ID; never generate
+        # another ID here or replay a possibly accepted POST.
+        replay_safe = method.upper() in {"GET", "HEAD", "PUT"}
+        deadline = None if budget is None else _now() + budget
+        payload: Any = None
+        for attempt in range(1, attempts + 1):
+            remaining = None if deadline is None else deadline - _now()
+            if remaining is not None and remaining <= 0:
+                log.warning("Matrix %s %s: HTTP 429 retry budget of %.0fs spent after "
+                            "%d attempt(s); %s",
+                            method, path, budget, attempt - 1, _describe_429(payload))
+                raise RuntimeError(f"Matrix {method} failed with HTTP 429")
+            if stop is not None and stop():
+                log.warning("Matrix %s %s: abandoning attempt %d/%d before sending because a "
+                            "cancel or stop is queued on this scope; %s",
+                            method, path, attempt, attempts, _describe_429(payload))
+                raise StopRequested(f"Matrix {method} abandoned for a queued scope stop")
+            async with self.session.request(
+                    method, self._url(path), json=data, params=params,
+                    timeout=aiohttp.ClientTimeout(
+                        total=timeout if remaining is None else min(timeout, remaining))) as response:
                 if response.status < 400:
                     return await response.json()
-                if response.status != 429 or attempt >= MATRIX_MAX_ATTEMPTS:
+                transient = response.status == 429 or 500 <= response.status < 600
+                if budget is not None and response.status == 429:
+                    # The 429 body is what says whether this is a limiter breach,
+                    # so it is read before the ceiling is chosen, not after.
+                    payload = await _json_or_none(response)
+                    body_read = True
+                else:
+                    # Every other response has its body read only if it is going to
+                    # be retried or logged.
+                    body_read = False
+                # A budgeted request spends its deeper attempt budget on a
+                # validated limiter signal only: a bare 429 (the front door
+                # answering while the backend is down) and a 5xx backend that
+                # never answers both keep the default ceiling, so neither holds
+                # the scope longer than ordinary traffic does.
+                ceiling = attempts
+                if budget is not None and not (response.status == 429
+                                               and _is_limiter_429(payload, response.headers)):
+                    ceiling = min(attempts, MATRIX_MAX_ATTEMPTS)
+                if not replay_safe or not transient or attempt >= ceiling:
+                    if response.status == 429 and not body_read:
+                        payload = await _json_or_none(response)
+                    if response.status == 429:
+                        log.warning("Matrix %s %s: HTTP 429 after %d attempt(s); %s",
+                                    method, path, attempt, _describe_429(payload))
                     raise RuntimeError(f"Matrix {method} failed with HTTP {response.status}")
-                payload = await _json_or_none(response)
-                await asyncio.sleep(_retry_delay(payload, response.headers, attempt))
+                if not body_read:
+                    payload = await _json_or_none(response)
+                delay = _retry_delay(payload, response.headers, attempt)
+                if deadline is not None:
+                    remaining = deadline - _now()
+                    if remaining <= 0:
+                        log.warning("Matrix %s %s: HTTP 429 retry budget of %.0fs spent after "
+                                    "%d attempt(s); %s",
+                                    method, path, budget, attempt, _describe_429(payload))
+                        raise RuntimeError(f"Matrix {method} failed with HTTP {response.status}")
+                    delay = min(delay, remaining)
+                if response.status == 429:
+                    log.warning("Matrix %s %s: HTTP 429 on attempt %d/%d, retrying in %.1fs; %s",
+                                method, path, attempt, ceiling, delay,
+                                _describe_429(payload))
+            # Release the response before waiting so retries do not hold a
+            # connector slot while other replies or sync requests need it.
+            if not await self._backoff(delay, stop):
+                log.warning("Matrix %s %s: abandoning attempt %d/%d while waiting to retry "
+                            "because a cancel or stop is queued on this scope; %s",
+                            method, path, attempt, attempts, _describe_429(payload))
+                raise StopRequested(f"Matrix {method} abandoned for a queued scope stop")
         raise RuntimeError(f"Matrix {method} failed with HTTP 429")
+
+    async def _backoff(self, delay: float, stop: Callable[[], bool] | None) -> bool:
+        """Wait out a retry delay; False once a queued stop asks to abandon it.
+
+        Only a budgeted acknowledgement passes ``stop``. It is the one request
+        that holds the scope lock across its retries, so its wait is the one an
+        emergency stop cannot afford to sit out. Every other retry keeps a
+        single unsliced sleep: nothing is waiting on those.
+        """
+        if stop is None:
+            await asyncio.sleep(delay)
+            return True
+        # The total wait is unchanged; it is taken in slices a queued stop is
+        # noticed between. Every slice is slept in full: the wait is measured by
+        # the slices taken, not by a clock reading, so a coarse clock can neither
+        # make the loop spin nor end the wait early.
+        slices = max(1, math.ceil(delay / MATRIX_STOP_POLL_SECONDS))
+        for _ in range(slices):
+            if stop():
+                return False
+            await asyncio.sleep(delay / slices)
+        return True
 
     def _write_since(self, token: str) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -476,6 +680,11 @@ class MatrixAdapter:
                 "has_more": isinstance(token, str) and bool(token)}
 
     async def react(self, key: SessionKey, message_id: str, emoji: str) -> None:
+        await self._add_reaction(key, message_id, emoji)
+        await self.runtime.record_activity(key)
+
+    async def _add_reaction(self, key: SessionKey, message_id: str, emoji: str,
+                            *, namespace: str = "") -> dict[str, Any]:
         """React only to an ordinary event in the active configured scope."""
         if key.transport != "matrix" or key.agent != self.agent or not message_id.startswith("$"):
             raise ReactionRejected("matrix_target")
@@ -491,13 +700,45 @@ class MatrixAdapter:
                 not _context_event(target) or not _in_scope(target, thread_root)):
             raise ReactionRejected("matrix_scope")
         transaction = hashlib.sha256(
-            (self.agent + "\0" + room_id + "\0" + message_id + "\0" + emoji).encode()
+            (self.agent + "\0" + room_id + "\0" + message_id + "\0" + emoji
+             + ("\0" + namespace if namespace else "")).encode()
         ).hexdigest()[:32]
-        await self._request(
+        return await self._request(
             "PUT", f"/_matrix/client/v3/rooms/{room}/send/m.reaction/bridge-{transaction}",
             data={"m.relates_to": {"rel_type": "m.annotation",
                                    "event_id": message_id, "key": emoji}})
-        await self.runtime.record_activity(key)
+
+    async def turn_status(self, record: Indicator, status: TurnStatus) -> str | None:
+        """Apply a durable intent without touching Pi reaction/activity accounting."""
+        key, request_id = record.key, record.request_id
+        room_id = key.scope.split(":thread:", 1)[0].removesuffix(":main")
+        if (key.agent != self.agent or key.transport != "matrix" or
+                room_id not in self.settings.rooms):
+            raise ReactionRejected("matrix_room")
+        namespace = f"turn-status-{record.epoch}"
+        running_id = record.running_id
+        if status == "running" or (running_id is None and record.pending_attempted):
+            # Same phase transaction recovers a lost acknowledgement after a
+            # kill between the server accepting the reaction and local fsync.
+            data = await self._add_reaction(key, request_id, TURN_EMOJI["running"], namespace=namespace)
+            running_id = data["event_id"]
+            if not isinstance(running_id, str) or not running_id.startswith("$"):
+                raise ValueError("invalid turn reaction receipt")
+            record.running_id = running_id
+        if status == "running":
+            return running_id
+        if status != "clear":
+            terminal = await self._add_reaction(key, request_id, TURN_EMOJI[status], namespace=namespace)
+            if not isinstance(terminal.get("event_id"), str) or not terminal["event_id"].startswith("$"):
+                raise ValueError("invalid terminal reaction receipt")
+        if running_id is not None:
+            room = urllib.parse.quote(room_id, safe="")
+            event = urllib.parse.quote(running_id, safe="")
+            transaction = hashlib.sha256(running_id.encode()).hexdigest()[:32]
+            await self._request(
+                "PUT", f"/_matrix/client/v3/rooms/{room}/redact/{event}/turn-{transaction}",
+                data={"reason": "Bridge turn ended"})
+        return None
 
     async def _image(self, content: dict[str, Any]) -> RpcImage | None:
         url = content.get("url")
@@ -569,6 +810,12 @@ class MatrixAdapter:
         return await self.room_leases.forward(room_id, event, attachment, reply_context, ping)
 
     async def _handle_event(self, room_id: str, event: dict[str, Any]) -> None:
+        scope = matrix_scope(room_id, event)
+        async with self.telemetry.queued(self._input_locks.setdefault(scope, asyncio.Lock()), "matrix",
+                                        SessionKey(self.agent, "matrix", scope).scope_hash):
+            await self._deliver_event(room_id, event)
+
+    async def _deliver_event(self, room_id: str, event: dict[str, Any]) -> None:
         if (event.get("type") != "m.room.message" or
                 event.get("sender") == self.settings.user_id):
             return
@@ -580,9 +827,10 @@ class MatrixAdapter:
             return
         relation = content.get("m.relates_to")
         meta = content.get(BRIDGE_META)
-        if isinstance(meta, dict) and meta.get("kind") in {"ack", "progress", "steered"}:
+        if isinstance(meta, dict) and isinstance(meta.get("kind"), str) and meta.get("kind") in SILENT_KINDS:
             # Working indicators are not new user turns. Terminal replies are separate events.
             self._remember(event_id)
+            self.telemetry.record("matrix", "filter", "machine_status")
             return
         if isinstance(relation, dict) and relation.get("rel_type") == "m.replace":
             # Interactive Pi coalesces edits while attention is held; without a
@@ -613,32 +861,19 @@ class MatrixAdapter:
         if isinstance(meta, dict):
             hop = meta.get("hop")
             invitations = meta.get("invitations", [])
-            mentions = content.get("m.mentions", {})
-            user_ids = mentions.get("user_ids") if isinstance(mentions, dict) else []
-            terminal_to_active = (meta.get("kind") in {"final", "error", "cancelled"} and
-                                  isinstance(user_ids, list) and
-                                  self.settings.user_id in user_ids and active)
-            legacy_invitation = (hop is None and meta.get("kind") == "final" and
-                                 isinstance(invitations, list) and
-                                 self.settings.user_id in invitations)
-            if legacy_invitation:
-                # A peer without hop metadata may invite once, but cannot
-                # extend the chain beyond this receiver's turn.
-                hop = MAX_HANDOFF_HOPS
-            elif hop is None and terminal_to_active:
-                hop = 0
-            if type(hop) is not int or not 0 <= hop <= MAX_HANDOFF_HOPS:
+            legacy = hop is None and meta.get("kind") == "final" and isinstance(invitations, list) and self.settings.user_id in invitations
+            if hop is None:
+                hop = MAX_HANDOFF_HOPS if legacy else 0
+            intentional = (meta.get("kind") == "final" and type(hop) is int and hop > 0
+                           and isinstance(invitations, list) and self.settings.user_id in invitations)
+            reason = metadata_rejection({**meta, "hop": hop}, awake=active,
+                                        addressed=intentional, wake_any=room_id in self.settings.waking_rooms)
+            if reason:
+                self.telemetry.record("matrix", "filter", reason)
                 self._remember(event_id)
                 return
-            intentional = (meta.get("kind") == "final" and
-                           hop > 0 and
-                           isinstance(invitations, list) and
-                           self.settings.user_id in invitations)
-            active_reply = terminal_to_active
-            if not intentional and not active_reply:
-                self._remember(event_id)
-                return
-        addressed = addressed_to(event, self.settings.user_id)
+        addressed = addressed_to(event, self.settings.user_id,
+                                 (self.settings.display_name,) if self.settings.display_name else ())
         mentions = content.get("m.mentions", {})
         user_ids = mentions.get("user_ids") if isinstance(mentions, dict) else None
         if (isinstance(user_ids, list) and user_ids and
@@ -671,7 +906,10 @@ class MatrixAdapter:
                 self._remember(event_id)
             return
         can_wake = addressed or room_id in self.settings.waking_rooms
-        if not await self.runtime.admit(key, can_wake):
+        async def compaction_notice() -> None:
+            await self.output(key, "compacting", "Compacting, one moment...", event_id)
+
+        if not await self.runtime.admit(key, can_wake, on_wait=compaction_notice):
             if await self._forward_interactive(room_id, event):
                 self._remember(event_id)
                 return
@@ -750,6 +988,13 @@ class MatrixAdapter:
             else:
                 await self.runtime.submit(key, incoming)
                 await self.runtime.record_wake(key, event_id)
+        except StopRequested:
+            # The acknowledgement dropped its retries because a cancel or stop is
+            # queued on the scope lock, so this request never started. The stop is
+            # the operator's own outcome: there is nothing here to recover from,
+            # and no reply that could still need the requester.
+            log.info("Matrix request abandoned for a queued scope stop event=%s", event_id)
+            self._requesters.pop((key, event_id), None)
         except Exception:
             log.exception("Matrix request could not be submitted event=%s", event_id)
             try:
@@ -768,13 +1013,14 @@ class MatrixAdapter:
         now = time.monotonic()
         cached = self._rosters.get(room_id)
         if cached is not None and cached[0] > now:
+            self.telemetry.record("matrix", "roster", "cached")
             return cached[1]
         room = urllib.parse.quote(room_id, safe="")
         try:
             data = await self._request("GET", f"/_matrix/client/v3/rooms/{room}/joined_members")
-        except Exception:
-            log.warning("Could not read Matrix room members for mention rendering",
-                        exc_info=True)
+        except Exception as error:
+            self.telemetry.record("matrix", "roster", "unavailable")
+            log.warning("Could not read Matrix room members error_class=%s", type(error).__name__)
             return None
         joined = data.get("joined") if isinstance(data, dict) else None
         if not isinstance(joined, dict):
@@ -782,66 +1028,91 @@ class MatrixAdapter:
         members = {user_id: entry for user_id, entry in joined.items()
                    if isinstance(user_id, str) and isinstance(entry, dict)}
         self._rosters[room_id] = (now + ROSTER_TTL_SECONDS, members)
+        self.telemetry.record("matrix", "roster", "fetched")
         return members
 
+    async def member_roster(self, key: SessionKey) -> Roster:
+        room_id = key.scope.split(":thread:", 1)[0].removesuffix(":main")
+        if key.transport != "matrix" or room_id not in self.settings.rooms:
+            raise ValueError("Matrix room is not enabled")
+        members = await self._room_members(room_id)
+        return Roster((Member(user_id, user_id[1:].split(":", 1)[0],
+                              tuple(dict.fromkeys(alias for alias in (
+                                  user_id[1:].split(":", 1)[0], entry.get("display_name"))
+                                  if isinstance(alias, str) and alias)))
+                       for user_id, entry in (members or {}).items()),
+                      available=members is not None, complete=members is not None)
+
     async def _render_mentions(self, room_id: str, text: str) -> tuple[str, list[str], bool]:
-        """Turn `@handles` into real mentions; report an unknown one instead of sending."""
         if "@" not in text:
             return text, [], False
-        members = await self._room_members(room_id)
-        if members is None:
-            return text, [], False
-        by_localpart: dict[str, str] = {}
-        for user_id in members:
-            by_localpart.setdefault(user_id[1:].split(":", 1)[0].casefold(), user_id)
+        roster = await self.member_roster(SessionKey(self.agent, "matrix", room_id + ":main"))
+        plan = roster.plan(text, allow_broadcast=room_id in self.settings.broadcast_allowed_room_ids)
+        if plan.unknown and room_id in self._rosters:
+            # A cached absence may simply be a recently joined or renamed member.
+            self._rosters.pop(room_id, None)
+            roster = await self.member_roster(SessionKey(self.agent, "matrix", room_id + ":main"))
+            plan = roster.plan(text, allow_broadcast=room_id in self.settings.broadcast_allowed_room_ids)
+        feedback = roster.feedback(plan)
+        if feedback:
+            self.telemetry.record("matrix", "mention", "rejected")
+            return feedback, [], True
+        return replace_mentions(text, plan, lambda _mention, target: target), plan.user_ids, False
 
-        def lookup(mention: Mention) -> str | None:
-            if mention.server:
-                return mention.user_id if mention.user_id in members else None
-            return by_localpart.get(mention.localpart.casefold())
-
-        plan = plan_mentions(text, lookup)
-        if plan.unknown:
-            unknown = ", ".join(f"`{mention.raw}`" for mention in plan.unknown)
-            labels = sorted((entry.get("display_name") or user_id
-                             for user_id, entry in members.items()), key=str.casefold)
-            return (f"I did not post that reply: it mentioned {unknown}, which is not a "
-                    f"member of this room. People here: {roster_line(labels)}. "
-                    "Rewrite the reply using one of those names.", [], True)
-        if not plan.known:
-            return text, [], False
-        return (replace_mentions(text, plan, lambda mention, user_id: user_id),
-                plan.user_ids, False)
+    async def _seal_progress(self, key: SessionKey, request_id: str, outcome: str) -> None:
+        event_id = self._acks.pop((key, request_id), None)
+        header = self._progress_headers.pop((key, request_id), "")
+        if event_id is None:
+            return
+        room_id = key.scope.split(":thread:", 1)[0].removesuffix(":main")
+        room = urllib.parse.quote(room_id, safe="")
+        event = urllib.parse.quote(event_id, safe="")
+        transaction = f"bridge-retire-{os.urandom(8).hex()}"
+        history = self._summary_cards.pop(event_id, "")
+        if outcome == "continued":
+            return  # Handoff/rotation retires tracking, never the visible snapshot.
+        try:
+            if history:
+                body = {"msgtype": "m.text", "body": sealed_progress(header, history, outcome),
+                        BRIDGE_META: {"kind": "progress_summary", "sealed": True},
+                        "m.mentions": {"user_ids": [], "room": False}}
+                await asyncio.wait_for(self._request(
+                    "PUT", f"/_matrix/client/v3/rooms/{room}/send/m.room.message/{transaction}",
+                    data={**body, "m.new_content": body,
+                          "m.relates_to": {"rel_type": "m.replace", "event_id": event_id}}), 2)
+            else:
+                await asyncio.wait_for(self._request(
+                    "PUT", f"/_matrix/client/v3/rooms/{room}/redact/{event}/{transaction}",
+                    data={"reason": "Progress card retired"}), 2)
+        except Exception:
+            log.warning("Could not seal Matrix bridge progress event", exc_info=True)
 
     async def output(self, key: SessionKey, kind: str, text: str,
-                     request_id: str) -> None:
+                     request_id: str) -> bool | None:
         if key.transport != "matrix":
-            return
-        if kind == "cleanup":
-            ack_id = self._acks.pop((key, request_id), None)
+            return None
+        request_error = kind == "request_error"
+        if request_error:
+            kind = "error"
+        scope_room_id = key.scope.split(":thread:", 1)[0].removesuffix(":main")
+        broadcast_allowed = scope_room_id in self.settings.broadcast_allowed_room_ids
+        if kind != "cleanup" and not broadcast_allowed and has_broadcast_ping(text):
+            raise ReplyRejected(BROADCAST_REJECTION)
+        if kind == "cleanup_request":
             self._requesters.pop((key, request_id), None)
-            if ack_id:
-                room_id = key.scope.split(":thread:", 1)[0].removesuffix(":main")
-                room = urllib.parse.quote(room_id, safe="")
-                event = urllib.parse.quote(ack_id, safe="")
-                transaction = f"bridge-cleanup-{os.urandom(8).hex()}"
-                try:
-                    await self._request(
-                        "PUT", f"/_matrix/client/v3/rooms/{room}/redact/{event}/{transaction}",
-                        data={"reason": "Completed with a reaction"})
-                except Exception:
-                    log.warning("Could not remove Matrix bridge progress event", exc_info=True)
-            return
+            return None
+        if kind == "cleanup":
+            self._requesters.pop((key, request_id), None)
+            for target in [target for target in self._acks if target[0] == key]:
+                await self._seal_progress(*target, "finished")
+            return None
         thread_root = key.scope.split(":thread:", 1)[1] if ":thread:" in key.scope else None
         room_id = key.scope.split(":thread:", 1)[0].removesuffix(":main")
         room = urllib.parse.quote(room_id, safe="")
         requester = self._requesters.get((key, request_id), "")
         prior_hops = self._scope_hops.get(key, 0)
-        # An invitation is a deliberate handoff: a full Matrix ID at the very
-        # start of a final reply. It is read from the original text so a plain
-        # @handle never widens the handoff chain.
-        invitations = (leading_agent_mentions(text)
-                       if kind == "final" and prior_hops < MAX_HANDOFF_HOPS else [])
+        # Invitations are deliberate handoffs: leading mentions are resolved
+        # first so accepted aliases widen the same chain as canonical IDs.
         mentioned: list[str] = []
         if kind == "final":
             text, mentioned, rejected = await self._render_mentions(room_id, text)
@@ -849,18 +1120,27 @@ class MatrixAdapter:
                 # Keep room membership validation private to the active Pi
                 # session. The runtime asks for a rewrite before any room send.
                 raise ReplyRejected(text)
+        invitations = (leading_agent_mentions(text)
+                       if kind == "final" and prior_hops < MAX_HANDOFF_HOPS else [])
         hop = min(prior_hops + 1, MAX_HANDOFF_HOPS) if kind == "final" else prior_hops
+        history = text.partition("\n")[2]
+        header = (self._progress_headers.get((key, request_id), "")
+                  if kind in {"ack", "progress", "progress_summary"} else "")
+        text = f"{header}\n{text}" if header else text
         content: dict[str, Any] = {"msgtype": "m.text", "body": text,
                                    BRIDGE_META: {"kind": kind,
                                                  "hop": hop,
                                                  "invitations": invitations}}
-        notify = list(dict.fromkeys(
-            ([requester] if requester else []) + invitations + mentioned))
-        # Explicitly disable room-wide pings even when an output contains raw
-        # @room text and no individual mention could be resolved.
-        content["m.mentions"] = {"user_ids": notify, "room": False}
-        if kind == "progress":
-            formatted = progress_html(text)
+        notify = ([] if kind == "compacting" else list(dict.fromkeys(
+            ([requester] if requester else []) + invitations + mentioned)))
+        # Only an explicit alerts-room exemption may authorize a native @room
+        # ping. Code examples, escaped words, and other platform tokens stay literal.
+        room_ping = (kind == "final" and broadcast_allowed and any(
+            mention.server is None and mention.localpart.casefold() == "room"
+            for mention in find_mentions(text)))
+        content["m.mentions"] = {"user_ids": notify, "room": room_ping}
+        if kind in {"progress", "progress_summary"}:
+            formatted = progress_html(text) if kind == "progress" else None
             if formatted is not None:
                 content["format"] = "org.matrix.custom.html"
                 content["formatted_body"] = formatted
@@ -874,7 +1154,7 @@ class MatrixAdapter:
                     content["m.new_content"]["format"] = "org.matrix.custom.html"
                     content["m.new_content"]["formatted_body"] = formatted
             else:
-                return
+                return None
         else:
             relation: dict[str, Any] = {}
             if thread_root:
@@ -883,16 +1163,56 @@ class MatrixAdapter:
             relation["m.in_reply_to"] = {"event_id": request_id}
             content["m.relates_to"] = relation
         transaction = urllib.parse.quote(f"bridge-{self.agent}-{os.urandom(8).hex()}")
+        is_ack = kind == "ack"
+        # The acknowledgement may outlast the default budget, but its whole
+        # retry window is bounded because the scope lock is held across it, and
+        # the runtime flags a queued cancel or emergency stop on that lock before
+        # it waits for it -- this write gives way instead of delaying the stop.
         data = await self._request("PUT", f"/_matrix/client/v3/rooms/{room}/send/m.room.message/{transaction}",
-                                   data=content)
+                                   data=content,
+                                   attempts=MATRIX_ACK_ATTEMPTS if is_ack else MATRIX_MAX_ATTEMPTS,
+                                   budget=MATRIX_ACK_RETRY_BUDGET_SECONDS if is_ack else None,
+                                   # Polled with this write's own requester: a stop
+                                   # queued by anyone else was refused and must not
+                                   # end the request it was never authorized to stop.
+                                   stop=(lambda: self.runtime.stop_requested(key, requester or None))
+                                   if is_ack else None)
         if kind == "ack":
+            await self._seal_progress(key, request_id, "continued")
             self._acks[(key, request_id)] = data["event_id"]
+            if header:
+                self._progress_headers[(key, request_id)] = header
+        if kind == "progress_summary":
+            self._summary_cards[self._acks[(key, request_id)]] = history
         if kind == "steered":
+            for target in [target for target in self._acks if target[0] == key]:
+                await self._seal_progress(*target, "continued")
+            self._acks[(key, request_id)] = data["event_id"]
+            self._progress_headers[(key, request_id)] = text
             self._requesters.pop((key, request_id), None)
         if kind in {"final", "cancelled", "error"}:
-            self._acks.pop((key, request_id), None)
+            for target in [target for target in self._acks if target[0] == key and
+                           (not request_error or target[1] == request_id)]:
+                await self._seal_progress(*target, "finished" if kind == "final" else kind)
             self._requesters.pop((key, request_id), None)
-        await self.runtime.record_activity(key)
+        # Waiting is not new Pi activity. In particular it must not overwrite
+        # the idle checkpoint clock while the sweep is still saving it.
+        if kind != "compacting":
+            await self.runtime.record_activity(key)
+        return (kind == "final" and isinstance(data.get("event_id"), str)
+                and data["event_id"].startswith("$"))
+
+    async def _announce_startup(self) -> None:
+        room_id = self.settings.startup_room_id
+        if room_id is None or self._startup_sent:
+            return
+        room = urllib.parse.quote(room_id, safe="")
+        await self._request(
+            "PUT", f"/_matrix/client/v3/rooms/{room}/send/m.room.message/{self._startup_transaction}",
+            data={"msgtype": "m.notice", BRIDGE_META: {"kind": "startup"},
+                  "body": f"agent-bridge v{__version__} connected — {self.agent} ({self.settings.user_id})",
+                  "m.mentions": {"user_ids": [], "room": False}})
+        self._startup_sent = True
 
     async def run(self) -> None:
         import aiohttp  # Imported only when starting the adapter.
@@ -913,20 +1233,39 @@ class MatrixAdapter:
                     next_batch = data["next_batch"]
                     if not first:
                         rooms = data.get("rooms", {}).get("join", {})
+                        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
                         for room_id in self.settings.rooms:
                             for event in rooms.get(room_id, {}).get("timeline", {}).get("events", []):
+                                if isinstance(event, dict):
+                                    grouped.setdefault((room_id, matrix_scope(room_id, event)), []).append(event)
+
+                        async def deliver_group(room_id: str, events: list[dict[str, Any]]) -> None:
+                            for event in events:
                                 try:
                                     await self._handle_event(room_id, event)
                                 except Exception:
                                     if targeted_pr_review(event, room_id, self.settings):
                                         raise
-                                    log.exception("Skipping unprocessable Matrix event in %s", room_id)
-                                    event_id = event.get("event_id") if isinstance(event, dict) else None
+                                    log.warning("Skipping Matrix event error scope_hash=%s",
+                                                SessionKey(self.agent, "matrix", matrix_scope(room_id, event)).scope_hash)
+                                    event_id = event.get("event_id")
                                     if isinstance(event_id, str):
                                         self._remember(event_id)
+
+                        results = await asyncio.gather(*(deliver_group(room_id, events)
+                            for (room_id, _), events in grouped.items()), return_exceptions=True)
+                        for result in results:
+                            if isinstance(result, BaseException):
+                                raise result
                     first = False
                     since = next_batch
                     self._write_since(since)
+                    try:
+                        await self._announce_startup()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        log.exception("Matrix startup notice failed; retrying after next sync")
                 except asyncio.CancelledError:
                     raise
                 except Exception:

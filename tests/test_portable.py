@@ -32,7 +32,7 @@ class PortableTests(unittest.TestCase):
                        PI_ROOM_LEASE_SECRET='x' * 64)
             args = ['message_agent', '--profile-file', str(path), '--room-id', room, '--to', peer,
                     '--message-file', str(text)]
-            client = Mock(user_id=user)
+            client = Mock(user_id=user, room_id=room)
             client.whoami.return_value = user
             client.joined_members.return_value = {user: {}, peer: {}}
             lease = Mock(return_value=True)

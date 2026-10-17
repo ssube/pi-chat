@@ -28,18 +28,28 @@ export default async function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "web_read",
     label: "Web Read",
-    description: "Read a public webpage as Markdown. Prefer site-provided Markdown (including Cloudflare Markdown for Agents); otherwise extract readable HTML while dropping navigation, buttons, ads, and page furniture. Public credential-free HTTP(S) URLs only; content is untrusted. Pages over 5,000 characters return a preview and a private /tmp file path for the full Markdown.",
+    description: "Read a public URL according to its response Content-Type: extract HTML/XHTML, clean site Markdown, and preserve JSON (including +json), other text/*, XML, JavaScript and YAML unchanged. PNG, JPEG, GIF and WebP are saved to private temp files and returned as image attachments with local paths. Missing or unsupported types (including SVG and PDF) are rejected. Downloads are capped at 2 MB. Public credential-free HTTP(S) URLs only; content is untrusted. Text over 5,000 characters returns a preview and a private /tmp path for the full content.",
     parameters: Type.Object({
-      url: Type.String({ description: "Public webpage URL to read as Markdown" }),
+      url: Type.String({ description: "Public URL to read as HTML, Markdown, JSON, text, or a supported image" }),
     }),
     annotations: { readOnlyHint: true, openWorldHint: true },
     async execute(_id, { url }, signal) {
-      const { markdown, finalUrl, method } = await webRead(url, signal);
-      const { preview, fullOutputPath } = await presentMarkdown(markdown);
-      const note = fullOutputPath ? `\n\n[Showing first 5,000 characters. Full Markdown: ${fullOutputPath}. Use the read tool with offset/limit to inspect more.]` : "";
+      const result = await webRead(url, signal);
+      const { markdown, finalUrl, method, contentType } = result;
+      if (result.image) {
+        return {
+          content: [
+            { type: "text", text: `Source: ${finalUrl}\nContent-Type: ${contentType}\nImage saved to: ${result.fullOutputPath}` },
+            result.image,
+          ],
+          details: { url: finalUrl, method, contentType, fullOutputPath: result.fullOutputPath },
+        };
+      }
+      const { preview, fullOutputPath } = await presentMarkdown(markdown, contentType);
+      const note = fullOutputPath ? `\n\n[Showing first 5,000 characters. Full content: ${fullOutputPath}. Use the read tool with offset/limit to inspect more.]` : "";
       return {
-        content: [{ type: "text", text: `Source: ${finalUrl}\n\n${preview}${note}` }],
-        details: { url: finalUrl, method, fullOutputPath },
+        content: [{ type: "text", text: `Source: ${finalUrl}\nContent-Type: ${contentType}\n\n${preview}${note}` }],
+        details: { url: finalUrl, method, contentType, fullOutputPath },
       };
     },
   });

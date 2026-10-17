@@ -18,3 +18,5 @@ Use `--wait-for 'literal phrase' --timeout 180` for a new matching message: old 
 Default bodies are short previews. Use `--metadata-only` for event discovery, `--json` for structured output, and `--full-body` only when needed. A progress notice or send event is not evidence of completed work.
 
 Inside a bridge RPC session, prefer the injected history command: it uses the bridge's scope capability and requires no transport credentials in Pi. The standalone reader is for interactive/operator use outside that scope.
+
+The [matrix skill](../matrix/SKILL.md) is the canonical interface for room/member/event reads, contacts, and reaction scans. This standalone reader remains compatible. `--identity-file` is optional when the profile names an existing token environment variable; inherited `MATRIX_URL`, `MATRIX_USER_ID`, and `MATRIX_TOKEN`, when present, must form a complete matching set. `--skip-progress` filters progress notices in both history and waits. Empty bounded results establish only that the scan found no match.

@@ -1,0 +1,5 @@
+{
+  "profile_file": "/path/to/private/profile.json",
+  "identity_file": "/path/to/private/matrix-identity.json",
+  "contacts_file": "/path/to/private/contacts.json"
+}

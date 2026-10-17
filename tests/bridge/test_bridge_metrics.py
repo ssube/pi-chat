@@ -6,6 +6,10 @@ from bridge.metrics import MetricsService, render_metrics
 
 
 class MetricsTests(unittest.IsolatedAsyncioTestCase):
+    def test_agent_metric_label_is_escaped(self):
+        body = render_metrics('agent"\\name\n', {}, 1.0)
+        self.assertIn('agent="agent\\"\\\\name\\n"', body)
+
     def test_render_marks_awake_when_a_turn_is_running(self):
         body = render_metrics("agent_three", {"total_scopes": 3, "active": 1, "awake": 1,
                                          "active_non_idle": 1}, 1000.0)

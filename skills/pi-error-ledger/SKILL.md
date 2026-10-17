@@ -10,3 +10,5 @@ Start with `errors`, `trends`, `patterns`, or `fixes`; use an `err-...` referenc
 Use `draft-fix`, `check-fix`, and `fix-evidence` to prepare and inspect a proposal. Cite occurrence IDs; keep raw logs owner-local. A changed pattern, instruction, or applicability needs renewed owner review and a fresh export. Publish only after the required owner approval using a mode-0600 JSON document and publisher-scoped credentials. Reuse the fix ID for updates. `corroborate-fix` adds evidence without silently changing reviewed content.
 
 Read [ledger operations](../../docs/ledger.md) for migration, ingestion, matching, export, and private-storage boundaries. If the database or matcher dependency is missing, report that limitation instead of fabricating a lookup result.
+
+Listings are bounded evidence, not a complete census. State the agent/filter/time scope and distinguish an empty successful query from unavailable credentials, dependencies or database access. Do not infer an agent has no failures from one capped listing. Keep proposed fixes within their reviewed agent and skill scope.

@@ -14,15 +14,15 @@ flowchart LR
   Bridge <-->|RPC pipes when room is unleased| Resident[Bridge Pi session]
 ```
 
-Read [attention, awareness, and continuity](docs/attention.md) for the mechanism, sequence diagrams, protocol, and delivery limits. See [installation](docs/installation.md), [tools and extensions](docs/components.md), [reviews](docs/reviews.md), and [the ledger](docs/ledger.md).
+Read [attention, awareness, and continuity](docs/attention.md) for the mechanism, sequence diagrams, protocol, and delivery limits. See [source provenance](docs/sources.md), [installation](docs/installation.md), [tools and extensions](docs/components.md), [reviews](docs/reviews.md), and [the ledger](docs/ledger.md).
 
 ## Contents
 
 | Directory | Purpose |
 | --- | --- |
 | `bridge/` | Matrix/Discord adapters, Pi RPC lifecycle, room leases, socket services, review queue |
-| `extensions/` | Interactive inbox, room labels, shell suggestions, questions, web tools, capture, topic labels |
-| `tools/` | Messaging, history, reactions, activity/session clients, ledger and fix tooling |
+| `extensions/` | Interactive inbox, room labels, shell suggestions, questions, web tools, clock, experimental background jobs, capture, topic labels |
+| `tools/` | Canonical Matrix operations, messaging, history, reactions, activity/session clients, ledger and fix tooling |
 | `skills/` | Agent-facing guidance for messaging, reading, awareness, reviews, and ledger use |
 | `tests/` | Synthetic fixtures and offline behavior tests |
 | `examples/` | Placeholder configuration only |
@@ -40,7 +40,12 @@ python -m unittest discover -s extensions/web-search -p 'test_*.py' -q
 node --test tests/*.test.cjs extensions/web-search/*.test.mjs extensions/observability/pi-capture/test/*.test.mjs extensions/observability/pi-topic/test/*.test.mjs
 bun test tests/room-lease.test.ts
 python -m ruff check --select E4,E7,E9,F bridge tools tests
+python -m mypy --follow-imports=silent --ignore-missing-imports bridge
+node extensions/observability/pi-topic/test/extension-smoke.mjs
+python tools/audit_export.py
 ```
+
+Background-job tests additionally require a systemd user manager and skip without one; the backend is [experimental](docs/background-jobs.md).
 
 Tests use fake transports/models and temporary files; some bind local TCP or Unix sockets. A full run needs those local operations permitted. Database migrations target a separately configured PostgreSQL service. No test requires production accounts or paid inference.
 

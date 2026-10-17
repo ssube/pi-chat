@@ -225,6 +225,7 @@ class DebugTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("sleeping", reply.await_args.args[0])
         runtime.admit.assert_not_awaited()
         runtime.submit.assert_not_awaited()
+        message.id += 1
         message.content = "<@9> !stop"
         runtime.stop_session = AsyncMock(return_value=True)
         await adapter._on_message(message)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import socket
 import stat
@@ -119,12 +120,14 @@ class RoomLeases:
                     raise ValueError("invalid inbox")
                 if current is not None:
                     if current.secret != secret or current.inbox != inbox:
-                        return {"ok": False}
+                        return {"ok": False, "reason": "interactive_session_active",
+                                "lease_seconds_remaining": max(0, math.ceil(
+                                    current.expires - time.monotonic()))}
                 else:
                     # Never run two Pi sessions on the same scope. This also
                     # checkpoints resident context before the local send starts.
                     if not await self.prepare(room):
-                        return {"ok": False}
+                        return {"ok": False, "reason": "bridge_handoff_unavailable"}
                     self.leases[room] = Lease(inbox, secret, 0)
                 self.leases[room].expires = time.monotonic() + LEASE_SECONDS
                 return {"ok": True, "created": current is None}

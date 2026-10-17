@@ -43,6 +43,56 @@ class FakePi:
 
 
 class AwarenessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_agent_four_transport_scopes_compact_before_three_minute_sleep(self):
+        with tempfile.TemporaryDirectory() as directory:
+            now = [1_000_000]
+            clients = {}
+            lifecycle = []
+
+            def factory(key, path):
+                pi = FakePi()
+
+                async def compact():
+                    lifecycle.append((key.transport, "compact"))
+                    return f"saved {key.transport} conversation"
+
+                async def stop():
+                    lifecycle.append((key.transport, "stop"))
+
+                pi.compact = compact
+                pi.stop = stop
+                clients[key] = pi
+                return pi
+
+            async def output(*args):
+                pass
+
+            runtime = BridgeRuntime(Path(directory), factory, output,
+                                    now_ms=lambda: now[0])
+            matrix = SessionKey("agent_four", "matrix", "!room:test:main")
+            discord = SessionKey("agent_four", "discord", "123")
+            for key in (matrix, discord):
+                self.assertFalse(await runtime.admit(key, False))
+                self.assertTrue(await runtime.admit(key, True))
+                await runtime.submit(key, Incoming("Operator", "ping", "Please reply"))
+                await clients[key].started.wait()
+                clients[key].release.set()
+                await runtime.wait_idle(key)
+            now[0] += 179_999
+            self.assertEqual(await runtime.sweep_idle(), 0)
+            self.assertTrue(await runtime.is_awake(matrix))
+            self.assertTrue(await runtime.is_awake(discord))
+            now[0] += 1
+            self.assertEqual(await runtime.sweep_idle(), 2)
+            for key in (matrix, discord):
+                self.assertFalse(await runtime.admit(key, False))
+                self.assertEqual([event for transport, event in lifecycle
+                                  if transport == key.transport], ["compact", "stop"])
+                checkpoint = read_checkpoint(key.directory(Path(directory)))
+                self.assertEqual(checkpoint.summary, f"saved {key.transport} conversation")
+                self.assertEqual(checkpoint.summary_saved_ms, now[0])
+            await runtime.close()
+
     async def test_ambient_steer_does_not_erase_completed_direct_reply(self):
         with tempfile.TemporaryDirectory() as directory:
             pi = FakePi("[[bridge:pass]]")

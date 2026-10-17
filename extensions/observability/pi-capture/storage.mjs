@@ -81,3 +81,15 @@ export function redactedExcerpt(root, id, extraSecrets = []) {
   const result = redactValue(detail, extraSecrets);
   return `Occurrence: ${id}\nStored evidence SHA-256: ${hash}\n` + bounded(JSON.stringify(result, null, 2), 6000);
 }
+
+/** Delivery audit contains only bounded references, versions, reasons and timing. */
+export function recordDeliveryReceipt({ root, agent, occurrenceId, outcome, metadata }) {
+  const id = `pidelivery-${randomUUID()}`;
+  const row = { id, occurrence_id: occurrenceId, agent, occurred_at: new Date().toISOString(), outcome, metadata };
+  const bytes = Buffer.from(JSON.stringify(row) + '\n');
+  if (bytes.length > 8192) throw new Error('oversized delivery receipt');
+  const outbox = join(resolve(root), 'outbox');
+  privateDir(outbox);
+  atomicPrivate(join(outbox, `${id}.json`), bytes);
+  return row;
+}

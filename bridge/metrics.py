@@ -9,6 +9,8 @@ from collections.abc import Callable
 from typing import Any
 
 from bridge.runtime.session import BridgeRuntime
+from bridge.telemetry import Telemetry
+from bridge.metric_labels import label_value
 
 
 log = logging.getLogger("agent_bridge.metrics")
@@ -32,6 +34,7 @@ def render_metrics(agent: str, summary: dict[str, object], timestamp: float,
     active = _count(summary.get("active", 0))
     awake = _count(summary.get("awake", 0))
     critical = _count(summary.get("active_non_idle", 0))
+    agent_label = label_value(agent)
     if disconnected:
         awake_v, connected_v, disconnected_v = 0, 0, 1
         total = active = awake = critical = 0
@@ -42,18 +45,18 @@ def render_metrics(agent: str, summary: dict[str, object], timestamp: float,
     lines = [
         "# HELP agent_bridge_presence Current lifecycle presence (1 when active).",
         "# TYPE agent_bridge_presence gauge",
-        f'agent_bridge_presence{{agent="{agent}",state="awake"}} {awake_v}',
-        f'agent_bridge_presence{{agent="{agent}",state="connected"}} {connected_v}',
-        f'agent_bridge_presence{{agent="{agent}",state="disconnected"}} {disconnected_v}',
+        f'agent_bridge_presence{{agent="{agent_label}",state="awake"}} {awake_v}',
+        f'agent_bridge_presence{{agent="{agent_label}",state="connected"}} {connected_v}',
+        f'agent_bridge_presence{{agent="{agent_label}",state="disconnected"}} {disconnected_v}',
         "# HELP agent_bridge_scopes Loaded conversation scopes by lifecycle state.",
         "# TYPE agent_bridge_scopes gauge",
-        f'agent_bridge_scopes{{agent="{agent}",state="total"}} {total}',
-        f'agent_bridge_scopes{{agent="{agent}",state="active"}} {active}',
-        f'agent_bridge_scopes{{agent="{agent}",state="awake"}} {awake}',
-        f'agent_bridge_scopes{{agent="{agent}",state="critical"}} {critical}',
+        f'agent_bridge_scopes{{agent="{agent_label}",state="total"}} {total}',
+        f'agent_bridge_scopes{{agent="{agent_label}",state="active"}} {active}',
+        f'agent_bridge_scopes{{agent="{agent_label}",state="awake"}} {awake}',
+        f'agent_bridge_scopes{{agent="{agent_label}",state="critical"}} {critical}',
         "# HELP agent_bridge_last_push_timestamp_seconds Unix time of the last push.",
         "# TYPE agent_bridge_last_push_timestamp_seconds gauge",
-        f"agent_bridge_last_push_timestamp_seconds{{agent=\"{agent}\"}} {timestamp!r}",
+        f"agent_bridge_last_push_timestamp_seconds{{agent=\"{agent_label}\"}} {timestamp!r}",
     ]
     return "\n".join(lines) + "\n"
 
@@ -87,7 +90,11 @@ class MetricsService:
 
     async def refresh(self) -> None:
         summary = await self.runtime.session_summary()
-        await self._push(render_metrics(self.agent, summary, self.now()))
+        body = render_metrics(self.agent, summary, self.now())
+        telemetry = getattr(self.runtime, "telemetry", None)
+        if isinstance(telemetry, Telemetry):
+            body += telemetry.render(self.agent)
+        await self._push(body)
 
     async def shutdown(self) -> None:
         """Stop the poll loop, then publish one final disconnected snapshot.
@@ -102,7 +109,11 @@ class MetricsService:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         try:
-            await self._push(render_metrics(self.agent, {}, self.now(), disconnected=True))
+            body = render_metrics(self.agent, {}, self.now(), disconnected=True)
+            telemetry = getattr(self.runtime, "telemetry", None)
+            if isinstance(telemetry, Telemetry):
+                body += telemetry.render(self.agent, disconnected=True)
+            await self._push(body)
         except Exception:
             log.warning("Could not push final disconnected metrics for %s",
                         self.agent, exc_info=True)

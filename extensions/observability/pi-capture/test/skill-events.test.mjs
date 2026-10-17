@@ -50,3 +50,11 @@ test('rejects invalid identity, skill, source, and symlinked storage', () => {
   symlinkSync(root, link);
   assert.throws(() => recordSkillEvent({ ...base, root: link }));
 });
+
+test('Agent Four skill telemetry uses its independent identity', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-agent-four-skill-'));
+  const row = recordSkillEvent({ root, agent: 'agent-four', origin: 'interactive',
+    skillName: 'pi-error-ledger', eventKind: 'loaded', source: 'read' });
+  assert.equal(row.agent, 'agent-four');
+  assert.deepEqual(JSON.parse(readFileSync(join(root, 'outbox', `${row.id}.json`), 'utf8')), row);
+});

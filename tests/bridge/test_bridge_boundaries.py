@@ -84,6 +84,23 @@ class ProfileBoundaryTests(unittest.TestCase):
             self.path.write_text(json.dumps(self.profile))
             self.assertEqual(Profile.load(self.path).discord.channel_ids, (456,))
 
+    def test_agent_four_accepts_each_transport_and_both_during_provisioning(self):
+        self.profile["agent"] = "agent_four"
+        self.profile["matrix"]["user_id"] = "@agent_four:example.test"
+        self.profile["discord"] = {"token_env": "TEST_DISCORD_TOKEN",
+                                   "guild_id": 123, "channel_ids": [456]}
+        with patch.dict(os.environ, {"TEST_DISCORD_TOKEN": "test-token"}):
+            profile = self.load()
+            self.assertEqual(profile.agent, "agent_four")
+            self.assertEqual(profile.matrix.waking_rooms, frozenset())
+            self.assertEqual(profile.discord.wake_on_any_channel_ids, ())
+            matrix = self.profile.pop("matrix")
+            self.assertIsNone(self.load().matrix)
+            self.profile["matrix"] = matrix
+            self.profile.pop("discord")
+            self.assertIsNone(self.load().discord)
+
+
 
 class CheckpointBoundaryTests(unittest.TestCase):
     def test_old_checkpoint_defaults_and_unknown_fields(self):

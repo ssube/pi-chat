@@ -9,9 +9,28 @@ import { fileURLToPath } from "node:url";
 import { Agent } from "undici";
 
 const CONVERTER = fileURLToPath(new URL("./html_to_markdown.py", import.meta.url));
+// HTML extraction needs BeautifulSoup, declared in the converter's own PEP 723
+// metadata. Run it through uv so the dependency resolves from the machine's uv
+// cache instead of from the session PATH; the argument list stays explicit, so
+// the session's own python3 remains first for the agent and everything else it
+// runs. PI_WEB_READ_PYTHON overrides the runner and may hold a whole command.
+export function converterCommand() {
+  return (process.env.PI_WEB_READ_PYTHON || "uv run --script").split(/\s+/).filter(Boolean);
+}
 const MAX_PAGE_BYTES = 2_000_000;
+const IMAGE_EXTENSIONS = new Map([
+  ["image/png", "png"], ["image/jpeg", "jpg"], ["image/gif", "gif"], ["image/webp", "webp"],
+]);
 const PREVIEW_CHARS = 5_000;
 const MAX_CONVERTER_OUTPUT = 4_000_000;
+const MAX_CONVERTER_ERROR = 500;
+
+// Fold the runner's leading stderr into the conversion error so a real cause
+// (a cold uv cache, a missing interpreter) is not reduced to a generic message.
+function converterFailure(stderr) {
+  const text = stderr.trim().replace(/\s+/g, " ");
+  return text ? ": " + text.slice(0, MAX_CONVERTER_ERROR) : "";
+}
 
 function publicIP(ip) {
   if (ip.startsWith("::ffff:")) return publicIP(ip.slice(7));
@@ -49,7 +68,7 @@ export function publicLookup(host, options, callback) {
   });
 }
 
-async function bodyText(response) {
+async function bodyBytes(response) {
   const reader = response.body.getReader();
   const chunks = [];
   let size = 0;
@@ -64,13 +83,33 @@ async function bodyText(response) {
   } finally {
     await reader.cancel().catch(() => {});
   }
-  return new TextDecoder().decode(Buffer.concat(chunks));
+  return Buffer.concat(chunks);
 }
 
-export async function presentMarkdown(markdown) {
+// Verify the declared format's signature, not the URL suffix. This is a
+// lightweight mismatch check, not a full image decoder or content sniffer.
+function imageSignatureMatches(bytes, type) {
+  if (type === "image/png") return bytes.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex"));
+  if (type === "image/jpeg") return bytes.subarray(0, 3).equals(Buffer.from("ffd8ff", "hex"));
+  if (type === "image/gif") return ["GIF87a", "GIF89a"].includes(bytes.subarray(0, 6).toString("latin1"));
+  return bytes.subarray(0, 4).toString("latin1") === "RIFF" && bytes.subarray(8, 12).toString("latin1") === "WEBP";
+}
+
+function contentKind(type) {
+  if (IMAGE_EXTENSIONS.has(type)) return "image";
+  if (type === "text/html" || type === "application/xhtml+xml") return "HTML extraction";
+  if (type === "text/markdown") return "site Markdown";
+  if (/^application\/(?:json|[\w.+-]+\+json)$/.test(type)) return "JSON";
+  if (type.startsWith("text/") || /^application\/(?:xml|[\w.+-]+\+xml|javascript|yaml|x-yaml)$/.test(type)) return "text";
+  return undefined;
+}
+
+export async function presentMarkdown(markdown, contentType = "text/markdown") {
   if (markdown.length <= PREVIEW_CHARS) return { preview: markdown };
   const dir = await mkdtemp(join(tmpdir(), "pi-web-read-"));
-  const fullOutputPath = join(dir, "page.md");
+  const kind = contentKind(contentType);
+  const extension = kind === "JSON" ? "json" : kind === "text" ? "txt" : "md";
+  const fullOutputPath = join(dir, `page.${extension}`);
   await writeFile(fullOutputPath, markdown, { encoding: "utf8", mode: 0o600 });
   return { preview: markdown.slice(0, PREVIEW_CHARS), fullOutputPath };
 }
@@ -84,19 +123,27 @@ export function cleanMarkdown(markdown) {
     .trim();
 }
 
-async function convertHtml(html, url, signal) {
+export async function convertHtml(html, url, signal) {
   return new Promise((resolve, reject) => {
-    const child = spawn("python3", [CONVERTER, url], { stdio: ["pipe", "pipe", "ignore"], signal });
+    const [runner, ...runnerArgs] = converterCommand();
+    const child = spawn(runner, [...runnerArgs, CONVERTER, url], { stdio: ["pipe", "pipe", "pipe"], signal });
     const timer = setTimeout(() => child.kill("SIGTERM"), 15000);
     let output = "";
+    let stderr = "";
     child.on("error", reject);
     child.stdout.on("data", (chunk) => {
       output += chunk.toString();
       if (output.length > MAX_CONVERTER_OUTPUT) child.kill("SIGTERM");
     });
+    child.stderr.on("data", (chunk) => {
+      // Keep the head; a runner reports the cause at the start of stderr.
+      if (stderr.length < MAX_CONVERTER_ERROR * 4) {
+        stderr = (stderr + chunk.toString()).slice(0, MAX_CONVERTER_ERROR * 4);
+      }
+    });
     child.on("close", (code) => {
       clearTimeout(timer);
-      if (code !== 0) reject(new Error("HTML-to-Markdown conversion failed"));
+      if (code !== 0) reject(new Error("HTML-to-Markdown conversion failed" + converterFailure(stderr)));
       else resolve(output.trim());
     });
     child.stdin.end(html);
@@ -110,7 +157,7 @@ export async function webRead(input, signal) {
   for (let redirects = 0; redirects <= 4; redirects++) {
     const dispatcher = new Agent({ connect: { lookup: publicLookup } });
     try {
-      const response = await fetch(url, { headers: { Accept: "text/markdown, text/html;q=0.9" }, redirect: "manual", signal: combined, dispatcher });
+      const response = await fetch(url, { headers: { Accept: "text/markdown, text/html;q=0.9, application/xhtml+xml;q=0.9, application/json;q=0.8, text/*;q=0.7, application/xml;q=0.7, image/png;q=0.6, image/jpeg;q=0.6, image/gif;q=0.6, image/webp;q=0.6" }, redirect: "manual", signal: combined, dispatcher });
       if (response.status >= 300 && response.status < 400) {
         if (redirects === 4 || !response.headers.get("location")) throw new Error("Too many redirects");
         await response.body?.cancel();
@@ -118,13 +165,30 @@ export async function webRead(input, signal) {
         continue;
       }
       if (!response.ok) throw new Error(`Web page returned HTTP ${response.status}`);
-      const type = response.headers.get("content-type")?.toLowerCase() ?? "";
-      if (!type.includes("text/markdown") && !type.includes("text/html")) throw new Error("Page did not return HTML or Markdown");
-      const body = await bodyText(response);
-      const method = type.includes("text/markdown") ? "site Markdown" : "HTML extraction";
-      const markdown = type.includes("text/markdown") ? cleanMarkdown(body) : await convertHtml(body, url.href, combined);
+      const contentType = (response.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+      const method = contentKind(contentType);
+      if (!method) {
+        await response.body?.cancel();
+        throw new Error(`Unsupported content type: ${contentType.slice(0, 100) || "missing"}`);
+      }
+      const bytes = await bodyBytes(response);
+      if (method === "image") {
+        if (!imageSignatureMatches(bytes, contentType)) throw new Error("Image signature does not match Content-Type");
+        const dir = await mkdtemp(join(tmpdir(), "pi-web-read-"));
+        const fullOutputPath = join(dir, `image.${IMAGE_EXTENSIONS.get(contentType)}`);
+        await writeFile(fullOutputPath, bytes, { mode: 0o600 });
+        return {
+          image: { type: "image", data: bytes.toString("base64"), mimeType: contentType },
+          fullOutputPath, finalUrl: url.href, method, contentType,
+        };
+      }
+      const body = new TextDecoder().decode(bytes);
+      // Keep non-HTML data verbatim: parsing JSON can lose integer precision,
+      // and Markdown cleanup can remove meaningful data or whitespace.
+      const markdown = method === "HTML extraction" ? await convertHtml(body, url.href, combined)
+        : method === "site Markdown" ? cleanMarkdown(body) : body;
       if (!markdown.trim()) throw new Error("No readable page content found");
-      return { markdown, finalUrl: url.href, method };
+      return { markdown, finalUrl: url.href, method, contentType };
     } finally {
       await dispatcher.close();
     }

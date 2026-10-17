@@ -309,7 +309,7 @@ class RoomLeaseTests(unittest.IsolatedAsyncioTestCase):
         waiting = asyncio.Event()
         proceed = asyncio.Event()
 
-        async def admit(*args):
+        async def admit(*args, **kwargs):
             waiting.set()
             await proceed.wait()
             return False
@@ -365,6 +365,28 @@ class RoomLeaseTests(unittest.IsolatedAsyncioTestCase):
             ROOM, event, None, {"event_id": "$parent"}, False)
         runtime.submit.assert_not_awaited()
         self.assertIn("$picture", adapter._seen)
+
+    async def test_competing_sessions_get_reason_and_remaining_time_without_owner_secrets(self):
+        self.assertTrue((await self.request())["ok"])
+        owner = self.leases.leases[ROOM]
+        with patch("bridge.room_lease.time.monotonic", return_value=1000):
+            owner.expires = 1090.2
+            for changes in ({"secret": "b" * 64}, {"inbox": str(self.root / "other.sock")}):
+                denied = await self.leases._command({
+                    "op": "acquire", "room": ROOM, "sender": USER, "secret": SECRET,
+                    "inbox": str(self.root / "inbox.sock"), **changes})
+                self.assertEqual(denied, {"ok": False, "reason": "interactive_session_active",
+                                          "lease_seconds_remaining": 91})
+                self.assertIs(self.leases.leases[ROOM], owner)
+                self.assertEqual(owner.expires, 1090.2)
+        self.assertEqual(self.prepare.await_count, 1)
+        self.assertNotIn(SECRET, json.dumps(denied))
+        self.assertNotIn(str(self.root), json.dumps(denied))
+
+    async def test_failed_handoff_reports_reason_without_claim_or_expiry_promise(self):
+        self.prepare.return_value = False
+        self.assertEqual(await self.request(), {"ok": False, "reason": "bridge_handoff_unavailable"})
+        self.assertNotIn(ROOM, self.leases.leases)
 
     async def test_wrong_sender_and_failed_preparation_never_claim(self):
         self.assertFalse((await self.request(sender="@other:example.test"))["ok"])

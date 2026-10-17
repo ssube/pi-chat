@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """Extract article-like text from downloaded HTML; no network access."""
+
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["beautifulsoup4==4.14.2"]
+# ///
 import re
 import sys
 from urllib.parse import urljoin, urlparse

@@ -14,7 +14,9 @@ import socket
 import stat
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, Literal, TypedDict, cast
+from typing import Any, Literal, NotRequired, TypedDict, cast
+
+from .mentions import Roster
 
 
 MAX_REQUEST_BYTES = 16_384
@@ -24,13 +26,14 @@ log = logging.getLogger("agent_bridge.history")
 _LOCAL_REJECTION_MESSAGES = {
     "capability": "history capability is not valid for this conversation",
     "awake": "history is available only for an awake conversation",
+    "unknown_target": "unknown or ambiguous target; enumerate canonical members",
 }
 
 
-class HistoryRejected(Exception):
+class HistoryRejected(ValueError):
     """A local authorization rejection with a fixed, Pi-safe message."""
 
-    def __init__(self, reason: Literal["capability", "awake"]) -> None:
+    def __init__(self, reason: Literal["capability", "awake", "unknown_target"]) -> None:
         self.reason = reason
         super().__init__(_LOCAL_REJECTION_MESSAGES[reason])
 
@@ -41,6 +44,8 @@ class HistoryRequest(TypedDict):
     before: str | None
     limit: int
     capability: str
+    operation: NotRequired[Literal["messages", "members"]]
+    targets: NotRequired[list[str]]
 
 
 class HistoryMessage(TypedDict):
@@ -56,13 +61,22 @@ class HistoryPage(TypedDict):
     has_more: bool
 
 
-FetchPage = Callable[[HistoryRequest], Awaitable[HistoryPage]]
+class MembersPage(TypedDict):
+    members: list[dict[str, object]]
+    next_before: str | None
+    has_more: bool
+    available: bool
+    complete: bool
+    resolved: NotRequired[list[str]]
+
+
+FetchPage = Callable[[HistoryRequest], Awaitable[HistoryPage | MembersPage]]
 
 
 def validate_request(request: Any) -> HistoryRequest:
     if not isinstance(request, dict):
         raise ValueError("history request must be an object")
-    if set(request) - {"transport", "scope", "before", "limit", "capability"}:
+    if set(request) - {"transport", "scope", "before", "limit", "capability", "operation", "targets"}:
         raise ValueError("history request contains unknown fields")
     transport = request.get("transport")
     scope = request.get("scope")
@@ -80,8 +94,57 @@ def validate_request(request: Any) -> HistoryRequest:
         raise ValueError("limit must be an integer between 1 and 100")
     if not isinstance(capability, str) or not 32 <= len(capability) <= 256:
         raise ValueError("history capability is required")
-    return {"transport": cast(Literal["matrix", "discord"], transport), "scope": scope,
-            "before": before, "limit": limit, "capability": capability}
+    result: HistoryRequest = {"transport": cast(Literal["matrix", "discord"], transport), "scope": scope,
+                              "before": before, "limit": limit, "capability": capability}
+    operation = request.get("operation", "messages")
+    if not isinstance(operation, str) or operation not in {"messages", "members"}:
+        raise ValueError("operation must be messages or members")
+    if operation == "members":
+        result["operation"] = "members"
+    if "targets" in request:
+        targets = request["targets"]
+        if (operation != "members" or not isinstance(targets, list) or not 1 <= len(targets) <= 32
+                or any(not isinstance(target, str) or not 1 <= len(target) <= 512 for target in targets)):
+            raise ValueError("targets must contain 1 to 32 member names or IDs")
+        result["targets"] = targets
+    return result
+
+
+def members_page(roster: Roster, before: str | None, limit: int,
+                 targets: list[str] | None = None) -> MembersPage:
+    if before is not None and (not before.isascii() or not before.isdecimal()):
+        raise ValueError("Invalid member cursor")
+    offset = int(before or "0")
+    selected = roster.members[offset:offset + limit]
+    more = offset + len(selected) < len(roster.members)
+    result: MembersPage = {"members": [member.to_json() for member in selected],
+            "next_before": str(offset + len(selected)) if more else None,
+            "has_more": more, "available": roster.available, "complete": roster.complete}
+    if targets is not None:
+        resolved = [roster.resolve_target(target) for target in targets]
+        if any(target is None for target in resolved):
+            raise HistoryRejected("unknown_target")
+        result["resolved"] = list(dict.fromkeys(target for target in resolved if target is not None))
+    return result
+
+
+def validate_members_page(value: Any) -> MembersPage:
+    if not isinstance(value, dict) or not isinstance(value.get("members"), list):
+        raise ValueError("invalid members page")
+    for member in value["members"]:
+        if (not isinstance(member, dict) or not isinstance(member.get("id"), str)
+                or not isinstance(member.get("name"), str) or not isinstance(member.get("kind"), str)
+                or member.get("kind") not in {"user", "role"}
+                or not isinstance(member.get("aliases"), list)
+                or any(not isinstance(alias, str) for alias in member["aliases"])):
+            raise ValueError("invalid member")
+    if (any(type(value.get(field)) is not bool for field in ("available", "complete", "has_more"))
+            or (value.get("next_before") is not None and not isinstance(value["next_before"], str))):
+        raise ValueError("invalid members page state")
+    if "resolved" in value and (not isinstance(value["resolved"], list) or
+                                any(not isinstance(target, str) for target in value["resolved"])):
+        raise ValueError("invalid resolved targets")
+    return cast(MembersPage, value)
 
 
 def validate_page(value: Any) -> HistoryPage:
@@ -157,7 +220,9 @@ class HistoryService:
         else:
             transport = request["transport"]
             try:
-                page = validate_page(await asyncio.wait_for(self.fetch_page(request), timeout=30))
+                value = await asyncio.wait_for(self.fetch_page(request), timeout=30)
+                page = (validate_members_page(value) if request.get("operation") == "members"
+                        else validate_page(value))
                 encoded = (json.dumps({"ok": True, "page": page}, ensure_ascii=False) + "\n").encode()
             except HistoryRejected as exc:
                 error = _LOCAL_REJECTION_MESSAGES[exc.reason]

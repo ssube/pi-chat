@@ -5,13 +5,13 @@ const { createJiti } = require(require.resolve('jiti', { paths: [path.resolve(__
 const extension = createJiti(__filename)(path.resolve(__dirname, '../extensions/follow-up-questions.ts')).default;
 
 function setup(branch = []) {
-  const handlers = {}, tools = {}, commands = {}, sent = [], widgets = [];
+  const handlers = {}, tools = {}, commands = {}, sent = [], widgets = [], selectTitles = [];
   let selections = [], answer, confirmed = true;
   const ctx = {
     mode: 'tui', sessionManager: { getBranch: () => branch },
     ui: {
       setWidget: (key, value) => widgets.push(value),
-      select: async () => selections.shift(),
+      select: async (title) => { selectTitles.push(title); return selections.shift(); },
       editor: async () => answer,
       confirm: async () => confirmed,
       notify() {},
@@ -25,7 +25,7 @@ function setup(branch = []) {
     sendUserMessage: async (...args) => sent.push(args),
   });
   handlers.session_start({}, ctx);
-  return { ctx, handlers, tools, commands, branch, sent, widgets,
+  return { ctx, handlers, tools, commands, branch, sent, widgets, selectTitles,
     choose: (...values) => { selections = values; },
     answer: (value) => { answer = value; },
     confirm: (value) => { confirmed = value; },
@@ -85,6 +85,22 @@ test('agent clears by id or all; restore follows current branch, IDs stay unique
   await call(s, { action: 'clear' });
   const next = await call(s, { action: 'add', question: 'Three?' });
   assert.equal(next.details.questions[0].id, 3);
+});
+
+test('optional context is stored, validated, and shown when reviewing the question', async () => {
+  const s = setup();
+  await call(s, { action: 'add', question: 'Plain?' });
+  const withContext = await call(s, { action: 'add', question: 'Why me?', context: 'The choice changes the design.' });
+  assert.equal(withContext.details.questions[0].context, undefined);
+  assert.equal(withContext.details.questions[1].context, 'The choice changes the design.');
+  const blank = await call(s, { action: 'add', question: 'Blank?', context: '   ' });
+  assert.equal(blank.details.questions[2].context, undefined);
+  const long = await call(s, { action: 'add', question: 'Long?', context: 'x'.repeat(2001) });
+  assert.match(long.content[0].text, /rejected/);
+  assert.equal(long.details.questions.length, 3);
+  s.choose('#2 Why me?', undefined);
+  await s.commands.questions.handler('', s.ctx);
+  assert.equal(s.selectTitles.at(-2), '#2 Why me?\n\nThe choice changes the design.');
 });
 
 test('invalid and full queues do not add questions', async () => {

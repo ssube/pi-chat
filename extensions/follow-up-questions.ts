@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-type Question = { id: number; text: string };
+type Question = { id: number; text: string; context?: string };
 type State = { questions: Question[]; nextId: number };
 const entryType = "follow-up-questions-state";
 
@@ -38,10 +38,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "queue_question",
 		label: "Queue follow-up question",
-		description: "Queue a concise, optional question for the user to answer later without blocking current work. Use when an answer would help but is not required to proceed safely. Do not use instead of asking immediately for required approval, spending, or consequential decisions. Use action=add with question; action=clear with id to withdraw a stale question, or omit id to clear all when the topic changes. The user can answer or clear questions with /questions.",
+		description: "Queue a concise, optional question for the user to answer later without blocking current work. Use when an answer would help but is not required to proceed safely. Do not use instead of asking immediately for required approval, spending, or consequential decisions. Use action=add with question, and optional context: a few sentences on why the question matters and relevant background, shown when the user reviews the question. Use action=clear with id to withdraw a stale question, or omit id to clear all when the topic changes. The user can answer or clear questions with /questions.",
 		parameters: Type.Object({
 			action: Type.Union([Type.Literal("add"), Type.Literal("clear")]),
 			question: Type.Optional(Type.String({ maxLength: 1000, description: "Question to queue (add only)" })),
+			context: Type.Optional(Type.String({ maxLength: 2000, description: "Brief context shown with the question: why it matters and relevant background (add only)" })),
 			id: Type.Optional(Type.Integer({ minimum: 1, description: "Question ID to clear; omit to clear all" })),
 		}),
 		executionMode: "sequential",
@@ -49,10 +50,13 @@ export default function (pi: ExtensionAPI) {
 			let result: string;
 			if (params.action === "add") {
 				const text = params.question?.trim();
+				const context = params.context?.trim();
 				if (!text || text.length > 1000) result = "Question rejected: provide nonempty text of at most 1000 characters.";
+				else if (context && context.length > 2000) result = "Question rejected: context must be at most 2000 characters.";
 				else if (questions.length >= 20) result = "Question queue is full (20); clear stale questions first.";
 				else {
-					const item = { id: nextId++, text };
+					const item: Question = { id: nextId++, text };
+					if (context) item.context = context;
 					questions = [...questions, item];
 					result = `Queued #${item.id}: ${item.text}. The user can answer later with /questions.`;
 				}
@@ -88,7 +92,8 @@ export default function (pi: ExtensionAPI) {
 				}
 				const item = questions[choices.indexOf(selected)];
 				if (!item) return;
-				const action = await ctx.ui.select(`#${item.id} ${item.text}`, ["Answer", "Clear this question", "Back"]);
+				const heading = item.context ? `#${item.id} ${item.text}\n\n${item.context}` : `#${item.id} ${item.text}`;
+				const action = await ctx.ui.select(heading, ["Answer", "Clear this question", "Back"]);
 				if (action === "Back" || action === undefined) continue;
 				if (action === "Clear this question") {
 					questions = questions.filter((q) => q.id !== item.id);

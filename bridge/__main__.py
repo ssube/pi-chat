@@ -15,14 +15,17 @@ from .adapters.matrix import MatrixAdapter
 from .activity import ActivityRejected, ActivityService
 from .activity_socket import ActivitySocket
 from .config import Profile
-from .history_service import HistoryPage, HistoryRejected, HistoryRequest, HistoryService
+from .health_socket import HealthSocket
+from .history_service import (HistoryPage, MembersPage, HistoryRejected, HistoryRequest,
+                              HistoryService, members_page)
 from .metrics import MetricsService
 from .reaction_service import ReactionRejected, ReactionRequest, ReactionService
 from .review_queue import ForgejoReviews, ReviewQueue
 from .room_lease import RoomLeases
-from .runtime.session import BridgeRuntime
+from .runtime.session import BridgeRuntime, PROGRESS_EDIT_INTERVAL
 from .runtime.state import SessionKey
 from .sessions_service import SessionsRequest, SessionsService
+from .turn_status import Indicator, TurnIndicators, TurnStatus
 
 
 log = logging.getLogger("agent_bridge")
@@ -34,11 +37,23 @@ async def run(profile: Profile) -> None:
     reaction_tokens: dict[SessionKey, str] = {}
     activity_tokens: dict[SessionKey, str] = {}
 
-    async def output(key: SessionKey, kind: str, text: str, request_id: str) -> None:
+    async def output(key: SessionKey, kind: str, text: str, request_id: str) -> bool | None:
         adapter = adapters.get(key.transport)
         if adapter is None:
             raise RuntimeError(f"No {key.transport} adapter for {profile.agent}")
-        await adapter.output(key, kind, text, request_id)
+        return await adapter.output(key, kind, text, request_id)
+
+    async def emit_indicator(record: Indicator, status: TurnStatus) -> str | None:
+        adapter = adapters.get(record.key.transport)
+        if adapter is None:
+            raise RuntimeError("indicator transport unavailable")
+        return await adapter.turn_status(record, status)
+
+    indicators = TurnIndicators(profile.state_dir / "turn-indicators.json", profile.agent,
+                                emit_indicator, interval=PROGRESS_EDIT_INTERVAL)
+
+    async def turn_status(key: SessionKey, request_id: str, status: TurnStatus, epoch: int) -> None:
+        await indicators.update(key, request_id, status, epoch)
 
     def pi_client(key: SessionKey, session_file: Path):
         history_token = secrets.token_urlsafe(32)
@@ -54,6 +69,8 @@ async def run(profile: Profile) -> None:
 
     runtime = BridgeRuntime(profile.state_dir / "sessions", pi_client, output,
                             failure_outbox=profile.observability_outbox,
+                            progress_summarizer=profile.summarize_progress,
+                            turn_status=turn_status,
                             image_captioner=(profile.describe_images
                                              if profile.image_model else None))
     review_queue = None
@@ -72,22 +89,26 @@ async def run(profile: Profile) -> None:
             profile.state_dir / "bridge-room-lease.sock",
             profile.matrix.rooms,
             profile.matrix.user_id, prepare_room)
-        adapters["matrix"] = MatrixAdapter(profile.agent, profile.matrix, runtime,
-                                            profile.state_dir / "matrix", review_queue,
-                                            room_leases)
+        adapter = MatrixAdapter(profile.agent, profile.matrix, runtime,
+                                profile.state_dir / "matrix", review_queue,
+                                room_leases)
+        adapters["matrix"] = adapter
     if profile.discord is not None:
         adapters["discord"] = DiscordAdapter(profile.agent, profile.discord, runtime)
     if review_queue is not None:
         async def review_react(room_id: str, event_id: str, emoji: str) -> None:
             await adapters["matrix"].react(SessionKey(profile.agent, "matrix", f"{room_id}:main"), event_id, emoji)
         review_queue.react = review_react
-    async def fetch_history(request: HistoryRequest) -> HistoryPage:
+    async def fetch_history(request: HistoryRequest) -> HistoryPage | MembersPage:
         key = SessionKey(profile.agent, request["transport"], request["scope"])
         if history_tokens.get(key) != request["capability"]:
             raise HistoryRejected("capability")
         adapter = adapters.get(key.transport)
         if adapter is None or not await runtime.is_awake(key):
             raise HistoryRejected("awake")
+        if request.get("operation") == "members":
+            roster = await adapter.member_roster(key)
+            return members_page(roster, request["before"], request["limit"], request.get("targets"))
         return await adapter.history_page(key, request["before"], request["limit"])
 
     history_service = HistoryService(profile.state_dir / "bridge-history.sock",
@@ -137,6 +158,7 @@ async def run(profile: Profile) -> None:
 
     activity_socket = ActivitySocket(profile.state_dir / "bridge-activity.sock",
                                      set_activity)
+    health_socket = HealthSocket(profile.state_dir / "bridge-health.sock")
     await history_service.start()
     try:
         if room_leases is not None:
@@ -144,7 +166,9 @@ async def run(profile: Profile) -> None:
         await reaction_service.start()
         await sessions_service.start()
         await activity_socket.start()
+        await health_socket.start()
     except Exception:
+        await health_socket.close()
         await activity_socket.close()
         await sessions_service.close()
         await reaction_service.close()
@@ -152,6 +176,12 @@ async def run(profile: Profile) -> None:
             await room_leases.close()
         await history_service.close()
         raise
+    # Singleton sockets are ours before any persisted running intent is
+    # classified interrupted. A second process must not repaint a live bridge.
+    try:
+        indicators.recover()
+    except OSError:
+        log.warning("Could not persist recovered turn indicators")
     stopping = asyncio.Event()
     checkpoint_requested = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -187,6 +217,7 @@ async def run(profile: Profile) -> None:
     tasks = [asyncio.create_task(adapter.run(), name=f"{name}-adapter")
              for name, adapter in adapters.items()]
     tasks.append(asyncio.create_task(sweep(), name="idle-sweep"))
+    tasks.append(asyncio.create_task(indicators.run(), name="turn-indicators"))
     tasks.append(asyncio.create_task(checkpoint_on_signal(), name="sighup-checkpoint"))
     tasks.append(asyncio.create_task(activity_service.run(), name="activity-status"))
     if metrics_service is not None:
@@ -194,6 +225,7 @@ async def run(profile: Profile) -> None:
     if review_queue is not None:
         tasks.append(asyncio.create_task(review_queue.run(), name="pr-review-queue"))
     tasks.append(asyncio.create_task(wait_for_shutdown(), name="shutdown-signal"))
+    health_socket.ready = True
     log.info("Bridge starting for %s with transports %s", profile.agent,
              ",".join(adapters))
     try:
@@ -208,6 +240,8 @@ async def run(profile: Profile) -> None:
                 raise RuntimeError(f"{task.get_name()} ended unexpectedly")
     finally:
         stopping.set()
+        health_socket.ready = False
+        indicators.close()
         await sessions_service.close()
         await reaction_service.close()
         await activity_socket.close()
@@ -226,6 +260,7 @@ async def run(profile: Profile) -> None:
         await runtime.close()
         if review_queue is not None:
             review_queue.close()
+        await health_socket.close()
 
 
 def main() -> None:

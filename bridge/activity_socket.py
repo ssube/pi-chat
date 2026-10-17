@@ -7,13 +7,13 @@ import json
 import logging
 import os
 import socket
-import stat
 import struct
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 from bridge.activity import ActivityRejected
+from bridge.socket_guard import remove_stale_socket
 
 
 MAX_BYTES = 4096
@@ -30,17 +30,7 @@ class ActivitySocket:
     async def start(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path.parent.chmod(0o700)
-        if self.path.exists() or self.path.is_socket():
-            info = self.path.lstat()
-            if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid():
-                raise RuntimeError("refusing to replace an unexpected activity socket")
-            probe = socket.socket(socket.AF_UNIX)
-            try:
-                if probe.connect_ex(str(self.path)) == 0:
-                    raise RuntimeError("another activity service owns this socket")
-            finally:
-                probe.close()
-            self.path.unlink()
+        remove_stale_socket(self.path, "activity")
         self._server = await asyncio.start_unix_server(self._handle, path=str(self.path))
         self.path.chmod(0o600)
 

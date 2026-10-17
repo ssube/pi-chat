@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import stat
 import sys
 import time
@@ -27,19 +28,47 @@ def private_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def credentials(profile_path: Path, identity_path: Path) -> tuple[str, str, str, set[str]]:
+def inherited_token(profile: dict[str, Any]) -> str:
+    """Use existing owner startup credentials; never load dotenv or persist tokens."""
+    name = profile.get("token_env")
+    if name is not None and (not isinstance(name, str) or
+                             not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)):
+        raise ValueError("profile Matrix token_env must be an environment variable name")
+    token = os.environ.get(name, "") if name else ""
+    startup = {key: os.environ.get("MATRIX_" + key, "")
+               for key in ("URL", "USER_ID", "TOKEN")}
+    if any(startup.values()):
+        if (not all(startup.values()) or startup["USER_ID"] != profile.get("user_id") or
+                startup["URL"].rstrip("/") != profile.get("homeserver", "").rstrip("/")):
+            raise ValueError("inherited Matrix sender does not match the owner bridge profile")
+        if token and token != startup["TOKEN"]:
+            raise ValueError("inherited Matrix token sources conflict")
+        token = startup["TOKEN"]
+    if not token:
+        raise ValueError("owner startup Matrix credentials are unavailable")
+    return token
+
+
+def profile_account(profile_path: Path):
     profile = private_json(profile_path).get("matrix")
-    identity = private_json(identity_path)
     if not isinstance(profile, dict):
         raise ValueError("profile has no Matrix configuration")
     url, user, rooms = profile.get("homeserver"), profile.get("user_id"), profile.get("rooms")
-    token = identity.get("token")
     if (not isinstance(url, str) or not url.startswith("https://") or
             not isinstance(user, str) or not user.startswith("@") or
-            not isinstance(rooms, list) or not isinstance(token, str) or not token or
-            identity.get("user_id") != user):
+            not isinstance(rooms, list)):
+        raise ValueError("profile has no usable Matrix account")
+    return profile, url.rstrip("/"), user, set(room for room in rooms if isinstance(room, str))
+
+
+def credentials(profile_path: Path, identity_path: Path | None = None) -> tuple[str, str, str, set[str]]:
+    profile, url, user, rooms = profile_account(profile_path)
+    identity = private_json(identity_path) if identity_path is not None else None
+    token = identity.get("token") if identity is not None else inherited_token(profile)
+    if (not isinstance(token, str) or not token or
+            (identity is not None and identity.get("user_id") != user)):
         raise ValueError("profile and identity do not describe the same usable Matrix account")
-    return url.rstrip("/"), user, token, set(room for room in rooms if isinstance(room, str))
+    return url, user, token, rooms
 
 
 def env_credentials(path: Path) -> tuple[str, str, str, set[str]]:
@@ -94,8 +123,10 @@ def since_ms(value: str | None) -> int | None:
 
 
 def progress(body: str) -> bool:
-    return (body.startswith("Using `") or body in {"Still working…", "I’m working on it.",
-                                                 "Added to the current response."})
+    if len(body) > 120 or "\n" in body or "\r" in body:
+        return False
+    return (body in {"Still working…", "I’m working on it.", "Added to the current response."} or
+            re.fullmatch(r"Using `(bash|read|write|edit|grep|find|ls)`(?:…|\.\.\.)?", body) is not None)
 
 
 def select(events: list[dict[str, Any]], *, sender: str | None, after_ms: int | None,
@@ -153,7 +184,7 @@ def history(url: str, token: str, room_id: str, *, limit: int, pages: int,
 
 
 def wait_for_message(url: str, token: str, room_id: str, *, sender: str, keyword: str,
-                     timeout: int, interval: int) -> dict[str, Any] | None:
+                     timeout: int, interval: int, skip_progress: bool = False) -> dict[str, Any] | None:
     """Start at the room's latest token, then scan only subsequent events."""
     path = "/_matrix/client/v3/rooms/" + urllib.parse.quote(room_id, safe="") + "/messages"
     baseline = get(url, token, path, {"dir": "b", "limit": 1})
@@ -172,7 +203,7 @@ def wait_for_message(url: str, token: str, room_id: str, *, sender: str, keyword
             if not isinstance(event, dict) or event.get("event_id") in old_ids:
                 continue
             matched = select([event], sender=sender, after_ms=None,
-                             skip_progress=False, contains=keyword)
+                             skip_progress=skip_progress, contains=keyword)
             if matched:
                 return matched[0]
         if isinstance(end, str) and end != cursor:
@@ -240,10 +271,10 @@ def main(argv: list[str] | None = None) -> int:
                          "--watch, --contains, or --since")
     if args.contact and not args.contacts_file:
         parser.error("--contact requires --contacts-file")
-    if bool(args.env_file) == bool(args.profile_file or args.identity_file):
-        parser.error("use either --env-file or both --profile-file and --identity-file")
-    if not args.env_file and not (args.profile_file and args.identity_file):
-        parser.error("--profile-file and --identity-file must be used together")
+    if bool(args.env_file) == bool(args.profile_file):
+        parser.error("use either --env-file or --profile-file")
+    if args.identity_file and not args.profile_file:
+        parser.error("--identity-file requires --profile-file")
     try:
         url, user, token, allowed_rooms = (env_credentials(args.env_file) if args.env_file
                                            else credentials(args.profile_file, args.identity_file))
@@ -256,7 +287,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.wait_for is not None:
             found = wait_for_message(url, token, room_id, sender=args.sender,
                                      keyword=args.wait_for, timeout=args.timeout,
-                                     interval=args.interval)
+                                     interval=args.interval, skip_progress=args.skip_progress)
             if found is None:
                 print("matrix-read: timed out waiting for a new matching message", file=sys.stderr)
                 return 2

@@ -21,3 +21,5 @@ A sent event ID proves acceptance by Matrix, not completion by the recipient. Re
 While interactive attention is active, mobile posts in the room enter the same desktop Pi session. Reply through this sender to make the response visible on mobile; ordinary terminal output is not mirrored. Bridge RPC sessions already publish their final response and should not send a duplicate through this helper.
 
 Read [attention and continuity](../../docs/attention.md) for expiry, fallback, and delivery limits.
+
+The canonical [matrix skill](../matrix/SKILL.md) also supports `send --contact NAME`, enabled-room updates without a recipient, bounded media and reactions. Keep this standalone sender path for existing callers. If safe handoff is unavailable, wait for current work or attention to finish; do not remove lease settings or change accounts to bypass it.

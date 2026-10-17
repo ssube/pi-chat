@@ -15,7 +15,7 @@ class FakeRuntime:
     async def is_awake(self, key):
         return self.awake
 
-    async def admit(self, key, can_wake):
+    async def admit(self, key, can_wake, *, on_wait=None):
         return self.awake or can_wake
 
     async def last_wake(self, key):

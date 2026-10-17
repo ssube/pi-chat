@@ -3,8 +3,9 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from bridge.runtime.pi_rpc import PiProviderError, PiRunResult, RpcImage
+from bridge.runtime.pi_rpc import PiProviderError, PiRpcError, PiRunResult, RpcImage
 from bridge.runtime.session import BridgeRuntime, Incoming, ReplyRejected, _deliver_progress
 from bridge.runtime.state import Checkpoint, SessionKey, read_checkpoint, write_checkpoint
 
@@ -83,6 +84,40 @@ class BridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(delivered, [("ack", "I’m working on it."),
                                          ("final", "Ask Agent_two about it.")])
             self.assertTrue(read_checkpoint(key.directory(Path(directory))).final_sent)
+
+    async def test_rejected_discord_final_is_rewritten_with_transport_feedback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            clients = []
+            delivered = []
+
+            class RevisionRpc(FakeRpc):
+                async def prompt(self, message, on_event, images=None, *, on_accepted=None):
+                    self.prompts.append(message)
+                    if on_accepted:
+                        await on_accepted()
+                    return PiRunResult("Ask @ghost about it." if len(self.prompts) == 1
+                                       else "Ask user about it.")
+
+            def factory(key, session_file):
+                client = RevisionRpc(session_file)
+                clients.append(client)
+                return client
+
+            async def send(key, kind, text, request_id):
+                if kind == "final" and "@ghost" in text:
+                    raise ReplyRejected("@ghost is not a resolved person here. People: user.")
+                delivered.append((kind, text))
+
+            runtime = BridgeRuntime(Path(directory), factory, send)
+            key = SessionKey("agent_two", "discord", "2")
+            await runtime.submit(key, Incoming("user", "1559374431523049503", "Start a PR"))
+            await asyncio.wait_for(runtime.wait_idle(key), timeout=1)
+            self.assertEqual(len(clients), 1)
+            self.assertEqual(len(clients[0].prompts), 2)
+            self.assertIn("not posted to the conversation", clients[0].prompts[1])
+            self.assertIn("People: user", clients[0].prompts[1])
+            self.assertEqual(delivered, [("ack", "I’m working on it."),
+                                         ("final", "Ask user about it.")])
 
     async def test_repeated_mention_rejection_never_posts_public_error(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -449,6 +484,148 @@ class BridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
             clients[1].release.set()
             await runtime.wait_idle(key)
 
+    async def test_optional_steer_and_caption_failure_use_request_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            clients = []
+            output = []
+
+            def factory(key, session_file):
+                client = FakeRpc(session_file)
+                clients.append(client)
+                return client
+
+            async def send(key, kind, text, request_id):
+                output.append((kind, text, request_id))
+
+            async def failed_caption(key, images):
+                raise RuntimeError("caption unavailable")
+
+            runtime = BridgeRuntime(Path(directory), factory, send,
+                                    image_captioner=failed_caption)
+            key = SessionKey("agent_one", "matrix", "!room:example.test:main")
+            await runtime.submit(key, Incoming("Operator", "1", "Direct"))
+            await clients[0].started.wait()
+            await runtime.submit(key, Incoming("Operator", "2", "Ambient", optional=True))
+            await runtime.submit(key, Incoming("Operator", "3", "Image",
+                                              (RpcImage("image/png", b"image"),), optional=True))
+            self.assertIn(("cleanup_request", "", "2"), output)
+            self.assertIn(("cleanup_request", "", "3"), output)
+            await runtime.submit(key, Incoming("Operator", "4", "Direct image",
+                                              (RpcImage("image/png", b"image"),)))
+            self.assertIn(("request_error", "I could not read that image. Please retry.", "4"), output)
+            self.assertFalse(any(kind == "cleanup" for kind, _, _ in output))
+            clients[0].release.set()
+            await runtime.wait_idle(key)
+            self.assertIn(("final", "Done", "1"), output)
+
+    async def test_queued_notice_handoff_finishes_before_terminal_reply(self):
+        with tempfile.TemporaryDirectory() as directory:
+            progress_started = asyncio.Event()
+            steer_accepted = asyncio.Event()
+            clients = []
+            delivered = []
+
+            class SteerRpc(FakeRpc):
+                async def steer(self, message, images=None):
+                    await super().steer(message, images)
+                    steer_accepted.set()
+
+            def factory(key, session_file):
+                client = SteerRpc(session_file)
+                clients.append(client)
+                return client
+
+            async def send(key, kind, text, request_id):
+                if kind == "progress":
+                    progress_started.set()
+                    await asyncio.Event().wait()
+                delivered.append((kind, request_id))
+
+            runtime = BridgeRuntime(Path(directory), factory, send)
+            key = SessionKey("agent_one", "matrix", "!room:example.test:main")
+            await runtime.submit(key, Incoming("Operator", "1", "First"))
+            await asyncio.wait_for(progress_started.wait(), 1)
+            steering = asyncio.create_task(runtime.submit(key, Incoming("Operator", "2", "Second")))
+            await asyncio.wait_for(steer_accepted.wait(), 1)
+            clients[0].release.set()
+            await asyncio.wait_for(steering, 1)
+            await asyncio.wait_for(runtime.wait_idle(key), 1)
+            self.assertIn(("steered", "2"), delivered)
+            self.assertEqual(delivered[-1], ("final", "1"))
+
+    async def test_progress_follows_successful_steer_notice(self):
+        with tempfile.TemporaryDirectory() as directory, patch(
+                "bridge.runtime.session.PROGRESS_EDIT_INTERVAL", 0):
+            clients = []
+            delivered = []
+            progress = asyncio.Event()
+
+            class EventRpc(FakeRpc):
+                async def prompt(self, message, on_event, images=None, *, on_accepted=None):
+                    self.on_event = on_event
+                    return await super().prompt(message, on_event, images, on_accepted=on_accepted)
+
+            def factory(key, session_file):
+                client = EventRpc(session_file)
+                clients.append(client)
+                return client
+
+            async def send(key, kind, text, request_id):
+                delivered.append((kind, text, request_id))
+                if kind == "progress":
+                    progress.set()
+
+            runtime = BridgeRuntime(Path(directory), factory, send)
+            key = SessionKey("agent_one", "matrix", "!room:example.test:main")
+            await runtime.submit(key, Incoming("Operator", "1", "First"))
+            await asyncio.wait_for(progress.wait(), 1)
+            self.assertEqual(delivered[-1][2], "1")
+            progress.clear()
+            self.assertEqual(await runtime.submit(key, Incoming("Operator", "2", "Second")), "steered")
+            await clients[0].on_event({"type": "tool_execution_start", "toolName": "Read"})
+            await asyncio.wait_for(progress.wait(), 1)
+            self.assertEqual(delivered[-1], ("progress", "Using `Read`…", "2"))
+            clients[0].release.set()
+            await runtime.wait_idle(key)
+            self.assertEqual(delivered[-1], ("final", "Done", "1"))
+
+    async def test_failed_steer_notice_keeps_previous_progress_target(self):
+        with tempfile.TemporaryDirectory() as directory, patch(
+                "bridge.runtime.session.PROGRESS_EDIT_INTERVAL", 0):
+            clients = []
+            progress = asyncio.Event()
+            targets = []
+
+            class EventRpc(FakeRpc):
+                async def prompt(self, message, on_event, images=None, *, on_accepted=None):
+                    self.on_event = on_event
+                    return await super().prompt(message, on_event, images,
+                                                on_accepted=on_accepted)
+
+            def factory(key, session_file):
+                client = EventRpc(session_file)
+                clients.append(client)
+                return client
+
+            async def send(key, kind, text, request_id):
+                if kind == "steered":
+                    raise RuntimeError("notice unavailable")
+                if kind == "progress":
+                    targets.append(request_id)
+                    progress.set()
+
+            runtime = BridgeRuntime(Path(directory), factory, send)
+            key = SessionKey("agent_one", "matrix", "!room:example.test:main")
+            await runtime.submit(key, Incoming("Operator", "1", "First"))
+            await asyncio.wait_for(progress.wait(), 1)
+            progress.clear()
+            self.assertEqual(await runtime.submit(key, Incoming("Operator", "2", "Second")), "steered")
+            await clients[0].on_event({"type": "tool_execution_start", "toolName": "Read"})
+            await asyncio.wait_for(progress.wait(), 1)
+            self.assertEqual(targets, ["1", "1"])
+            clients[0].release.set()
+            await runtime.wait_idle(key)
+
     async def test_steering_activity_and_summary_only_revival(self):
         with tempfile.TemporaryDirectory() as directory:
             now = [1_000_000]
@@ -596,7 +773,10 @@ class BridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(delivered, ["ack", "final"])
 
     async def test_progress_edits_are_ordered_and_bounded(self):
-        with tempfile.TemporaryDirectory() as directory:
+        # The coalescing window is patched short so the assertion is about
+        # ordering, not about how long the production cadence happens to be.
+        with tempfile.TemporaryDirectory() as directory, patch(
+                "bridge.runtime.session.PROGRESS_EDIT_INTERVAL", 0.05):
             first_started = asyncio.Event()
             release_first = asyncio.Event()
             last_started = asyncio.Event()
@@ -631,7 +811,10 @@ class BridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(edits, ["Using `first`…", "Using `third`…"])
 
     async def test_progress_burst_collapses_into_one_edit(self):
-        with tempfile.TemporaryDirectory() as directory:
+        # Patching the window keeps this a test of burst collapse rather than a
+        # wall-clock proxy for the cadence constant itself.
+        with tempfile.TemporaryDirectory() as directory, patch(
+                "bridge.runtime.session.PROGRESS_EDIT_INTERVAL", 0.05):
             first_started = asyncio.Event()
             release_burst = asyncio.Event()
             last_started = asyncio.Event()
@@ -884,6 +1067,231 @@ class BridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("summary before the new wake", clients[1].prompts[0])
             clients[1].release.set()
             await runtime.wait_idle(key)
+
+    async def test_admission_notices_compaction_and_preserves_unmentioned_followup(self):
+        for notice_fails in (False, True):
+            with self.subTest(notice_fails=notice_fails), tempfile.TemporaryDirectory() as directory:
+                now = [1_000_000]
+                compact_started = asyncio.Event()
+                finish_compact = asyncio.Event()
+                noticed = asyncio.Event()
+                clients = []
+
+                class SlowCompactRpc(FakeRpc):
+                    async def compact(self):
+                        compact_started.set()
+                        await finish_compact.wait()
+                        return "new saved summary"
+
+                def factory(key, session_file):
+                    client = SlowCompactRpc(session_file)
+                    clients.append(client)
+                    return client
+
+                async def send(key, kind, text, request_id):
+                    pass
+
+                async def notice():
+                    noticed.set()
+                    if notice_fails:
+                        raise OSError("notice unavailable")
+
+                runtime = BridgeRuntime(Path(directory), factory, send,
+                                        now_ms=lambda: now[0])
+                key = SessionKey("agent_one", "matrix", "compaction-wait")
+                await runtime.submit(key, Incoming("Operator", "1", "First"))
+                await clients[0].started.wait()
+                clients[0].release.set()
+                await runtime.wait_idle(key)
+                now[0] += 181_000
+                sweep = asyncio.create_task(runtime.sweep_idle())
+                await asyncio.wait_for(compact_started.wait(), timeout=1)
+                census = await runtime.session_summary()
+                self.assertEqual(census["state_breakdown"], {"compacting": 1})
+                self.assertEqual(census["active_non_idle"], 1)
+                admission = asyncio.create_task(runtime.admit(key, False, on_wait=notice))
+                await asyncio.wait_for(noticed.wait(), timeout=1)
+                self.assertFalse(admission.done())
+                self.assertEqual(len(clients), 1)
+                self.assertFalse(clients[0].stopped)
+                abandoned = asyncio.create_task(runtime.admit(key, True, on_wait=notice))
+                await asyncio.sleep(0)
+                abandoned.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await abandoned
+                self.assertFalse(sweep.done())
+                self.assertFalse(clients[0].stopped)
+                finish_compact.set()
+                self.assertEqual(await asyncio.wait_for(sweep, timeout=1), 1)
+                self.assertTrue(await asyncio.wait_for(admission, timeout=1))
+                self.assertEqual((await runtime.session_summary())["active_non_idle"], 0)
+                await runtime.submit(key, Incoming("Operator", "2", "Follow-up", optional=True))
+                await clients[1].started.wait()
+                self.assertIn("new saved summary", clients[1].prompts[0])
+                self.assertIn("Follow-up", clients[1].prompts[0])
+                clients[1].release.set()
+                await runtime.wait_idle(key)
+
+    async def test_automatic_compaction_defers_messages_in_order_without_interrupting_pi(self):
+        for reason, outcome, settles in (("threshold", {}, False),
+                                         ("overflow", {"willRetry": True}, False),
+                                         ("threshold", {"aborted": True}, False),
+                                         ("overflow", {"errorMessage": "synthetic failure"}, False),
+                                         ("threshold", {}, True)):
+            with self.subTest(reason=reason, outcome=outcome, settles=settles), tempfile.TemporaryDirectory() as directory:
+                compact_started = asyncio.Event()
+                finish_compact = asyncio.Event()
+                noticed = asyncio.Event()
+                clients = []
+                output = []
+
+                class AutomaticRpc(FakeRpc):
+                    async def prompt(self, message, on_event, images=None, *, on_accepted=None):
+                        self.prompts.append(message)
+                        if on_accepted:
+                            await on_accepted()
+                        if len(self.prompts) > 1:
+                            return PiRunResult("Handled queued input")
+                        self.active = True
+                        await on_event({"type": "compaction_start", "reason": reason})
+                        compact_started.set()
+                        await finish_compact.wait()
+                        await on_event({"type": "compaction_end", "reason": reason, **outcome})
+                        if not settles:
+                            await self.release.wait()
+                        self.active = False
+                        return PiRunResult("Done after automatic compaction")
+
+                    async def steer(self, message, images=None):
+                        if not finish_compact.is_set():
+                            raise AssertionError("input interrupted automatic compaction")
+                        await super().steer(message, images)
+
+                def factory(key, session_file):
+                    client = AutomaticRpc(session_file)
+                    clients.append(client)
+                    return client
+
+                async def send(key, kind, text, request_id):
+                    output.append((kind, text, request_id))
+                    if kind == "compacting":
+                        noticed.set()
+
+                runtime = BridgeRuntime(Path(directory), factory, send)
+                key = SessionKey("agent_one", "matrix", "automatic-compaction")
+                await runtime.submit(key, Incoming("Operator", "1", "First"))
+                await asyncio.wait_for(compact_started.wait(), 1)
+                first = asyncio.create_task(runtime.submit(key, Incoming("Operator", "2", "Second")))
+                await asyncio.wait_for(noticed.wait(), 1)
+                second = asyncio.create_task(runtime.submit(key, Incoming("Operator", "3", "Third")))
+                await asyncio.sleep(0)
+                self.assertFalse(first.done())
+                self.assertFalse(second.done())
+                self.assertEqual(clients[0].steers, [])
+                self.assertFalse(clients[0].aborted)
+                self.assertFalse(clients[0].stopped)
+                self.assertEqual((await runtime.session_summary())["state_breakdown"], {"compacting": 1})
+                abandoned = asyncio.create_task(runtime.admit(key, True))
+                await asyncio.sleep(0)
+                abandoned.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await abandoned
+                self.assertFalse(clients[0].aborted)
+                finish_compact.set()
+                self.assertEqual(await asyncio.wait_for(asyncio.gather(first, second), 1),
+                                 ["started", "started"] if settles else ["steered", "steered"])
+                self.assertEqual(len(clients), 1)  # auto-compaction keeps the same live Pi
+                delivered = clients[0].prompts[1:] if settles else clients[0].steers
+                self.assertIn("Second", delivered[0])
+                self.assertIn("Third", delivered[1])
+                self.assertFalse(any(kind == "error" for kind, _, _ in output))
+                clients[0].release.set()
+                await runtime.wait_idle(key)
+                self.assertEqual((await runtime.session_summary())["state_breakdown"], {"idle": 1})
+
+    async def test_auto_compaction_starting_after_admission_is_rechecked_before_steering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            clients = []
+            noticed = asyncio.Event()
+
+            class EventRpc(FakeRpc):
+                async def prompt(self, message, on_event, images=None, *, on_accepted=None):
+                    self.on_event = on_event
+                    return await super().prompt(message, on_event, images, on_accepted=on_accepted)
+
+            def factory(key, session_file):
+                client = EventRpc(session_file)
+                clients.append(client)
+                return client
+
+            async def caption(key, images):
+                await clients[0].on_event({"type": "compaction_start", "reason": "threshold"})
+                return "synthetic caption"
+
+            async def send(key, kind, text, request_id):
+                if kind == "compacting":
+                    noticed.set()
+
+            runtime = BridgeRuntime(Path(directory), factory, send, image_captioner=caption)
+            key = SessionKey("agent_one", "matrix", "late-auto-compaction")
+            await runtime.submit(key, Incoming("Operator", "1", "First"))
+            await clients[0].started.wait()
+            self.assertTrue(await runtime.admit(key, True))
+            pending = asyncio.create_task(runtime.submit(key, Incoming(
+                "Operator", "2", "Image follow-up", (RpcImage("image/png", b"synthetic"),))))
+            await asyncio.wait_for(noticed.wait(), 1)
+            self.assertFalse(pending.done())
+            self.assertEqual(clients[0].steers, [])
+            await clients[0].on_event({"type": "compaction_end", "reason": "threshold",
+                                      "result": {"summary": "synthetic"}})
+            self.assertEqual(await asyncio.wait_for(pending, 1), "steered")
+            self.assertIn("Image follow-up", clients[0].steers[0])
+            clients[0].release.set()
+            await runtime.wait_idle(key)
+
+    async def test_rpc_failure_without_compaction_end_releases_waiting_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            compact_started = asyncio.Event()
+            fail_rpc = asyncio.Event()
+            noticed = asyncio.Event()
+            clients = []
+
+            class BrokenAutomaticRpc(FakeRpc):
+                async def prompt(self, message, on_event, images=None, *, on_accepted=None):
+                    self.prompts.append(message)
+                    if on_accepted:
+                        await on_accepted()
+                    if self is clients[0] and len(self.prompts) == 1:
+                        self.active = True
+                        await on_event({"type": "compaction_start", "reason": "threshold"})
+                        compact_started.set()
+                        await fail_rpc.wait()
+                        self.active = False
+                        raise PiRpcError("synthetic RPC exit before compaction_end")
+                    return PiRunResult("Recovered input")
+
+            def factory(key, session_file):
+                client = BrokenAutomaticRpc(session_file)
+                clients.append(client)
+                return client
+
+            async def send(key, kind, text, request_id):
+                if kind == "compacting":
+                    noticed.set()
+
+            runtime = BridgeRuntime(Path(directory), factory, send)
+            key = SessionKey("agent_one", "matrix", "automatic-rpc-failure")
+            await runtime.submit(key, Incoming("Operator", "1", "First"))
+            await asyncio.wait_for(compact_started.wait(), 1)
+            pending = asyncio.create_task(runtime.submit(key, Incoming("Operator", "2", "Keep this")))
+            await asyncio.wait_for(noticed.wait(), 1)
+            fail_rpc.set()
+            self.assertEqual(await asyncio.wait_for(pending, 1), "started")
+            await asyncio.wait_for(runtime.wait_idle(key), 1)
+            self.assertEqual(len(clients), 2)
+            self.assertTrue(clients[0].stopped)
+            self.assertIn("Keep this", clients[1].prompts[0])
+            self.assertEqual((await runtime.session_summary())["state_breakdown"], {"idle": 1})
 
     async def test_restart_archives_interrupted_transcript(self):
         with tempfile.TemporaryDirectory() as directory:

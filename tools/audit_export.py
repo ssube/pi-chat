@@ -5,7 +5,7 @@ import argparse
 import re
 from pathlib import Path
 
-IGNORED = {'.git', 'node_modules', '__pycache__', '.venv', '.mypy_cache', '.ruff_cache', '.pytest_cache'}
+IGNORED = {'.git', 'node_modules', '__pycache__', '.venv', '.mypy_cache', '.ruff_cache', '.pytest_cache', '.hypothesis'}
 FORBIDDEN_SUFFIXES = {'.sock', '.sqlite3', '.log', '.pem', '.key', '.pyc'}
 
 

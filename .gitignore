@@ -17,3 +17,5 @@ state/
 *.sock
 *.log
 private/
+
+.hypothesis/
