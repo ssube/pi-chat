@@ -10,6 +10,16 @@ const { setTimeout: delay } = require('node:timers/promises');
 const { createJiti } = require(require.resolve('jiti', { paths: [path.resolve(__dirname, '../extensions')] }));
 const { default: extension, retentionConfig, expiredJobs } = createJiti(__filename)(path.resolve(__dirname, '../extensions/background-jobs.ts'));
 
+nodeTest('stable backend registers its tools without a draft label', () => {
+  const tools = {};
+  extension({ on() {}, registerTool: tool => tools[tool.name] = tool, registerCommand() {} });
+  assert.deepEqual(Object.keys(tools).sort(), [
+    'background_cancel', 'background_list', 'background_start', 'background_status',
+  ]);
+  assert.match(tools.background_start.description, /^Systemd backend:/);
+  assert.doesNotMatch(tools.background_start.description, /draft|experimental/i);
+});
+
 function setup(t, mode = 'tui', env = {}) {
   const handlers = {}, tools = {}, commands = {}, sent = [], statuses = [], selections = [], titles = [], choicesShown = [], branch = [];
   let confirmed = true;

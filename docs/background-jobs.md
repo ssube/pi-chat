@@ -1,6 +1,6 @@
-# Experimental background jobs
+# Background jobs
 
-`extensions/background-jobs.ts` is an opt-in **draft systemd backend**. It requires Linux, `/bin/bash`, `systemd-run`, `systemctl`, a reachable systemd user manager, and a Node-compatible runtime. No direct-process fallback is provided. Do not load it alongside another extension registering the same tools or `/jobs`.
+`extensions/background-jobs.ts` is an opt-in **stable systemd backend**. It requires Linux, `/bin/bash`, `systemd-run`, `systemctl`, a reachable systemd user manager, and a Node-compatible runtime. No direct-process fallback is provided. Do not load it alongside another extension registering the same tools or `/jobs`.
 
 ```sh
 npm ci --prefix extensions --ignore-scripts

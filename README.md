@@ -14,7 +14,7 @@ Read [attention, awareness, and continuity](docs/attention.md) for the mechanism
 | Directory | Purpose |
 | --- | --- |
 | `bridge/` | Matrix/Discord adapters, Pi RPC lifecycle, room leases, socket services, review queue |
-| `extensions/` | Interactive inbox, room labels, shell suggestions, questions, web tools, clock, experimental background jobs, capture, topic labels |
+| `extensions/` | Interactive inbox, room labels, shell suggestions, questions, web tools, clock, stable systemd background jobs, capture, topic labels |
 | `tools/` | Canonical Matrix operations, messaging, history, reactions, activity/session clients, ledger and fix tooling |
 | `skills/` | Agent-facing guidance for messaging, reading, awareness, reviews, and ledger use |
 | `tests/` | Synthetic fixtures and offline behavior tests |
@@ -27,7 +27,7 @@ The bridge runs on Linux with Python 3.11+ and a compatible Pi executable. Exten
 - Reload supported profile settings without restarting the bridge.
 - Configurable conversation model modes, with explicit switching on Matrix and Discord.
 - Bounded Discord reconnect recovery with per-scope holds and retries.
-- Branch-persistent session task ledger with evidence judging, user overrides, list sharing, and advisory summary steering.
+- Branch-persistent session task ledger with evidence judging, user overrides, agent unblocking, colored progress with a one-task progress limit, list sharing, and advisory summary steering.
 - Standalone, private HTML session export with optional cached AI chapters.
 - Configurable active background-job limits and completed-history pruning; artifacts are preserved.
 
@@ -49,7 +49,7 @@ node extensions/observability/pi-topic/test/extension-smoke.mjs
 python tools/audit_export.py
 ```
 
-Background-job tests additionally require a systemd user manager and skip without one; the backend is [experimental](docs/background-jobs.md).
+Background-job tests additionally require a systemd user manager and skip without one; see the [stable backend prerequisites and limits](docs/background-jobs.md).
 
 Tests use fake transports/models and temporary files; some bind local TCP or Unix sockets. A full run needs those local operations permitted. Database migrations target a separately configured PostgreSQL service. No test requires production accounts or paid inference.
 

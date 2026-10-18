@@ -399,7 +399,7 @@ class MatrixOutputTests(unittest.IsolatedAsyncioTestCase):
             adapter = matrix_adapter(directory, matrix_runtime())
             adapter._request = AsyncMock(side_effect=RuntimeError("nope"))
             self.assertIsNone(await adapter._room_members(ROOM))
-            roster = {"@b:example.test": {"display_name": "Briana"}}
+            roster = {"@b:example.test": {"display_name": "Bailey"}}
             adapter._rosters[ROOM] = (time.monotonic() + 60, roster)
             adapter._request = AsyncMock(side_effect=AssertionError("cached"))
             self.assertIs(await adapter._room_members(ROOM), roster)
