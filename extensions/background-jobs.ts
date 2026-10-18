@@ -1,4 +1,4 @@
-// DRAFT: systemd user-service backend. Not installed; no direct-process fallback.
+// Stable systemd user-service backend. Opt-in; no direct-process fallback.
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, fstatSync, mkdtempSync, openSync, readFileSync, readSync, renameSync, statSync, watch, writeFileSync, type FSWatcher } from "node:fs";
@@ -405,14 +405,14 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "background_start", label: "Start background job",
-		description: "DRAFT systemd backend: launch an authorized /bin/bash command as a transient user oneshot service without blocking the conversation. Required timeout_seconds maps to TimeoutStartSec; unsafe_to_terminate uses infinity and forbids extension-initiated stops. systemd owns cgroup termination. ExecStopPost persists exit results independently of Pi and unit collection; completion steers structured combined output. Requires Linux, a working user manager, systemd-run, systemctl and a Node-compatible runtime. Logs and results are private disk files; the inherited environment is temporarily stored owner-only and removed by the hook. No direct-process fallback. File events drive completion with slow reconciliation as backup; progress_interval defaults to off and never steers automatically. Session services share pi-jobs-<sessionHash>.slice. Active-job limit and completed-history retention are configurable (defaults: 5 active, newest 100 completed, 24 hours). Pruning preserves disk artifacts. Grants no new permissions or spending authority.",
+		description: "Systemd backend: launch an authorized /bin/bash command as a transient user oneshot service without blocking the conversation. Required timeout_seconds maps to TimeoutStartSec; unsafe_to_terminate uses infinity and forbids extension-initiated stops. systemd owns cgroup termination. ExecStopPost persists exit results independently of Pi and unit collection; completion steers structured combined output. Requires Linux, a working user manager, systemd-run, systemctl and a Node-compatible runtime. Logs and results are private disk files; the inherited environment is temporarily stored owner-only and removed by the hook. No direct-process fallback. File events drive completion with slow reconciliation as backup; progress_interval defaults to off and never steers automatically. Session services share pi-jobs-<sessionHash>.slice. Active-job limit and completed-history retention are configurable (defaults: 5 active, newest 100 completed, 24 hours). Pruning preserves disk artifacts. Grants no new permissions or spending authority.",
 		parameters: Type.Object({ command: Type.String({ minLength: 1, maxLength: 4096 }),
 			label: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
 			timeout_seconds: Type.Number({ minimum: 0.001, maximum: 2_147_483 }), unsafe_to_terminate: Type.Optional(Type.Boolean()),
 			progress_interval: Type.Optional(Type.Union([Type.Literal("off"), Type.Literal("5s"), Type.Literal("30s"), Type.Literal("1m"), Type.Literal("5m"), Type.Literal("15m"), Type.Literal("1h")])) }),
 		outputSchema, executionMode: "sequential",
 		async execute(_id, params, signal, _update, context) {
-			if (process.platform !== "linux") throw new Error("This draft requires Linux and a systemd user manager.");
+			if (process.platform !== "linux") throw new Error("Background jobs require Linux and a systemd user manager.");
 			if (!ctx || shuttingDown) throw new Error("No active background-job session.");
 			if (signal?.aborted) throw new Error("Launch cancelled.");
 			if (!params.command.trim() || params.command.includes("\0") || params.command.length > 4096) throw new Error("Invalid command.");

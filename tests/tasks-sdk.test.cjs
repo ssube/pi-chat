@@ -34,7 +34,7 @@ test('Pi SDK: real settlement boundary continues early stops, injects task conte
   manager.appendCustomEntry('tasks-state-v1', { version: 1, nextId: 2, paused: false,
     tasks: [{ id: 1, summary: 'Finish the example', acceptance: 'Example has verified output', status: 'pending' }] });
   const { session } = await sdk.createAgentSession({ cwd: dir, agentDir: dir, modelRuntime: runtime, model,
-    resourceLoader, sessionManager: manager, settingsManager, tools: ['tasks_list', 'tasks_add', 'tasks_complete', 'tasks_block', 'tasks_summary'] });
+    resourceLoader, sessionManager: manager, settingsManager, tools: ['tasks_list', 'tasks_add', 'tasks_complete', 'tasks_block', 'tasks_unblock', 'tasks_progress', 'tasks_summary'] });
   const requests = [], errors = [], asideRequests = []; let nextTool;
   runtime.complete = async (_model, context) => {
     asideRequests.push(context);
@@ -82,6 +82,16 @@ test('Pi SDK: real settlement boundary continues early stops, injects task conte
     assert.ok(JSON.parse(asideRequests[1].messages[0].content).recent_messages.some(message => /Use the summary tool/.test(message.text)));
     const latestState = manager.getBranch().filter(entry => entry.type === 'custom' && entry.customType === 'tasks-state-v1').at(-1).data;
     assert.equal(latestState.tasks[0].status, 'pending', 'advice never completes a task');
+    nextTool = { type: 'toolCall', id: 'block-tool', name: 'tasks_block', arguments: { task_id: 1, reason: 'Waiting for prerequisite' } };
+    await session.prompt('Block the task.');
+    assert.equal(manager.getBranch().filter(entry => entry.type === 'custom' && entry.customType === 'tasks-state-v1').at(-1).data.tasks[0].status, 'blocked');
+    nextTool = { type: 'toolCall', id: 'unblock-tool', name: 'tasks_unblock', arguments: { task_id: 1 } };
+    await session.prompt('The prerequisite is resolved; unblock the task.');
+    const resumed = manager.getBranch().filter(entry => entry.type === 'custom' && entry.customType === 'tasks-state-v1').at(-1).data.tasks[0];
+    assert.equal(resumed.status, 'pending'); assert.equal(resumed.blocker, undefined);
+    nextTool = { type: 'toolCall', id: 'progress-tool', name: 'tasks_progress', arguments: { task_id: 1 } };
+    await session.prompt('Start working on the task.');
+    assert.equal(manager.getBranch().filter(entry => entry.type === 'custom' && entry.customType === 'tasks-state-v1').at(-1).data.tasks[0].status, 'progress');
     assert.deepEqual(errors, []);
   } finally { session.dispose(); }
 });

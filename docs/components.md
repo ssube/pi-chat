@@ -4,7 +4,7 @@
 | --- | --- |
 | `extensions/pi-time.ts` | Clock formats and abortable waits with an explicit expected wake time |
 | `extensions/tasks.ts` | Session task ledger, evidence judging, user menu, list sharing and advisory summary steering; see [tasks](tasks.md) |
-| `extensions/background-jobs.ts` | Experimental systemd jobs, status, cancellation and completion steering; see [runbook](background-jobs.md) |
+| `extensions/background-jobs.ts` | Stable, opt-in systemd jobs, status, cancellation and completion steering; see [runbook](background-jobs.md) |
 | `extensions/room-lease.ts` | Temporary interactive Matrix inbox, steering, edit coalescing, lease status and release |
 | `extensions/matrix-room-attention.ts` | Optional owner-only room label file |
 | `extensions/follow-up-questions.ts` | `queue_question` and `/questions`; branch-persistent optional questions, answered as steering |

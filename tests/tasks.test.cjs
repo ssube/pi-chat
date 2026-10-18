@@ -60,6 +60,155 @@ test('ordered, stable IDs; limits/invalid input; no agent removal or override', 
   await assert.rejects(add(s), /limit/);
 });
 
+test('agent unblocks only blocked tasks, preserves assessment, and restores pending state', async () => {
+  const s = setup(); await add(s, 'Resolved prerequisite');
+  s.judge(async () => ({ verdict: 'needs_work', reason: 'Missing result.', missing: ['Provide result.'] }));
+  await complete(s);
+  await call(s, 'tasks_block', { task_id: 1, reason: 'Waiting for result' });
+  const before = (await list(s)).tasks[0];
+  const requestsBefore = s.requests.length;
+  const response = await call(s, 'tasks_unblock', { task_id: 1 });
+  assert.equal(s.requests.length, requestsBefore, 'unblock does not call a model');
+  assert.equal(response.details.task.status, 'pending');
+  assert.equal(response.details.task.blocker, undefined);
+  assert.equal(response.details.task.evidence, before.evidence);
+  assert.deepEqual(response.details.task.assessment, before.assessment);
+  assert.equal(s.sent.length, 0, 'unblock does not start inference');
+  const restored = setup(s.branch);
+  assert.equal((await list(restored)).tasks[0].status, 'pending');
+  assert.equal((await list(restored)).tasks[0].blocker, undefined);
+  for (const id of [0, 99, 1]) await assert.rejects(call(s, 'tasks_unblock', { task_id: id }), /not blocked/);
+  s.judge(async () => ({ verdict: 'accepted', reason: 'Result supplied.', missing: [] }));
+  await complete(s);
+  await assert.rejects(call(s, 'tasks_unblock', { task_id: 1 }), /not blocked/);
+});
+
+test('unblock respects stops, paused reminders and the no-progress budget', async () => {
+  const s = setup(); await add(s); input(s);
+  settle(s); settle(s);
+  await call(s, 'tasks_block', { task_id: 1, reason: 'Waiting' });
+  await call(s, 'tasks_unblock', { task_id: 1 });
+  assert.equal(settle(s), undefined, 'unblock must not replenish the reminder budget');
+  s.handlers.input({ source: 'interactive', text: 'Stop' }, s.ctx);
+  await call(s, 'tasks_block', { task_id: 1, reason: 'Waiting again' });
+  await call(s, 'tasks_unblock', { task_id: 1 });
+  assert.equal(settle(s), undefined, 'unblock must not override a stop');
+  s.select('Pause reminders', 'Close'); await s.commands.tasks.handler('', s.ctx);
+  input(s);
+  await call(s, 'tasks_block', { task_id: 1, reason: 'Paused' });
+  await call(s, 'tasks_unblock', { task_id: 1 });
+  assert.equal((await list(s)).paused, true); assert.equal(settle(s), undefined);
+});
+
+test('unblocking aborts an assessment and prevents a stale verdict applying', async () => {
+  const s = setup(); await add(s);
+  await call(s, 'tasks_block', { task_id: 1, reason: 'Wait' });
+  let resolve;
+  s.judge(() => new Promise(r => { resolve = r; }));
+  const assessment = complete(s);
+  const signal = s.requests[0][2].signal;
+  await call(s, 'tasks_unblock', { task_id: 1 });
+  assert.equal(signal.aborted, true);
+  resolve({ verdict: 'accepted', reason: 'Late result.', missing: [] });
+  assert.match((await assessment).details.reason, /changed|cancelled/);
+  assert.equal((await list(s)).tasks[0].status, 'pending');
+});
+
+test('progress is explicit, persisted, reversible, and never completion or inference', async () => {
+  const s = setup(); await add(s); input(s);
+  const response = await call(s, 'tasks_progress', { task_id: 1 });
+  assert.equal(response.details.task.status, 'progress'); assert.equal(s.requests.length, 0); assert.equal(s.sent.length, 0);
+  const count = s.branch.length;
+  await call(s, 'tasks_progress', { task_id: 1 }); assert.equal(s.branch.length, count, 'same state is a no-op');
+  assert.equal((await list(setup(s.branch))).tasks[0].status, 'progress');
+  const reminder = settle(s); assert.match(reminder.entries[0].content, /"status":"progress"/);
+  await s.commands['tasks-send'].handler('', s.ctx); assert.match(s.sent.at(-1)[0].content, /in progress/);
+  s.judge(async () => ({ verdict: 'needs_work', reason: 'Missing result.', missing: ['Provide result.'] }));
+  await complete(s); const before = (await list(s)).tasks[0]; assert.equal(before.status, 'progress');
+  await call(s, 'tasks_progress', { task_id: 1, active: false });
+  const pending = (await list(s)).tasks[0]; assert.equal(pending.status, 'pending'); assert.equal(pending.evidence, before.evidence);
+  assert.deepEqual(pending.assessment, before.assessment);
+  await call(s, 'tasks_block', { task_id: 1, reason: 'Waiting' });
+  await assert.rejects(call(s, 'tasks_progress', { task_id: 1 }), /blocked/);
+  await call(s, 'tasks_unblock', { task_id: 1 }); await call(s, 'tasks_progress', { task_id: 1 });
+  s.judge(async () => ({ verdict: 'accepted', reason: 'Result provided.', missing: [] })); await complete(s);
+  for (const id of [0, 1, 99]) await assert.rejects(call(s, 'tasks_progress', { task_id: id }), /missing|complete/);
+});
+
+test('progress cannot replenish reminders or override stop/pause and cancels stale assessments', async () => {
+  const s = setup(); await add(s); input(s); settle(s); settle(s);
+  await call(s, 'tasks_progress', { task_id: 1 }); assert.equal(settle(s), undefined);
+  s.handlers.input({ source: 'interactive', text: 'Stop' }, s.ctx);
+  await call(s, 'tasks_progress', { task_id: 1, active: false }); assert.equal(settle(s), undefined);
+  s.select('Pause reminders', 'Close'); await s.commands.tasks.handler('', s.ctx); input(s);
+  await call(s, 'tasks_progress', { task_id: 1 }); assert.equal((await list(s)).paused, true); assert.equal(settle(s), undefined);
+  let resolve; s.judge(() => new Promise(done => { resolve = done; })); const assessment = complete(s);
+  await call(s, 'tasks_progress', { task_id: 1, active: false }); assert.equal(s.requests[0][2].signal.aborted, true);
+  resolve({ verdict: 'accepted', reason: 'Late result.', missing: [] }); await assessment;
+  assert.equal((await list(s)).tasks[0].status, 'pending');
+});
+
+test('progress menu actions preserve selection, stop state and assessment-only completion', async () => {
+  const s = setup(); await add(s); input(s);
+  s.select(pickTask(1), 'Mark in progress', 'Close'); await s.commands.tasks.handler('', s.ctx);
+  assert.equal((await list(s)).tasks[0].status, 'progress'); assert.equal(s.sent.length, 0);
+  s.select(pickTask(1), 'Return to pending', 'Close'); await s.commands.tasks.handler('', s.ctx);
+  assert.equal((await list(s)).tasks[0].status, 'pending'); assert.equal(s.sent.length, 0);
+  s.handlers.session_start({}, s.ctx); await call(s, 'tasks_progress', { task_id: 1 });
+  assert.equal(settle(s), undefined, 'loading a session stays suspended');
+});
+
+test('completion returns remaining progress IDs and menu changes cancel assessments without resetting budget', async () => {
+  const s = setup(); await add(s, 'First'); await add(s, 'Second'); input(s);
+  await call(s, 'tasks_progress', { task_id: 2 });
+  assert.deepEqual((await complete(s, 1)).details.remaining, [2]);
+  settle(s); settle(s);
+  for (const [action, status] of [['Return to pending', 'pending'], ['Mark in progress', 'progress']]) {
+    let resolve; s.judge(() => new Promise(done => { resolve = done; })); const assessment = complete(s, 2);
+    const signal = s.requests.at(-1)[2].signal;
+    s.select(pickTask(2), action, 'Close'); await s.commands.tasks.handler('', s.ctx);
+    assert.equal(signal.aborted, true);
+    resolve({ verdict: 'accepted', reason: 'Late result.', missing: [] }); await assessment;
+    assert.equal((await list(s)).tasks[1].status, status);
+    assert.equal(settle(s), undefined, 'menu status changes do not replenish reminders');
+  }
+});
+
+test('one progress slot is enforced by tools and menu without mutation on refusal', async () => {
+  const s = setup(); await add(s, 'First'); await add(s, 'Second'); input(s);
+  assert.equal((await list(s)).progress_limit, 1);
+  await call(s, 'tasks_progress', { task_id: 1 });
+  const before = await list(s); const entries = s.branch.length;
+  await assert.rejects(call(s, 'tasks_progress', { task_id: 2 }), /At most 1 task.*#1/);
+  assert.deepEqual(await list(s), before); assert.equal(s.branch.length, entries);
+  await call(s, 'tasks_progress', { task_id: 1 }); assert.equal(s.branch.length, entries);
+  s.select(pickTask(2), 'Mark in progress', 'Close'); await s.commands.tasks.handler('', s.ctx);
+  assert.deepEqual(await list(s), before); assert.equal(s.branch.length, entries);
+  assert.ok(s.notices.some(([message, kind]) => kind === 'warning' && /At most 1 task/.test(message)));
+  assert.match(s.widgets.at(-1).join('\n'), /1\/1 in progress/);
+  assert.match(JSON.stringify(s.handlers.context({ messages: [] }, s.ctx)), /progress_limit/);
+  await call(s, 'tasks_progress', { task_id: 1, active: false });
+  s.select(pickTask(2), 'Mark in progress', 'Close'); await s.commands.tasks.handler('', s.ctx);
+  assert.equal((await list(s)).tasks[1].status, 'progress');
+  await call(s, 'tasks_block', { task_id: 2, reason: 'Wait' }); await call(s, 'tasks_progress', { task_id: 1 });
+  await complete(s, 1); await call(s, 'tasks_unblock', { task_id: 2 }); await call(s, 'tasks_progress', { task_id: 2 });
+  assert.equal((await list(s)).tasks[1].status, 'progress');
+});
+
+test('restored excess progress is preserved and can drain without permitting new starts', async () => {
+  const s = setup([{ type: 'custom', customType: 'tasks-state-v1', data: { version: 1, nextId: 4, paused: false,
+    tasks: [1, 2, 3].map(id => ({ id, summary: `Task ${id}`, acceptance: 'Result', status: id < 3 ? 'progress' : 'pending' })) } }]);
+  assert.deepEqual((await list(s)).tasks.map(task => task.status), ['progress', 'progress', 'pending']);
+  await assert.rejects(call(s, 'tasks_progress', { task_id: 3 }), /#1, #2/);
+  await call(s, 'tasks_progress', { task_id: 1 });
+  await call(s, 'tasks_progress', { task_id: 1, active: false });
+  await assert.rejects(call(s, 'tasks_progress', { task_id: 3 }), /#2/);
+  await call(s, 'tasks_progress', { task_id: 2, active: false });
+  await call(s, 'tasks_progress', { task_id: 3 });
+  assert.deepEqual((await list(s)).tasks.map(task => task.status), ['pending', 'pending', 'progress']);
+  assert.equal((await list(setup(s.branch))).tasks[2].status, 'progress');
+});
+
 test('judge isolation, exact criteria, evidence, usage, and accepted persistence', async () => {
   const s = setup(); await add(s, 'Run tests', { acceptance: 'Eight tests pass' });
   const result = await complete(s);
@@ -425,18 +574,21 @@ test('blocked assistance requests retain why/what context for user and LLM witho
 test('TUI status labels use distinct theme colors with text retained; menu selection and stored data stay intact', async () => {
   const s = setup(); const colored = [];
   s.ctx.ui.theme.fg = (color, value) => { colored.push([color, value]); return `<${color}>${value}</${color}>`; };
-  await add(s, 'Pending'); await add(s, 'Blocked'); await add(s, 'Complete');
+  await add(s, 'Pending'); await add(s, 'Blocked'); await add(s, 'Complete'); await add(s, 'Progress');
+  await call(s, 'tasks_progress', { task_id: 4 });
   await call(s, 'tasks_block', { task_id: 2, reason: 'Need user input' }); await complete(s, 3);
   assert.match(s.widgets.at(-1).join('\n'), /<accent>\[pending\]<\/accent>/);
   assert.match(s.widgets.at(-1).join('\n'), /<warning>\[blocked\]<\/warning>/);
+  assert.match(s.widgets.at(-1).join('\n'), /<mdLink>\[progress\]<\/mdLink>/);
   s.select(choices => {
     assert.ok(choices.some(choice => /<success>\[complete\]<\/success>/.test(choice)));
+    assert.ok(choices.some(choice => /<mdLink>\[progress\]<\/mdLink>/.test(choice)));
     return choices.find(choice => choice.startsWith('#2 '));
   }, 'Back', 'Close');
   await s.commands.tasks.handler('', s.ctx);
   assert.ok(s.titles.some(title => /#2 <warning>\[blocked\]<\/warning>/.test(title)));
   assert.ok(colored.some(([color, label]) => color === 'success' && label === '[complete]'));
-  assert.doesNotMatch(JSON.stringify(await list(s)), /<accent>|<warning>|<success>/);
+  assert.doesNotMatch(JSON.stringify(await list(s)), /<accent>|<warning>|<success>|<mdLink>/);
   await s.commands['tasks-send'].handler('', s.ctx);
-  assert.doesNotMatch(s.sent.at(-1)[0].content, /<accent>|<warning>|<success>/);
+  assert.doesNotMatch(s.sent.at(-1)[0].content, /<accent>|<warning>|<success>|<mdLink>/);
 });
