@@ -34,6 +34,10 @@ class Checkpoint:
     requester: str = ""
     request_id: str = ""
     last_message_id: str = ""
+    # Highest Discord message handled, or an explicit catch-up baseline. This
+    # lives beside last_message_id so a crash after admission cannot replay work.
+    last_observed_message_id: str = ""
+    discord_recovery_gap: str = ""
     final_sent: bool = False
     summary_saved_ms: int = 0
     last_wake_id: str = ""
@@ -51,6 +55,10 @@ def _checkpoint_field(value: Any, name: str, expected: type) -> Any:
         raise ValueError(f"Bridge checkpoint {name} must be nonnegative")
     if name == "status" and value not in _STATUSES:
         raise ValueError("Bridge checkpoint status is unknown")
+    if name == "last_observed_message_id" and value and not cast(str, value).isdecimal():
+        raise ValueError("Bridge checkpoint Discord observation must be a message ID")
+    if name == "discord_recovery_gap" and len(cast(str, value)) > 200:
+        raise ValueError("Bridge checkpoint Discord gap marker is too long")
     return value
 
 

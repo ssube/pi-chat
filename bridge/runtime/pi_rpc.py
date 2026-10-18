@@ -559,6 +559,14 @@ class PiRpcClient:
             raise PiRpcProtocolError("Pi compact returned no summary")
         return summary.strip()
 
+    async def set_model(self, provider: str, model: str) -> None:
+        """Switch the resident session without compacting, restarting, or prompting."""
+        await self.start()
+        response = await self._send_command("set_model", {"provider": provider, "modelId": model})
+        selected = response.get("data")
+        if not isinstance(selected, dict) or selected.get("provider") != provider or selected.get("id") != model:
+            raise PiRpcProtocolError("Pi did not confirm the requested model selection")
+
     async def get_state(self) -> JsonObject:
         """Return Pi's current RPC session state."""
         await self.start()

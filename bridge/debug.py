@@ -7,6 +7,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from bridge.modes import mode_label
 from bridge.runtime.session import BridgeRuntime
 from bridge.runtime.state import SessionKey
 
@@ -48,9 +49,20 @@ async def debug_status(runtime: BridgeRuntime, key: SessionKey) -> str:
     else:
         state = "sleeping"
     checkpoint = scope.checkpoint.status if scope is not None else "none loaded"
+    mode = getattr(scope, "mode", None) if scope is not None else None
+    mode_status = ""
+    if scope is not None and mode is not None:
+        label = mode_label(mode) if mode else "unconfirmed — select a mode before continuing"
+        selection = getattr(runtime, "modes", {}).get(mode)
+        model = f" · {selection.provider}/{selection.model}" if selection else ""
+        pending = " (next wake)" if scope.client is None else ""
+        mode_status = f"Mode: {label}{model}{pending}\n"
+    names = ", ".join(mode_label(name) for name in sorted(getattr(runtime, "modes", {})))
+    configured = f"Configured modes: {names}\n" if names else ""
     return (f"Bridge debug ({key.agent}, {key.transport})\n"
             f"Uptime: {_duration(time.monotonic() - STARTED)}\n"
             f"Status (this conversation): {state}\n"
             f"Checkpoint: {checkpoint}\n"
+            f"{mode_status}{configured}"
             f"Bridge commit: {bridge_commit()}\n"
             "Pi status is not queried; this command does not wake a session.")

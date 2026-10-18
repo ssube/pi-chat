@@ -20,6 +20,7 @@ from typing import Any, Callable, TYPE_CHECKING
 from bridge import __version__
 from bridge.config import MatrixSettings
 from bridge.debug import debug_status
+from bridge.modes import ModeSwitchError, mode_command
 from bridge.activity import Activity, Presence
 from bridge.filtering import SILENT_KINDS, metadata_rejection
 from bridge.telemetry import Telemetry
@@ -249,13 +250,11 @@ BRIDGE_COMMANDS = {
     "/recover": "recover",
     "!recover": "recover",
 }
-_COMMAND_TOKENS = "|".join(re.escape(token) for token in
-                           sorted(BRIDGE_COMMANDS, key=len, reverse=True))
 
 
-def bridge_command(content: dict[str, Any], user_id: str,
-                   display_name: str | None = None) -> str | None:
-    """Parse an explicitly addressed native command, including display-name pings."""
+def addressed_command_body(content: dict[str, Any], user_id: str,
+                           display_name: str | None = None) -> str | None:
+    """Strip only this agent's leading address, never mentions in quoted prose."""
     if content.get("msgtype") != "m.text":
         return None
     body = content.get("body")
@@ -268,9 +267,8 @@ def bridge_command(content: dict[str, Any], user_id: str,
         # m.mentions.user_ids, so the address never reaches the text. Honour the
         # token then, but only when it is the whole message: ordinary prose that
         # merely mentions the agent stays ordinary text.
-        bare = body.strip().lower()
-        if bare in BRIDGE_COMMANDS:
-            return BRIDGE_COMMANDS[bare]
+        if body.lstrip().startswith("!") or body.strip().lower() in BRIDGE_COMMANDS:
+            return body.strip()
         # Matrix clients may render a structured mention as "Agent_one: !debug"
         # instead of embedding the full ID in the plain-text body. Match the
         # localpart and, when the display name differs from it (e.g. "Agent_three"
@@ -287,11 +285,15 @@ def bridge_command(content: dict[str, Any], user_id: str,
         prefix = "(?:" + "|".join(alternatives) + ")"
     else:
         prefix = re.escape(user_id)
-    match = re.fullmatch(rf"\s*{prefix}\s*[:,]?\s*({_COMMAND_TOKENS})\s*", body,
-                         re.IGNORECASE)
-    if match is None:
-        return None
-    return BRIDGE_COMMANDS[match.group(1).lower()]
+    match = re.fullmatch(rf"\s*{prefix}\s*[:,]?\s*([\s\S]*?)\s*", body, re.IGNORECASE)
+    return match[1] if match is not None else None
+
+
+def bridge_command(content: dict[str, Any], user_id: str,
+                   display_name: str | None = None) -> str | None:
+    """Parse an explicitly addressed whole native control command."""
+    body = addressed_command_body(content, user_id, display_name)
+    return BRIDGE_COMMANDS.get(body.lower()) if body is not None else None
 
 
 def is_debug_command(content: dict[str, Any], user_id: str,
@@ -949,6 +951,28 @@ class MatrixAdapter:
                               event_id)
             self._remember(event_id)
             return
+        selected_mode = None
+        if (not isinstance(meta, dict) and content.get("msgtype") == "m.text"
+                and sender != self.settings.hookshot_user_id
+                and "uk.half-shot.hookshot.webhook_data" not in content):
+            body = addressed_command_body(content, self.settings.user_id, self.settings.display_name)
+            selection = mode_command(body if body is not None else text,
+                                     getattr(self.runtime, "modes", {}))
+            if selection is not None:
+                selected_mode, text = selection
+                if not text:
+                    self._requesters[(key, event_id)] = sender
+                    try:
+                        notice = await self.runtime.change_mode(key, selected_mode, sender)
+                        await self.output(key, "mode", notice, event_id)
+                    except StopRequested:
+                        pass  # The queued stop/cancel owns its own acknowledgment.
+                    except ModeSwitchError as error:
+                        await self.output(key, "request_error", str(error), event_id)
+                    finally:
+                        self._requesters.pop((key, event_id), None)
+                        self._remember(event_id)
+                    return
         if not awake_after_admission:
             thread_root = (key.scope.split(":thread:", 1)[1]
                            if ":thread:" in key.scope else None)
@@ -969,9 +993,9 @@ class MatrixAdapter:
         self._requesters[(key, event_id)] = sender
         try:
             incoming = Incoming(sender, event_id, text, images,
-                                optional=not addressed,
+                                optional=not addressed and selected_mode is None,
                                 # Peer bridge traffic expects no reaction.
-                                ack_required=not isinstance(meta, dict))
+                                ack_required=not isinstance(meta, dict), mode=selected_mode)
             if self.room_leases is not None and content.get("msgtype") in {"m.text", "m.image"}:
                 # Serialize final bridge admission with lease acquisition. A handler
                 # may have read history while the interactive Pi claimed attention.
@@ -988,6 +1012,11 @@ class MatrixAdapter:
             else:
                 await self.runtime.submit(key, incoming)
                 await self.runtime.record_wake(key, event_id)
+        except ModeSwitchError as error:
+            try:
+                await self.output(key, "request_error", str(error), event_id)
+            finally:
+                self._requesters.pop((key, event_id), None)
         except StopRequested:
             # The acknowledgement dropped its retries because a cancel or stop is
             # queued on the scope lock, so this request never started. The stop is

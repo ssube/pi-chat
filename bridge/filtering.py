@@ -5,7 +5,7 @@ import json
 from typing import Any
 
 BRIDGE_META = "org.example.pi_bridge"
-SILENT_KINDS = frozenset({"ack", "progress", "progress_summary", "steered", "status", "startup", "cleanup", "cleanup_request", "compacting"})
+SILENT_KINDS = frozenset({"ack", "progress", "progress_summary", "steered", "status", "startup", "cleanup", "cleanup_request", "compacting", "mode"})
 TERMINAL_KINDS = frozenset({"final", "error", "cancelled"})
 MAX_HANDOFF_HOPS = 3
 DISCORD_META_PREFIX = "agent-bridge:v1:"

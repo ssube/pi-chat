@@ -20,6 +20,7 @@ from .history_service import (HistoryPage, MembersPage, HistoryRejected, History
                               HistoryService, members_page)
 from .metrics import MetricsService
 from .reaction_service import ReactionRejected, ReactionRequest, ReactionService
+from .reload import sighup as reload_sighup
 from .review_queue import ForgejoReviews, ReviewQueue
 from .room_lease import RoomLeases
 from .runtime.session import BridgeRuntime, PROGRESS_EDIT_INTERVAL
@@ -31,7 +32,7 @@ from .turn_status import Indicator, TurnIndicators, TurnStatus
 log = logging.getLogger("agent_bridge")
 
 
-async def run(profile: Profile) -> None:
+async def run(profile: Profile, profile_path: Path) -> None:
     adapters: dict[str, MatrixAdapter | DiscordAdapter] = {}
     history_tokens: dict[SessionKey, str] = {}
     reaction_tokens: dict[SessionKey, str] = {}
@@ -69,6 +70,7 @@ async def run(profile: Profile) -> None:
 
     runtime = BridgeRuntime(profile.state_dir / "sessions", pi_client, output,
                             failure_outbox=profile.observability_outbox,
+                            modes=profile.conversation_modes, default_mode=profile.default_mode,
                             progress_summarizer=profile.summarize_progress,
                             turn_status=turn_status,
                             image_captioner=(profile.describe_images
@@ -183,23 +185,27 @@ async def run(profile: Profile) -> None:
     except OSError:
         log.warning("Could not persist recovered turn indicators")
     stopping = asyncio.Event()
-    checkpoint_requested = asyncio.Event()
+    hup_requested = asyncio.Event()
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(signum, stopping.set)
-    loop.add_signal_handler(signal.SIGHUP, checkpoint_requested.set)
+    loop.add_signal_handler(signal.SIGHUP, hup_requested.set)
 
-    async def checkpoint_on_signal() -> None:
+    async def reload_and_checkpoint_on_signal() -> None:
+        nonlocal profile
         while not stopping.is_set():
-            await checkpoint_requested.wait()
-            checkpoint_requested.clear()
+            await hup_requested.wait()
+            hup_requested.clear()
             if stopping.is_set():
                 break
-            try:
-                count = await runtime.sweep_idle(force=True)
-                log.info("SIGHUP checkpointed %d idle conversations", count)
-            except Exception:
-                log.exception("SIGHUP checkpoint sweep failed")
+            # A rejected reload keeps the running profile; the forced
+            # checkpoint inside `reload_sighup` still runs.
+            profile = await reload_sighup(
+                profile_path, profile,
+                sweep=lambda: runtime.sweep_idle(force=True),
+                adapters=adapters, room_leases=room_leases,
+                review_queue=review_queue, runtime=runtime,
+                activity=activity_service)
 
     async def sweep() -> None:
         while not stopping.is_set():
@@ -218,7 +224,7 @@ async def run(profile: Profile) -> None:
              for name, adapter in adapters.items()]
     tasks.append(asyncio.create_task(sweep(), name="idle-sweep"))
     tasks.append(asyncio.create_task(indicators.run(), name="turn-indicators"))
-    tasks.append(asyncio.create_task(checkpoint_on_signal(), name="sighup-checkpoint"))
+    tasks.append(asyncio.create_task(reload_and_checkpoint_on_signal(), name="sighup-reload"))
     tasks.append(asyncio.create_task(activity_service.run(), name="activity-status"))
     if metrics_service is not None:
         tasks.append(asyncio.create_task(metrics_service.run(), name="metrics"))
@@ -269,7 +275,8 @@ def main() -> None:
     path = os.environ.get("AGENT_BRIDGE_PROFILE")
     if not path:
         raise SystemExit("AGENT_BRIDGE_PROFILE must name a private JSON profile")
-    asyncio.run(run(Profile.load(Path(path))))
+    profile_path = Path(path)
+    asyncio.run(run(Profile.load(profile_path), profile_path))
 
 
 if __name__ == "__main__":

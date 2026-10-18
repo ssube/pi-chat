@@ -14,13 +14,17 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import AsyncIterator, Protocol
 
-from .pi_rpc import (JsonObject, PiProviderError, PiRpcError, PiRunResult, RpcImage,
+from bridge.modes import ModelSelection, ModeSwitchError, mode_label
+
+from .pi_rpc import (JsonObject, PiProviderError, PiRpcError, PiRpcTimeout, PiRunResult, RpcImage,
                      assistant_text_from_message)
 from .state import Checkpoint, SessionKey, read_checkpoint, write_checkpoint
 from ..observability import record_bridge_failure
 from ..telemetry import Telemetry
 from ..turn_status import TurnStatus
 
+
+MODE_SWITCH_TIMEOUT_SECONDS = 5
 
 _ACTIVE_STATUSES = frozenset({"running", "cancel_requested", "final_pending"})
 
@@ -156,6 +160,8 @@ class RpcClient(Protocol):
 
     async def stop(self) -> None: ...
 
+    async def set_model(self, provider: str, model: str) -> None: ...
+
 
 # Only an explicit True confirms a complete final post. Legacy/no-op sinks
 # may return None; returning normally alone is not a delivery receipt.
@@ -176,6 +182,7 @@ class Incoming:
     # traffic acknowledges itself in its own turn. A ping from a person keeps
     # the encouragement in the prompt and nothing more.
     ack_required: bool = True
+    mode: str | None = None
 
     def prompt(self) -> str:
         prompt = f"Message from {self.sender} (event {self.message_id}):\n{self.text}"
@@ -199,6 +206,8 @@ class _Scope:
     input_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     accepted: asyncio.Event = field(default_factory=asyncio.Event)
     client: RpcClient | None = None
+    mode: str = "fast"
+    mode_switch: asyncio.Task[None] | None = None
     task: asyncio.Task[None] | None = None
     last_persist_ms: int = 0
     current_optional: bool = False
@@ -241,7 +250,13 @@ class BridgeRuntime:
                  progress_summarizer: ProgressSummarizer | None = None,
                  turn_status: Callable[[SessionKey, str, TurnStatus, int], Awaitable[None]] | None = None,
                  sleep: Callable[[float], Awaitable[None]] | None = None,
-                 failure_outbox: Path | None = None) -> None:
+                 failure_outbox: Path | None = None,
+                 modes: dict[str, ModelSelection] | None = None,
+                 default_mode: str = "fast") -> None:
+        self.modes = dict(modes or {})
+        self.default_mode = default_mode
+        if self.modes and default_mode not in self.modes:
+            raise ValueError("default_mode must name a configured mode")
         self.state_root = state_root
         self.client_factory = client_factory
         self.output = output
@@ -344,7 +359,7 @@ class BridgeRuntime:
                     state.status = "interrupted"
                     state.final_sent = False
                     write_checkpoint(directory, state)
-                self._scopes[key] = _Scope(key, directory, state)
+                self._scopes[key] = _Scope(key, directory, state, mode=self.default_mode)
             return self._scopes[key]
 
     def _touch(self, scope: _Scope, *, persist: bool = False) -> None:
@@ -354,13 +369,75 @@ class BridgeRuntime:
             write_checkpoint(scope.directory, scope.checkpoint)
             scope.last_persist_ms = now
 
-    def _ensure_client(self, scope: _Scope) -> RpcClient:
+    async def _ensure_client(self, scope: _Scope) -> RpcClient:
         if scope.client is None:
             scope.checkpoint.epoch += 1
             session_file = scope.directory / f"conversation-{scope.checkpoint.epoch:08d}.jsonl"
             scope.client = self.client_factory(scope.key, session_file)
             write_checkpoint(scope.directory, scope.checkpoint)
+            # Apply at the sole creation point, including provider-error retries.
+            # This validates the configured selection before any prompt runs.
+            if self.modes:
+                try:
+                    await self._apply_model(scope, scope.mode)
+                except PiRpcError as error:
+                    await scope.client.stop()
+                    scope.client = None
+                    scope.mode = ""
+                    raise ModeSwitchError("Pi could not start the selected mode; no request was submitted. Check the configured model and provider.") from error
         return scope.client
+
+    async def _apply_model(self, scope: _Scope, name: str) -> None:
+        """A bounded control operation that queued stops can interrupt under lock."""
+        assert scope.client is not None
+        selection = self.modes[name]
+        task = asyncio.create_task(scope.client.set_model(selection.provider, selection.model))
+        scope.mode_switch = task
+        try:
+            await asyncio.wait_for(task, MODE_SWITCH_TIMEOUT_SECONDS)
+        except TimeoutError as error:
+            scope.mode = ""
+            raise PiRpcTimeout(MODE_SWITCH_TIMEOUT_SECONDS) from error
+        except asyncio.CancelledError:
+            scope.mode = ""
+            if self.stop_requested(scope.key, scope.checkpoint.requester):
+                raise StopRequested("Mode selection interrupted by a queued stop") from None
+            raise
+        finally:
+            scope.mode_switch = None
+
+    async def _select_mode(self, scope: _Scope, name: str, requester: str = "") -> str:
+        # Caller owns input_lock and the non-compacting scope lock. Do not
+        # interrupt a tool, alter another request's next call, or replay work.
+        if name not in self.modes:
+            raise ModeSwitchError(f"Mode '{name}' is not configured for this bridge.")
+        if scope.active:
+            raise ModeSwitchError("A turn is running here. Let it finish or cancel it before switching modes; this request was not submitted.")
+        if scope.checkpoint.status == "checkpoint_error":
+            raise ModeSwitchError("Recover this conversation's failed checkpoint before switching modes.")
+        selection = self.modes[name]
+        if requester:
+            scope.checkpoint.requester = requester
+        if scope.client is not None and scope.mode != name:
+            try:
+                await self._apply_model(scope, name)
+            except PiRpcError as error:
+                scope.mode = ""  # A lost receipt may follow a successful mutation.
+                # Never claim the mode changed or fall back to a different
+                # provider. RPC errors can contain private provider diagnostics.
+                raise ModeSwitchError("Pi could not confirm the mode switch; no request was submitted. Check the configured model and provider.") from error
+        scope.mode = name
+        self.telemetry.record(scope.key.transport, "mode", name, scope_hash=scope.key.scope_hash)
+        self._touch(scope, persist=True)
+        pending = " · next wake" if scope.client is None else ""
+        return f"{mode_label(name)} mode · {selection.provider}/{selection.model}{pending}"
+
+    async def change_mode(self, key: SessionKey, name: str, requester: str = "") -> str:
+        """Bare command: remember the next selection without starting inference."""
+        async with self._operation_slot():
+            scope = await self._scope(key)
+            async with scope.input_lock, self._locked_scope(scope, wait_compaction=True):
+                return await self._select_mode(scope, name, requester)
 
     def _record_pi_failure(self, scope: _Scope, error: PiRpcError, phase: str,
                             *, request_id: str | None = None,
@@ -409,6 +486,59 @@ class BridgeRuntime:
         async with self._locked_scope(scope):
             scope.checkpoint.last_wake_id = event_id
             write_checkpoint(scope.directory, scope.checkpoint)
+
+    async def discord_recovery_state(self, key: SessionKey) -> tuple[str, str, str]:
+        """Observed watermark, last accepted ID, and status for one Discord scope."""
+        if key.transport != "discord":
+            raise ValueError("Discord recovery requires a Discord scope")
+        scope = await self._scope(key)
+        state = scope.checkpoint
+        accepted = state.last_message_id if state.last_message_id.isdecimal() else ""
+        return state.last_observed_message_id, accepted, state.status
+
+    async def record_discord_observed(self, key: SessionKey, message_id: str) -> None:
+        """Persist only after the input was handled; never turn observation into activity."""
+        if key.transport != "discord" or not message_id.isdecimal():
+            raise ValueError("Discord observation requires a numeric Discord message ID")
+        scope = await self._scope(key)
+        async with self._locked_scope(scope):
+            previous = scope.checkpoint.last_observed_message_id
+            if not previous or int(message_id) > int(previous):
+                scope.checkpoint.last_observed_message_id = message_id
+                write_checkpoint(scope.directory, scope.checkpoint)
+
+    async def record_discord_gap(self, key: SessionKey, reason: str,
+                                 boundary: int, skipped: str) -> bool:
+        """Durably name a bounded catch-up skip; True only for a new incident."""
+        if (key.transport != "discord" or
+                reason not in {"age", "count", "first_enable", "fresh_install", "permission", "not_found",
+                               "transient", "limit", "discovery", "thread_discovery", "error",
+                               "hold_expired", "thread_hold_expired"}
+                or boundary < 0):
+            raise ValueError("Invalid Discord recovery gap")
+        prefix = ("baseline_reset" if reason in {"age", "count", "first_enable", "fresh_install",
+                                                 "hold_expired", "thread_hold_expired"}
+                  else "recovery_paused")
+        marker = f"{prefix} reason={reason} boundary={boundary} skipped={skipped}"
+        if len(marker) > 200:
+            raise ValueError("Discord recovery gap marker is too long")
+        scope = await self._scope(key)
+        async with self._locked_scope(scope):
+            prior = scope.checkpoint.discord_recovery_gap
+            if prior == marker:
+                return False
+            scope.checkpoint.discord_recovery_gap = marker
+            write_checkpoint(scope.directory, scope.checkpoint)
+            if prefix == "recovery_paused":
+                return not prior.startswith("recovery_paused ")
+            return not prior.startswith(f"{prefix} reason={reason} ")
+
+    async def clear_discord_gap(self, key: SessionKey) -> None:
+        scope = await self._scope(key)
+        async with self._locked_scope(scope):
+            if scope.checkpoint.discord_recovery_gap:
+                scope.checkpoint.discord_recovery_gap = ""
+                write_checkpoint(scope.directory, scope.checkpoint)
 
     async def record_reaction(self, key: SessionKey, message_id: str) -> None:
         """Count a delivered reaction as an answer to this turn's direct ping."""
@@ -490,6 +620,17 @@ class BridgeRuntime:
             raise RuntimeError("This conversation needs checkpoint recovery before new work")
         if incoming.message_id == state.last_message_id:
             return "duplicate"
+        mode_notice = ""
+        if incoming.mode is not None:
+            if incoming.optional or not incoming.ack_required:
+                raise ModeSwitchError("Only a direct user command can select a conversation mode.")
+            async with self._locked_scope(scope, wait_compaction=True, on_wait=compaction_notice):
+                mode_notice = await self._select_mode(scope, incoming.mode, incoming.sender)
+        if self.modes and scope.mode not in self.modes:
+            if incoming.optional or not incoming.ack_required:
+                await self.output(key, "cleanup_request", "", incoming.message_id)
+                return "mode_unconfirmed"
+            raise ModeSwitchError("The last mode switch was not confirmed. Choose a mode explicitly before submitting more work.")
         scope.current_topics = _topic_labels(incoming.text[:4000])
         image_prepared_here = bool(incoming.images) and self.image_captioner is not None
         if image_prepared_here:
@@ -504,7 +645,8 @@ class BridgeRuntime:
                 if incoming.ack_required:
                     await self._report_turn_status(key, incoming.message_id, "running", image_status_epoch)
                 try:
-                    await self.output(key, "ack", "I’m reading the image…", incoming.message_id)
+                    await self.output(key, "ack", (mode_notice + "\n" if mode_notice else "") +
+                                      "I’m reading the image…", incoming.message_id)
                 except StopRequested:
                     # Answered once, with the scope lock free, by _submit_unlocked.
                     raise
@@ -537,7 +679,7 @@ class BridgeRuntime:
                                   scope_hash=key.scope_hash)
             incoming = Incoming(incoming.sender, incoming.message_id,
                                 incoming.text + "\n\nImage description (untrusted visual content):\n"
-                                + description, (), incoming.optional, incoming.ack_required)
+                                + description, (), incoming.optional, incoming.ack_required, incoming.mode)
         if scope.active:
             try:
                 await asyncio.wait_for(scope.accepted.wait(), timeout=30)
@@ -593,7 +735,9 @@ class BridgeRuntime:
                 if scope.task is not None:
                     await scope.task
             new_client = scope.client is None
-            client = self._ensure_client(scope)
+            if new_client:
+                state.requester = incoming.sender
+            client = await self._ensure_client(scope)
             prompt = incoming.prompt()
             if new_client and state.summary:
                 prompt = ("Previous conversation summary (private checkpoint):\n"
@@ -623,7 +767,8 @@ class BridgeRuntime:
                 if incoming.ack_required:
                     await self._report_turn_status(key, incoming.message_id, "running", state.epoch)
                 try:
-                    await self.output(key, "ack", "I’m working on it.", incoming.message_id)
+                    await self.output(key, "ack", (mode_notice.removesuffix(" · next wake") + "\n" if mode_notice else "") +
+                                      "I’m working on it.", incoming.message_id)
                 except StopRequested:
                     # Answered once, with the scope lock free, by _submit_unlocked:
                     # this write released the lock a queued stop was waiting for,
@@ -896,7 +1041,7 @@ class BridgeRuntime:
                         _archive_transcripts(scope.directory, [
                             scope.directory / f"conversation-{epoch:08d}.jsonl"])
                         scope.client = None
-                        client = self._ensure_client(scope)
+                        client = await self._ensure_client(scope)
                         epoch = state.epoch
                         delay = min(
                             PROVIDER_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
@@ -1016,6 +1161,8 @@ class BridgeRuntime:
                     try:
                         if kind == "cancelled":
                             text = "Request cancelled."
+                        elif isinstance(error, ModeSwitchError):
+                            text = str(error)
                         elif isinstance(error, PiProviderError):
                             if attempt_had_tool:
                                 text = f"{error}. A tool may have run; inspect its result before retrying."
@@ -1054,7 +1201,8 @@ class BridgeRuntime:
 
     async def cancel(self, key: SessionKey, requester: str) -> bool:
         scope = await self._scope(key)
-        if not scope.active or scope.checkpoint.requester != requester:
+        switching = scope.mode_switch is not None
+        if (not scope.active and not switching) or scope.checkpoint.requester != requester:
             # Denied before the cooperative-stop flag is raised: a caller whose
             # request this is not must not make that request abandon the control
             # write it is retrying. Rechecked under the lock below.
@@ -1064,7 +1212,16 @@ class BridgeRuntime:
         self._queue_stop(scope, requester)
         try:
             async with self._locked_scope(scope):
-                if not scope.active or scope.checkpoint.requester != requester:
+                if scope.checkpoint.requester != requester:
+                    return False
+                if switching and not scope.active:
+                    if scope.client is not None:
+                        await scope.client.stop()
+                        scope.client = None
+                    scope.mode = self.default_mode
+                    self._touch(scope, persist=True)
+                    return True
+                if not scope.active:
                     return False
                 try:
                     await asyncio.wait_for(scope.accepted.wait(), timeout=30)
@@ -1111,6 +1268,7 @@ class BridgeRuntime:
                 if client is not None:
                     await client.stop()
                 scope.client = None
+                scope.mode = self.default_mode
                 _archive_transcripts(scope.directory, [
                     scope.directory / f"conversation-{scope.checkpoint.epoch:08d}.jsonl"])
                 scope.checkpoint.status = "idle"
@@ -1124,6 +1282,9 @@ class BridgeRuntime:
     @staticmethod
     def _queue_stop(scope: _Scope, stop_key: str) -> None:
         scope.stop_requests[stop_key] = scope.stop_requests.get(stop_key, 0) + 1
+        if (scope.mode_switch is not None and
+                (not stop_key or stop_key == scope.checkpoint.requester)):
+            scope.mode_switch.cancel()
 
     @staticmethod
     def _release_stop(scope: _Scope, stop_key: str) -> None:
@@ -1253,6 +1414,7 @@ class BridgeRuntime:
             source = scope.directory / f"conversation-{state.epoch:08d}.jsonl"
             _archive_transcripts(scope.directory, [source])
             state.status = "idle"
+            scope.mode = self.default_mode
             state.last_message_id = ""
             self._touch(scope, persist=True)
             return True
@@ -1303,6 +1465,16 @@ class BridgeRuntime:
                         (not force and
                          self.now_ms() - scope.checkpoint.last_activity_ms < self.idle_ms)):
                     continue
+                if self.modes and scope.mode not in self.modes:
+                    # No inference on an uncertain model, but do not retain a
+                    # resident process forever. Preserve its private transcript
+                    # and require an explicit selection before the next prompt.
+                    await scope.client.stop()
+                    scope.client = None
+                    _archive_transcripts(scope.directory, [
+                        scope.directory / f"conversation-{scope.checkpoint.epoch:08d}.jsonl"])
+                    closed += 1
+                    continue
                 scope.compaction_finished.clear()
                 scope.compacting = True
                 compact_started = time.monotonic()
@@ -1350,6 +1522,7 @@ class BridgeRuntime:
                             await client.stop()
                     finally:
                         scope.client = None
+                        scope.mode = self.default_mode
                         scope.compacting = False
                         scope.compaction_finished.set()
                         self.telemetry.inflight[scope.key.transport, "compact"] -= 1

@@ -10,13 +10,14 @@ import shlex
 import shutil
 import tempfile
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from dotenv import dotenv_values
 from dotenv.parser import parse_stream
 
+from .modes import ModelSelection, read_modes
 from .runtime.pi_rpc import PiRpcClient, RpcImage
 from .runtime.state import SessionKey
 
@@ -145,6 +146,12 @@ class Profile:
     provider: str = "test"
     reviews: ReviewSettings | None = None
     pi_env_file: Path | None = None
+    modes: dict[str, ModelSelection] = field(default_factory=dict)
+    default_mode: str = "fast"
+
+    @property
+    def conversation_modes(self) -> dict[str, ModelSelection]:
+        return self.modes or read_modes(None, self.model, self.default_mode, self.provider)
 
     @property
     def observability_outbox(self) -> Path:
@@ -257,6 +264,10 @@ class Profile:
             if (require_transport_credentials and transport is not None
                     and not os.environ.get(transport.token_env)):
                 raise ValueError(f"Missing credential variable: {transport.token_env}")
+        model = _string(raw.get("model"), "model")
+        provider = _string(raw.get("provider"), "provider")
+        default_mode = _string(raw.get("default_mode", "fast"), "default_mode")
+        modes = read_modes(raw.get("modes"), model, default_mode, provider)
         return cls(
             agent=agent,
             work_dir=_path(raw.get("work_dir"), "work_dir"),
@@ -265,8 +276,7 @@ class Profile:
             pi_agent_dir=_path(raw.get("pi_agent_dir"), "pi_agent_dir"),
             pi_path_prefix=tuple(_path(item, "pi_path_prefix") for item in
                                  _strings(raw.get("pi_path_prefix", []), "pi_path_prefix")),
-            model=_string(raw.get("model"), "model"),
-            provider=_string(raw.get("provider"), "provider"),
+            model=model, provider=provider, modes=modes, default_mode=default_mode,
             image_model=(_string(raw["image_model"], "image_model")
                          if raw.get("image_model") not in (None, "") else None),
             pi_extra_args=_strings(raw.get("pi_extra_args", []), "pi_extra_args"),
@@ -359,8 +369,11 @@ class Profile:
             identity += f"\n\nLocal agent identity from {path.name}:\n{path.read_text()}"
         prompt_file.write_text(rule + identity + "\n")
         prompt_file.chmod(0o600)
+        selection = ModelSelection(self.provider, model_override or self.model)
+        if not (safe_mode or vision_mode or status_mode or progress_mode or model_override):
+            selection = self.conversation_modes[self.default_mode]
         command = [str(self.pi_executable), "--mode", "rpc",
-                   "--provider", self.provider, "--model", model_override or self.model,
+                   "--provider", selection.provider, "--model", selection.model,
                    "--thinking", "off" if vision_mode or progress_mode else "medium", "--session", str(session_file),
                    "--append-system-prompt", str(prompt_file)]
         if safe_mode:

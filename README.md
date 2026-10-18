@@ -1,20 +1,13 @@
 # Pi chat bridge
 
-Keep a Pi coding session in conversation across a desktop terminal and mobile chat. A Python bridge listens to Matrix and Discord; a TypeScript extension lets an interactive desktop Pi session temporarily take attention for a Matrix room over local Unix sockets.
+Chat with a Pi coding agent from your desktop or phone through Matrix and Discord. Keep a task list, choose a conversation model, run background work, and save a readable copy when you are done.
 
-While that lease is active, messages from your phone enter the **same desktop Pi session**, with its current working context. When the lease ends, the bridge handles subsequent messages using its own saved context and the room's recent history.
+The optional desktop extension lets your open Pi session take attention for a Matrix room.
 
-```mermaid
-flowchart LR
-  Phone[Mobile Matrix client] <--> Matrix[Matrix room]
-  Matrix <--> Bridge[Chat bridge]
-  Bridge -->|Authenticated inbox socket| Desktop[Interactive desktop Pi]
-  Desktop -->|Sender tool: acquire then post| Matrix
-  Desktop <-->|Lease-control socket| Bridge
-  Bridge <-->|RPC pipes when room is unleased| Resident[Bridge Pi session]
-```
+While that lease is active, messages from your phone enter the **same desktop Pi session**, with its current working context. When desktop attention ends, the bridge handles subsequent messages using its own saved context and the room's recent history.
 
-Read [attention, awareness, and continuity](docs/attention.md) for the mechanism, sequence diagrams, protocol, and delivery limits. See [source provenance](docs/sources.md), [installation](docs/installation.md), [tools and extensions](docs/components.md), [reviews](docs/reviews.md), and [the ledger](docs/ledger.md).
+
+Read [attention, awareness, and continuity](docs/attention.md) for the mechanism, sequence diagrams, protocol, and delivery limits. See [source provenance](docs/sources.md), [installation](docs/installation.md), [tools and extensions](docs/components.md), [reviews](docs/reviews.md), and [the ledger](docs/ledger.md), [task ledger](docs/tasks.md), [session export](docs/session-export.md), and [conversation modes](docs/modes.md).
 
 ## Contents
 
@@ -28,6 +21,17 @@ Read [attention, awareness, and continuity](docs/attention.md) for the mechanism
 | `examples/` | Placeholder configuration only |
 
 The bridge runs on Linux with Python 3.11+ and a compatible Pi executable. Extension tests use Node 24 and Bun. Pi must expose the extension hooks and RPC events described in the installation guide. No model, provider endpoint, contact, deployment, or credentials are configured for you.
+
+## Latest features
+
+- Reload supported profile settings without restarting the bridge.
+- Configurable conversation model modes, with explicit switching on Matrix and Discord.
+- Bounded Discord reconnect recovery with per-scope holds and retries.
+- Branch-persistent session task ledger with evidence judging, user overrides, list sharing, and advisory summary steering.
+- Standalone, private HTML session export with optional cached AI chapters.
+- Configurable active background-job limits and completed-history pruning; artifacts are preserved.
+
+All inference features require existing provider and spending authorization. Components are opt-in.
 
 ## Checks
 
@@ -50,3 +54,17 @@ Background-job tests additionally require a systemd user manager and skip withou
 Tests use fake transports/models and temporary files; some bind local TCP or Unix sockets. A full run needs those local operations permitted. Database migrations target a separately configured PostgreSQL service. No test requires production accounts or paid inference.
 
 Source is MIT licensed; retained third-party notices are in [LICENSE](LICENSE) and the Unicode data file. Operational profiles, logs, transcripts, database contents, and credentials belong outside this repository.
+
+## How messages travel (technical reference)
+
+```mermaid
+flowchart LR
+  Phone[Mobile Matrix client] <--> Matrix[Matrix room]
+  Matrix <--> Bridge[Chat bridge]
+  Bridge -->|Authenticated inbox socket| Desktop[Interactive desktop Pi]
+  Desktop -->|Sender tool: acquire then post| Matrix
+  Desktop <-->|Lease-control socket| Bridge
+  Bridge <-->|RPC pipes when room is unleased| Resident[Bridge Pi session]
+```
+
+The bridge owns transport connections and credentials. The desktop inbox and attention controls use local Unix sockets; the bridge handles unleased conversations through Pi RPC. See [attention and continuity](docs/attention.md) for protocol details and limits.

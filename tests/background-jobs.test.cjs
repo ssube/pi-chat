@@ -8,22 +8,27 @@ const path = require('node:path');
 const os = require('node:os');
 const { setTimeout: delay } = require('node:timers/promises');
 const { createJiti } = require(require.resolve('jiti', { paths: [path.resolve(__dirname, '../extensions')] }));
-const extension = createJiti(__filename)(path.resolve(__dirname, '../extensions/background-jobs.ts')).default;
+const { default: extension, retentionConfig, expiredJobs } = createJiti(__filename)(path.resolve(__dirname, '../extensions/background-jobs.ts'));
 
-function setup(t, mode = 'tui') {
+function setup(t, mode = 'tui', env = {}) {
   const handlers = {}, tools = {}, commands = {}, sent = [], statuses = [], selections = [], titles = [], choicesShown = [], branch = [];
   let confirmed = true;
   const ctx = { mode, cwd: process.cwd(), sessionManager: { getSessionId: () => 'test-session', getBranch: () => branch },
     ui: { setStatus: (...args) => statuses.push(args), setWidget() {}, notify() {}, confirm: async () => confirmed,
       select: async (title, choices) => { titles.push(title); choicesShown.push(choices); const choice = selections.shift(); return typeof choice === 'number' ? choices[choice] : choice; } } };
-  extension({ on: (name, fn) => handlers[name] = fn, registerTool: tool => tools[tool.name] = tool,
+  const original = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
+  Object.assign(process.env, env);
+  try { extension({ on: (name, fn) => handlers[name] = fn, registerTool: tool => tools[tool.name] = tool,
     registerCommand: (name, cmd) => commands[name] = cmd, sendMessage: (...args) => sent.push(args),
     appendEntry: (customType, data) => branch.push({ type: 'custom', customType, data }) });
-  handlers.session_start({}, ctx);
+  } finally { for (const [key, value] of Object.entries(original)) {
+    if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  } }
+  const ready = handlers.session_start({}, ctx);
   t.after(() => handlers.session_shutdown({ reason: 'quit' }, ctx));
   const call = async (name, args = {}, signal, context = ctx) => (await tools[name].execute('call', args, signal, undefined, context)).structuredContent;
   const start = (command, options = {}) => call('background_start', { command, timeout_seconds: 5, ...options });
-  return { ctx, handlers, tools, commands, sent, statuses, selections, titles, choicesShown, call, start,
+  return { ready, branch, ctx, handlers, tools, commands, sent, statuses, selections, titles, choicesShown, call, start,
     confirm: value => { confirmed = value; } };
 }
 async function until(fn, timeout = 6000) {
@@ -329,4 +334,110 @@ test('restored observation metadata cannot change immutable unit identity or uns
   assert.equal(restored.unsafe_to_terminate, true);
   await assert.rejects(s.call('background_cancel', { id: job.id }), /unsafe to terminate/);
   await ended(s, job.id);
+});
+
+nodeTest('retention configuration validates integers and supplies bounded defaults', () => {
+  assert.deepEqual(retentionConfig({}), { maxActive: 5, historyLimit: 100, maxAgeSeconds: 86400 });
+  assert.deepEqual(retentionConfig({ PI_BACKGROUND_MAX_ACTIVE: '2', PI_BACKGROUND_HISTORY_LIMIT: '0',
+    PI_BACKGROUND_HISTORY_TTL_SECONDS: '0' }), { maxActive: 2, historyLimit: 0, maxAgeSeconds: 0 });
+  for (const key of ['PI_BACKGROUND_MAX_ACTIVE', 'PI_BACKGROUND_HISTORY_LIMIT', 'PI_BACKGROUND_HISTORY_TTL_SECONDS']) {
+    for (const value of ['', ' ', '-1', '1.5', 'NaN', 'Infinity', '9007199254740992']) {
+      assert.throws(() => retentionConfig({ [key]: value }), new RegExp(key));
+    }
+  }
+  assert.throws(() => retentionConfig({ PI_BACKGROUND_MAX_ACTIVE: '0' }), /MAX_ACTIVE/);
+});
+
+nodeTest('retention uses completion time, newest-first count and TTL; unresolved work is never eligible', () => {
+  const now = Date.now();
+  const job = (id, age, status = 'succeeded') => ({ id: `job-${id}`, status,
+    finished_at: new Date(now - age * 1000).toISOString() });
+  const jobs = [job(1, 60), job(2, 20), job(3, 10), job(4, 10),
+    ...['running', 'deadline_exceeded', 'stopping', 'unknown', 'detached'].map((s, i) => job(5 + i, 1000, s)),
+    { ...job(10, 1000), finished_at: null }, { ...job(11, 1000), finished_at: 'invalid' }];
+  const ids = config => expiredJobs(jobs, config, now).map(j => j.id);
+  assert.deepEqual(ids({ historyLimit: 2, maxAgeSeconds: 0 }), ['job-2', 'job-1']);
+  assert.deepEqual(ids({ historyLimit: 100, maxAgeSeconds: 60 }), ['job-1']);
+  assert.deepEqual(ids({ historyLimit: 3, maxAgeSeconds: 20 }), ['job-2', 'job-1']);
+  assert.deepEqual(ids({ historyLimit: 0, maxAgeSeconds: 0 }), ['job-4', 'job-3', 'job-2', 'job-1']);
+});
+
+test('active limit rejects without artifacts, counts unsafe jobs, and releases capacity after completion', async t => {
+  const s = setup(t, 'rpc', { PI_BACKGROUND_MAX_ACTIVE: '1' });
+  await s.ready;
+  const first = await s.start('sleep 0.4', { unsafe_to_terminate: true });
+  const before = fs.readdirSync(os.tmpdir()).filter(n => n.startsWith('pi-background-systemd-')).length;
+  await assert.rejects(s.start('echo rejected'), /Active background job limit reached \(1\)/);
+  assert.equal(fs.readdirSync(os.tmpdir()).filter(n => n.startsWith('pi-background-systemd-')).length, before);
+  await ended(s, first.id);
+  const next = await s.start('echo accepted');
+  await ended(s, next.id);
+  assert.equal((await s.call('background_list')).total, 2);
+});
+
+test('concurrent launch attempts reserve active capacity before contacting systemd', async t => {
+  const s = setup(t, 'rpc', { PI_BACKGROUND_MAX_ACTIVE: '1' });
+  await s.ready;
+  const results = await Promise.allSettled([s.start('sleep 2'), s.start('sleep 2')]);
+  assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
+  assert.match(results.find(r => r.status === 'rejected').reason.message, /Active background job limit/);
+});
+
+test('history pruning persists across resume, preserves logs, and never reuses IDs or removes active work', async t => {
+  const s = setup(t, 'rpc', { PI_BACKGROUND_MAX_ACTIVE: '2', PI_BACKGROUND_HISTORY_LIMIT: '1' });
+  await s.ready;
+  const live = await s.start('sleep 20');
+  const done = [];
+  for (let i = 0; i < 4; i++) {
+    const launched = await s.start('echo retained');
+    done.push(await ended(s, launched.id));
+    await s.call('background_list');
+  }
+  const list = await s.call('background_list');
+  assert.deepEqual(list.jobs.map(j => j.id), [live.id, done.at(-1).id]);
+  assert.equal(list.active, 1);
+  for (const job of done.slice(0, -1)) {
+    await assert.rejects(s.call('background_status', { id: job.id }), /Unknown background job/);
+    assert.equal(fs.readFileSync(job.log_path, 'utf8'), 'retained\n');
+  }
+  await s.handlers.session_shutdown({}, s.ctx);
+  s.branch.push({ type: 'custom', customType: 'background-systemd-jobs-pruned', data: { ids: ['job-NaN'] } });
+  await s.handlers.session_start({}, s.ctx);
+  const restored = await s.call('background_list');
+  assert.equal(restored.completed, 1);
+  assert.ok(!restored.jobs.some(j => done.slice(0, -1).some(old => old.id === j.id)));
+  const next = await s.start('echo unique');
+  assert.equal(next.id, 'job-6');
+  await ended(s, next.id);
+});
+
+test('TTL prunes restored completed jobs while preserving logs and ID high-water mark', async t => {
+  const s = setup(t, 'rpc', { PI_BACKGROUND_HISTORY_TTL_SECONDS: '1' });
+  await s.ready;
+  const job = await s.start('echo old');
+  await ended(s, job.id);
+  await s.handlers.session_shutdown({}, s.ctx);
+  const metadata = JSON.parse(fs.readFileSync(job.metadata_path, 'utf8'));
+  metadata.finished_at = new Date(Date.now() - 2000).toISOString();
+  fs.writeFileSync(job.metadata_path, JSON.stringify(metadata));
+  await s.handlers.session_start({}, s.ctx);
+  assert.equal((await s.call('background_list')).total, 0);
+  assert.equal(fs.readFileSync(job.log_path, 'utf8'), 'old\n');
+  await s.handlers.session_shutdown({}, s.ctx);
+  await s.handlers.session_start({}, s.ctx);
+  const next = await s.start('echo new');
+  assert.equal(next.id, 'job-2');
+  await ended(s, next.id);
+});
+
+nodeTest('malformed prune markers cannot abort session restore', async t => {
+  const s = setup(t, 'rpc');
+  await s.ready;
+  await s.handlers.session_shutdown({}, s.ctx);
+  for (const data of [null, {}, { ids: null }, { ids: 'job-1' }, { ids: [null] },
+    { ids: ['job-NaN'] }, { ids: ['job-9007199254740992'] }]) {
+    s.branch.push({ type: 'custom', customType: 'background-systemd-jobs-pruned', data });
+  }
+  await s.handlers.session_start({}, s.ctx);
+  assert.equal((await s.call('background_list')).total, 0);
 });

@@ -27,6 +27,12 @@ Each job owns a uniquely named `pi-bg-<UUID>.service`, grouped in a session-spec
 
 A generated standalone `ExecStopPost` hook writes the terminal result to `completion.json`, independent of Pi and unit garbage collection. The extension retains session mappings and can reconcile on resume. Completion records retain the service result, exit kind/status and timestamp; successful submission is not successful completion. Submission failure can leave an already-created service, so creation is never retried automatically. Unit absence without a completion record is `unknown`, not success. No cross-session adoption or permanent retention guarantee is provided.
 
-The service receives a snapshot of conventionally named environment variables in a mode-0600 EnvironmentFile. This file can contain credentials; it stays private and the standalone hook removes it. Uncertain submission or a hook failure can leave it behind. Logs, metadata and command scripts may also contain private data. They remain on disk for inspection, without a quota or automatic retention cleanup, and temporary storage may be purged by the OS.
+The service receives a snapshot of conventionally named environment variables in a mode-0600 EnvironmentFile. This file can contain credentials; it stays private and the standalone hook removes it. Uncertain submission or a hook failure can leave it behind. Logs, metadata and command scripts may also contain private data. They remain on disk for inspection, without a disk quota or automatic artifact cleanup, and temporary storage may be purged by the OS.
 
 Inspect the recorded unit with `systemctl --user show UNIT` and read only the job's recorded private output paths. If no completion record exists, establish actual service state before retrying or cancelling work. Never stop a whole session slice if it contains unsafe jobs. Starting or cancelling a background command requires the same authorization as running or stopping that command in the foreground.
+
+## Capacity and retained history
+
+Per-session active capacity defaults to **5** jobs. Configure `PI_BACKGROUND_MAX_ACTIVE` (integer ≥ 1). Restored active/unknown jobs count toward capacity; reaching the cap refuses submission without stopping existing jobs.
+
+Completed registry history defaults to the newest **100** jobs and **24 hours**. Configure `PI_BACKGROUND_HISTORY_LIMIT` (integer ≥ 0) and `PI_BACKGROUND_HISTORY_TTL_SECONDS` (integer ≥ 0, default 86400 seconds). Pruning does not delete private artifact files or historical Pi session entries, cancel jobs, or change active capacity. Expired/pruned jobs are omitted from the registry view; retained artifact paths remain private.

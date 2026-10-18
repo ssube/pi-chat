@@ -11,6 +11,21 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 const control = promisify(execFile);
 const MAX_BYTES = 16 * 1024;
 const entryType = "background-systemd-job";
+const prunedEntryType = "background-systemd-jobs-pruned";
+export function retentionConfig(env = process.env) {
+	const integer = (name: string, fallback: number, minimum: number) => {
+		const value = env[name] === undefined ? fallback : Number(env[name]);
+		if (env[name]?.trim() === "" || !Number.isSafeInteger(value) || value < minimum) {
+			throw new Error(`${name} must be an integer >= ${minimum}.`);
+		}
+		return value;
+	};
+	return {
+		maxActive: integer("PI_BACKGROUND_MAX_ACTIVE", 5, 1),
+		historyLimit: integer("PI_BACKGROUND_HISTORY_LIMIT", 100, 0),
+		maxAgeSeconds: integer("PI_BACKGROUND_HISTORY_TTL_SECONDS", 86400, 0),
+	};
+}
 const progressIntervals = { off: null, "5s": 5, "30s": 30, "1m": 60, "5m": 300, "15m": 900, "1h": 3600 };
 type JobEvent = "completion" | "progress" | "deadline" | "reconcile";
 type EventSource = {
@@ -148,13 +163,26 @@ async function requireUserManager() {
 	catch (error) { throw new Error(`No reachable systemd user manager; refusing to create job artifacts. ${String(error)}`); }
 }
 
+// Only reconciled terminal results are eligible. The caller also requires a
+// queued completion notification before forgetting a job.
+export function expiredJobs(jobs: Job[], config: ReturnType<typeof retentionConfig>, now = Date.now()) {
+	return jobs.filter(job => !active(job) && job.status !== "detached" &&
+		job.finished_at !== null && Number.isFinite(Date.parse(job.finished_at)))
+		.sort((a, b) => Date.parse(b.finished_at!) - Date.parse(a.finished_at!) ||
+			Number(b.id.slice(4)) - Number(a.id.slice(4)))
+		.filter((job, index) => index >= config.historyLimit ||
+			(config.maxAgeSeconds > 0 && now - Date.parse(job.finished_at!) >= config.maxAgeSeconds * 1000));
+}
+
 export default function (pi: ExtensionAPI) {
+	const config = retentionConfig();
 	let jobs = new Map<string, Job>();
 	let ctx: ExtensionContext | undefined;
 	let observer: NodeJS.Timeout | undefined;
 	const sources = new Map<string, EventSource>();
 	let shuttingDown = false;
 	let nextId = 1;
+	let launching = 0;
 	const persist = (job: Job) => atomic(job.metadata_path, summary(job));
 	const showCount = () => {
 		if (ctx?.mode === "tui") {
@@ -270,7 +298,21 @@ export default function (pi: ExtensionAPI) {
 			source.deadline = setTimeout(() => { void dispatch(job, "deadline"); }, remaining);
 		}
 	};
-	const observe = () => Promise.all([...jobs.values()].map(job => dispatch(job, "reconcile")));
+	const prune = () => {
+		if (shuttingDown) return;
+		const expired = expiredJobs([...jobs.values()].filter(job =>
+			existsSync(join(job.directory, "completed-notified.json"))), config);
+		if (!expired.length) return;
+		// Persist before forgetting: a reload must not resurrect old jobs. Keep
+		// private artifacts intact; this is registry retention, not disk cleanup.
+		pi.appendEntry(prunedEntryType, { ids: expired.map(job => job.id) });
+		for (const job of expired) { release(job); sources.delete(job.id); jobs.delete(job.id); }
+		showCount();
+	};
+	const observe = async () => {
+		await Promise.all([...jobs.values()].map(job => dispatch(job, "reconcile")));
+		prune();
+	};
 	const stop = async (job: Job) => {
 		await refresh(job, false);
 		if (!active(job)) return;
@@ -297,19 +339,37 @@ export default function (pi: ExtensionAPI) {
 	};
 	pi.on("session_start", async (_event, context) => {
 		ctx = context; jobs = new Map(); sources.clear(); nextId = 1; shuttingDown = false;
+		const pruned = new Set<string>();
+		for (const entry of context.sessionManager.getBranch()) {
+			if (entry.type === "custom" && entry.customType === prunedEntryType) {
+				const ids = (entry.data as { ids?: unknown } | null)?.ids;
+				if (!Array.isArray(ids) || ids.some(id => typeof id !== "string" ||
+					!/^job-[1-9][0-9]*$/.test(id) || !Number.isSafeInteger(Number(id.slice(4)) + 1))) {
+					if (context.hasUI) context.ui.notify("Cannot restore an invalid background-job prune marker.", "warning");
+					continue;
+				}
+				for (const id of ids) {
+					pruned.add(id); nextId = Math.max(nextId, Number(id.slice(4)) + 1);
+				}
+			}
+		}
 		// Reconnect only through this explicitly resumed session's recorded mappings.
 		for (const entry of context.sessionManager.getBranch()) {
 			if (entry.type !== "custom" || entry.customType !== entryType) continue;
 			try {
-				const directory = (entry.data as { directory: string }).directory;
+				const mapping = entry.data as { directory: string; id?: string };
+				if (mapping.id && pruned.has(mapping.id)) continue;
+				const directory = mapping.directory;
 				const info = statSync(directory);
 				if (info.uid !== process.getuid?.() || info.mode & 0o077) throw new Error("Job directory must be owner-private.");
 				const job = JSON.parse(readFileSync(join(directory, "request.json"), "utf8")) as Job;
 				if (job.session_id !== context.sessionManager.getSessionId()) continue;
 				if (!/^job-[1-9][0-9]*$/.test(job.id) || !/^pi-bg-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[.]service$/.test(job.unit) || job.slice !== sessionSlice(job.session_id)) throw new Error("Invalid job identity or session slice.");
 				if (existsSync(job.metadata_path)) mergeObservation(job, JSON.parse(readFileSync(job.metadata_path, "utf8")));
+				nextId = Math.max(nextId, Number(job.id.slice(4)) + 1);
+				if (pruned.has(job.id)) continue;
 				if (job.status === "detached") job.status = "running";
-				jobs.set(job.id, job); nextId = Math.max(nextId, Number(job.id.slice(4)) + 1);
+				jobs.set(job.id, job);
 			} catch (error) {
 				// Temp artifacts can be purged; one missing mapping must not disable others.
 				if (context.hasUI) context.ui.notify(`Cannot restore a background job: ${String(error)}`, "warning");
@@ -345,7 +405,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "background_start", label: "Start background job",
-		description: "DRAFT systemd backend: launch an authorized /bin/bash command as a transient user oneshot service without blocking the conversation. Required timeout_seconds maps to TimeoutStartSec; unsafe_to_terminate uses infinity and forbids extension-initiated stops. systemd owns cgroup termination. ExecStopPost persists exit results independently of Pi and unit collection; completion steers structured combined output. Requires Linux, a working user manager, systemd-run, systemctl and a Node-compatible runtime. Logs and results are private disk files; the inherited environment is temporarily stored owner-only and removed by the hook. No direct-process fallback. File events drive completion with slow reconciliation as backup; progress_interval defaults to off and never steers automatically. Session services share pi-jobs-<sessionHash>.slice. At most 100 jobs per session. Grants no new permissions or spending authority.",
+		description: "DRAFT systemd backend: launch an authorized /bin/bash command as a transient user oneshot service without blocking the conversation. Required timeout_seconds maps to TimeoutStartSec; unsafe_to_terminate uses infinity and forbids extension-initiated stops. systemd owns cgroup termination. ExecStopPost persists exit results independently of Pi and unit collection; completion steers structured combined output. Requires Linux, a working user manager, systemd-run, systemctl and a Node-compatible runtime. Logs and results are private disk files; the inherited environment is temporarily stored owner-only and removed by the hook. No direct-process fallback. File events drive completion with slow reconciliation as backup; progress_interval defaults to off and never steers automatically. Session services share pi-jobs-<sessionHash>.slice. Active-job limit and completed-history retention are configurable (defaults: 5 active, newest 100 completed, 24 hours). Pruning preserves disk artifacts. Grants no new permissions or spending authority.",
 		parameters: Type.Object({ command: Type.String({ minLength: 1, maxLength: 4096 }),
 			label: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
 			timeout_seconds: Type.Number({ minimum: 0.001, maximum: 2_147_483 }), unsafe_to_terminate: Type.Optional(Type.Boolean()),
@@ -357,49 +417,57 @@ export default function (pi: ExtensionAPI) {
 			if (signal?.aborted) throw new Error("Launch cancelled.");
 			if (!params.command.trim() || params.command.includes("\0") || params.command.length > 4096) throw new Error("Invalid command.");
 			if (!Number.isFinite(params.timeout_seconds) || params.timeout_seconds < 0.001 || params.timeout_seconds > 2_147_483) throw new Error("Invalid timeout_seconds.");
-			if (jobs.size >= 100) throw new Error("Session job limit reached (100).");
-			if (params.progress_interval !== undefined && !Object.hasOwn(progressIntervals, params.progress_interval)) throw new Error("Invalid progress_interval.");
-			await requireUserManager();
-			const directory = mkdtempSync(join(tmpdir(), "pi-background-systemd-"));
-			const job: Job = {
-				id: `job-${nextId++}`, session_id: context.sessionManager.getSessionId(), label: params.label ?? "Background job",
-				command: params.command, cwd: context.cwd, unit: `pi-bg-${randomUUID()}.service`, directory,
-				started_at: new Date().toISOString(), finished_at: null, timeout_seconds: params.timeout_seconds,
-				unsafe_to_terminate: params.unsafe_to_terminate ?? false, status: "running", exit_code: null, signal: null, error: null,
-				log_path: join(directory, "output.log"), metadata_path: join(directory, "metadata.json"),
-				completion_path: join(directory, "completion.json"), deadline_exceeded: false, systemd_result: null,
-				slice: sessionSlice(context.sessionManager.getSessionId()), systemd: {}, systemd_observed_at: null, last_progress_at: null,
-				progress_interval_seconds: progressIntervals[params.progress_interval ?? "off"],
-			};
-			writeFileSync(job.log_path, "", { mode: 0o600 });
-			// Give the hook a stable cwd even when the command's requested cwd is invalid.
-			writeFileSync(join(directory, "command.sh"), `cd -- ${shellArgument(context.cwd)} || exit 200\n${params.command}`, { mode: 0o600 });
-			writeFileSync(join(directory, "completion.cjs"), completionHook, { mode: 0o600 });
-			writeFileSync(join(directory, "environment"), environmentFile(), { mode: 0o600 });
-			atomic(join(directory, "request.json"), job); persist(job);
-			jobs.set(job.id, job);
-			pi.appendEntry(entryType, { directory });
-			attach(job);
-			const literal = specifierLiteral;
-			try {
-				await control("systemd-run", ["--user", "--quiet", "--no-block", "--collect", `--unit=${job.unit}`,
-					"--property=Type=oneshot", "--property=RemainAfterExit=no", "--property=Restart=no",
-					`--property=Slice=${job.slice}`, `--property=Description=Pi ${job.id}: ${job.label.replace(/[\x00-\x1f\x7f]/g, " ")}`,
-					"--property=CPUAccounting=yes", "--property=MemoryAccounting=yes",
-					`--property=TimeoutStartSec=${job.unsafe_to_terminate ? "infinity" : `${params.timeout_seconds}s`}`,
-					"--property=TimeoutStopSec=1s", "--property=KillMode=control-group", "--property=StandardInput=null",
-					"--property=UMask=0077", `--property=WorkingDirectory=${literal(directory)}`,
-					`--property=EnvironmentFile=${literal(join(directory, "environment"))}`,
-					`--property=StandardOutput=append:${literal(job.log_path)}`, "--property=StandardError=inherit",
-					`--property=ExecStopPost=:${execArgument(process.execPath)} ${execArgument(join(directory, "completion.cjs"))} ${execArgument(directory)}`,
-					"/bin/bash", literal(join(directory, "command.sh"))], controlOptions());
-			} catch (error) {
-				// A control-client error can follow unit creation. Never retry creation or
-				// infer that the command did not run; keep its unit identity and artifacts.
-				job.status = "unknown"; job.error = `Submission not confirmed: ${String(error)}`; persist(job);
+			await observe();
+			if (launching + [...jobs.values()].filter(active).length >= config.maxActive) {
+				throw new Error(`Active background job limit reached (${config.maxActive}); wait for completion or cancel a safe job.`);
 			}
-			await refresh(job); showCount();
-			return result(snapshot(job));
+			if (params.progress_interval !== undefined && !Object.hasOwn(progressIntervals, params.progress_interval)) throw new Error("Invalid progress_interval.");
+			launching++;
+			let reserved = true;
+			try {
+				await requireUserManager();
+				const directory = mkdtempSync(join(tmpdir(), "pi-background-systemd-"));
+				const job: Job = {
+					id: `job-${nextId++}`, session_id: context.sessionManager.getSessionId(), label: params.label ?? "Background job",
+					command: params.command, cwd: context.cwd, unit: `pi-bg-${randomUUID()}.service`, directory,
+					started_at: new Date().toISOString(), finished_at: null, timeout_seconds: params.timeout_seconds,
+					unsafe_to_terminate: params.unsafe_to_terminate ?? false, status: "running", exit_code: null, signal: null, error: null,
+					log_path: join(directory, "output.log"), metadata_path: join(directory, "metadata.json"),
+					completion_path: join(directory, "completion.json"), deadline_exceeded: false, systemd_result: null,
+					slice: sessionSlice(context.sessionManager.getSessionId()), systemd: {}, systemd_observed_at: null, last_progress_at: null,
+					progress_interval_seconds: progressIntervals[params.progress_interval ?? "off"],
+				};
+				writeFileSync(job.log_path, "", { mode: 0o600 });
+				// Give the hook a stable cwd even when the command's requested cwd is invalid.
+				writeFileSync(join(directory, "command.sh"), `cd -- ${shellArgument(context.cwd)} || exit 200\n${params.command}`, { mode: 0o600 });
+				writeFileSync(join(directory, "completion.cjs"), completionHook, { mode: 0o600 });
+				writeFileSync(join(directory, "environment"), environmentFile(), { mode: 0o600 });
+				atomic(join(directory, "request.json"), job); persist(job);
+				jobs.set(job.id, job);
+				launching--; reserved = false;
+				pi.appendEntry(entryType, { directory, id: job.id });
+				attach(job);
+				const literal = specifierLiteral;
+				try {
+					await control("systemd-run", ["--user", "--quiet", "--no-block", "--collect", `--unit=${job.unit}`,
+						"--property=Type=oneshot", "--property=RemainAfterExit=no", "--property=Restart=no",
+						`--property=Slice=${job.slice}`, `--property=Description=Pi ${job.id}: ${job.label.replace(/[\x00-\x1f\x7f]/g, " ")}`,
+						"--property=CPUAccounting=yes", "--property=MemoryAccounting=yes",
+						`--property=TimeoutStartSec=${job.unsafe_to_terminate ? "infinity" : `${params.timeout_seconds}s`}`,
+						"--property=TimeoutStopSec=1s", "--property=KillMode=control-group", "--property=StandardInput=null",
+						"--property=UMask=0077", `--property=WorkingDirectory=${literal(directory)}`,
+						`--property=EnvironmentFile=${literal(join(directory, "environment"))}`,
+						`--property=StandardOutput=append:${literal(job.log_path)}`, "--property=StandardError=inherit",
+						`--property=ExecStopPost=:${execArgument(process.execPath)} ${execArgument(join(directory, "completion.cjs"))} ${execArgument(directory)}`,
+						"/bin/bash", literal(join(directory, "command.sh"))], controlOptions());
+				} catch (error) {
+					// A control-client error can follow unit creation. Never retry creation or
+					// infer that the command did not run; keep its unit identity and artifacts.
+					job.status = "unknown"; job.error = `Submission not confirmed: ${String(error)}`; persist(job);
+				}
+				await refresh(job); showCount();
+				return result(snapshot(job));
+			} finally { if (reserved) launching--; }
 		},
 	});
 	pi.registerTool({

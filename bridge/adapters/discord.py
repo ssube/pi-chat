@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import json
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from bridge import __version__
@@ -20,13 +21,20 @@ from bridge.mentions import (BROADCAST_REJECTION, Member, Roster, find_mentions,
                              replace_mentions)
 from bridge.reaction_service import ReactionRejected
 from bridge.debug import debug_status
+from bridge.modes import ModeSwitchError, mode_command
 from bridge.runtime.pi_rpc import RpcImage
-from bridge.runtime.session import BridgeRuntime, Incoming, ReplyRejected
+from bridge.runtime.session import BridgeRuntime, Incoming, ReplyRejected, StopRequested
 from bridge.runtime.state import SessionKey
 
 
 log = logging.getLogger("agent_bridge.discord")
 DISCORD_LIMIT = 1900
+DISCORD_EPOCH_MS = 1_420_070_400_000
+
+
+def _snowflake_at(moment: datetime) -> int:
+    return max(0, int(moment.timestamp() * 1000) - DISCORD_EPOCH_MS) << 22
+
 # Session-control tokens shared with the Matrix adapter: the plain words a
 # requester types (`cancel`, `recover`), the chat-client slash spellings, and
 # the bang spelling of the diagnostic commands. These run after admission,
@@ -79,6 +87,16 @@ class DiscordAdapter:
         self._progress_headers: dict[tuple[SessionKey, str], str] = {}
         self._input_locks: dict[str, asyncio.Lock] = {}
         self._startup_sent = False
+        self._recovery_ready = asyncio.Event()
+        self._recovery_ready.set()  # Direct adapter calls outside run() remain usable.
+        self._recovery_lock = asyncio.Lock()
+        self._blocked_channels: set[int] = set()
+        self._recovery_floor = 0
+        self._gap_alert_pending = False
+        self._blocked_thread_parents: set[int] = set()
+        self._retry_task: asyncio.Task[None] | None = None
+        self._retry_delay = 30
+        self._hold_failures: dict[tuple[str, int], int] = {}
 
     async def publish_activity(self, activity: Activity) -> bool:
         if self.client is None or not self.client.is_ready():
@@ -157,21 +175,50 @@ class DiscordAdapter:
                 log.exception("Could not read Discord image")
         return tuple(images)
 
-    async def _on_message(self, message: Any) -> None:
-        if not self._approved(message) or message.author.id == self.client.user.id:
+    async def _on_message(self, message: Any, *, recovering: bool = False) -> None:
+        if not self._approved(message):
             return
+        blocked = False
+        if not recovering:
+            await self._recovery_ready.wait()
+            blocked = (int(message.channel.id) in self._blocked_channels or
+                       getattr(message.channel, "parent_id", None) in
+                       (self._blocked_channels | self._blocked_thread_parents))
+            if blocked:
+                # Keep the requester's escape hatch available even when history
+                # cannot be inspected; a control never advances the gap cursor.
+                control = (message.content.replace(f"<@{self.client.user.id}>", "")
+                           .replace(f"<@!{self.client.user.id}>", "").strip().lower())
+                if message.author.bot or control not in {"recover", "/recover", "!recover",
+                                                             "!debug", "!stop"}:
+                    return
         scope = str(message.channel.id)
+        key = SessionKey(self.agent, "discord", scope)
         async with self.telemetry.queued(self._input_locks.setdefault(scope, asyncio.Lock()), "discord",
-                                        SessionKey(self.agent, "discord", scope).scope_hash):
+                                        key.scope_hash):
             if message.id in self._seen:
                 self.telemetry.record("discord", "filter", "duplicate")
                 return
-            await self._deliver_message(message)
+            recovery_state = getattr(self.runtime, "discord_recovery_state", None)
+            if recovery_state is not None:
+                observed, accepted, _ = await recovery_state(key)
+                watermark = max((int(value) for value in (observed, accepted) if value),
+                                default=0)
+                if (recovering and int(message.id) <= watermark or
+                        not recovering and int(message.id) < self._recovery_floor):
+                    self.telemetry.record("discord", "filter", "duplicate")
+                    return
+            if message.author.id != self.client.user.id:
+                if await self._deliver_message(message) is False:
+                    return  # A failed submit is not an inspected/admitted message.
+            record_observed = getattr(self.runtime, "record_discord_observed", None)
+            if not blocked and record_observed is not None:
+                await record_observed(key, str(message.id))
             self._seen[message.id] = None
             if len(self._seen) > 10_000:
                 self._seen.pop(next(iter(self._seen)))
 
-    async def _deliver_message(self, message: Any) -> None:
+    async def _deliver_message(self, message: Any) -> bool:
         key = SessionKey(self.agent, "discord", str(message.channel.id))
         meta = discord_metadata(message)
         awake = await self.runtime.is_awake(key) if message.author.bot else False
@@ -181,17 +228,18 @@ class DiscordAdapter:
                                     wake_any=self._wake_on_any(message.channel))
         if reason:
             self.telemetry.record("discord", "filter", reason, scope_hash=key.scope_hash)
-            return
+            return True
         roster = self._roster(message.channel, message.guild, self.client.user)
         self_id = f"<@{self.client.user.id}>"
         plan = roster.plan(message.content)
         mentioned = self.client.user in message.mentions or self_id in plan.user_ids
-        command = (message.content.replace(f"<@{self.client.user.id}>", "")
-                   .replace(f"<@!{self.client.user.id}>", "").strip().lower())
+        command_body = (message.content.replace(f"<@{self.client.user.id}>", "")
+                        .replace(f"<@!{self.client.user.id}>", "").strip())
         leading = next((mention for mention, target in plan.known
                         if target == self_id and not message.content[:mention.start].strip()), None)
         if leading is not None:
-            command = message.content[leading.end:].strip().lower()
+            command_body = message.content[leading.end:].lstrip(" :,\n\t")
+        command = command_body.lower()
         if mentioned and not message.author.bot and command in {"!debug", "!stop"}:
             if command == "!debug":
                 reply = await debug_status(self.runtime, key)
@@ -201,13 +249,13 @@ class DiscordAdapter:
                          "discarded; the next wake uses the last saved summary and recent posts."
                          if stopped else "No running session belonging to you here.")
             await message.reply(reply, mention_author=False)
-            return
+            return True
         async def compaction_notice() -> None:
             await message.reply("Compacting, one moment...", mention_author=False)
 
         if not await self.runtime.admit(key, mentioned or self._wake_on_any(message.channel),
                                         on_wait=compaction_notice):
-            return
+            return True
         if not message.author.bot:
             session_command = DISCORD_SESSION_COMMANDS.get(
                 command if mentioned else message.content.strip().lower())
@@ -216,7 +264,7 @@ class DiscordAdapter:
                 await message.reply(
                     "Cancellation requested." if cancelled else
                     "No active request from you here.", mention_author=False)
-                return
+                return True
             if session_command == "recover":
                 recovered = await self.runtime.recover(key, str(message.author.id))
                 await message.reply(
@@ -224,7 +272,7 @@ class DiscordAdapter:
                     "recent unsaved context may be missing." if recovered else
                     "No failed checkpoint belonging to you in this channel.",
                     mention_author=False)
-                return
+                return True
         awake = await self.runtime.is_awake(key)
         if meta:
             hop = meta.get("hop", 0)
@@ -232,6 +280,24 @@ class DiscordAdapter:
         elif not awake:
             self._scope_hops[key] = 0
         text = message.content
+        selected_mode = None
+        if not message.author.bot:
+            mode_body = (message.content[leading.end:].lstrip(" :,\n\t")
+                         if leading is not None else message.content)
+            selection = mode_command(mode_body,
+                                     getattr(self.runtime, "modes", {}))
+            if selection is not None:
+                selected_mode, text = selection
+                if not text:
+                    try:
+                        notice = await self.runtime.change_mode(key, selected_mode, str(message.author.id))
+                    except StopRequested:
+                        return True  # The queued stop/cancel owns its acknowledgment.
+                    except ModeSwitchError as error:
+                        notice = str(error)
+                    await message.reply(notice, mention_author=False,
+                                        embed=self._metadata_embed("mode"))
+                    return True
         if not awake:
             context = await self._context(message)
             if context:
@@ -240,12 +306,19 @@ class DiscordAdapter:
         self._requests[(key, request_id)] = message
         incoming = Incoming(str(message.author.id), request_id,
                             f"Discord display name: {message.author.display_name}\n{text}",
-                            await self._images(message), optional=not mentioned,
+                            await self._images(message), optional=not mentioned and selected_mode is None,
                             # Another bridge's bot expects no reaction.
-                            ack_required=not message.author.bot)
+                            ack_required=not message.author.bot, mode=selected_mode)
         try:
             await self.runtime.submit(key, incoming)
             await self.runtime.record_wake(key, request_id)
+        except StopRequested:
+            self._requests.pop((key, request_id), None)
+            return True
+        except ModeSwitchError as error:
+            await message.reply(str(error), mention_author=False)
+            self._requests.pop((key, request_id), None)
+            return True
         except Exception:
             log.exception("Discord request could not be submitted id=%s", request_id)
             try:
@@ -255,6 +328,8 @@ class DiscordAdapter:
             except Exception:
                 log.exception("Discord request error could not be delivered id=%s", request_id)
                 self._requests.pop((key, request_id), None)
+            return False
+        return True
 
     def _broadcast_allowed(self, channel: Any) -> bool:
         return (getattr(channel, "id", None) in self.settings.broadcast_allowed_channel_ids or
@@ -387,7 +462,7 @@ class DiscordAdapter:
         broadcast_allowed = self._broadcast_allowed(getattr(request, "channel", None))
         if not broadcast_allowed and has_broadcast_ping(text):
             raise ReplyRejected(BROADCAST_REJECTION)
-        if kind == "compacting":
+        if kind in {"compacting", "mode"}:
             await request.reply(text, mention_author=False, embed=self._metadata_embed(kind),
                                 allowed_mentions=discord.AllowedMentions.none())
             return None  # Non-terminal notice; keep the request for its later reply.
@@ -566,6 +641,264 @@ class DiscordAdapter:
             raise ReactionRejected("discord_scope")
         return message
 
+    async def _recovery_scopes(self, deadline: float | None = None) -> tuple[list[Any], set[int], set[int]]:
+        """Bound every REST call; one slow listing cannot erase completed discovery."""
+        def budget(seconds: float) -> float:
+            return seconds if deadline is None else min(seconds, max(0, deadline - time.monotonic()))
+
+        blocked: set[int] = set()
+        thread_blind: set[int] = set()
+        threads = []
+        try:
+            guild = self.client.get_guild(self.settings.guild_id)
+            if guild is None:
+                guild = await asyncio.wait_for(self.client.fetch_guild(self.settings.guild_id), budget(10))
+            active = await asyncio.wait_for(guild.active_threads(), budget(10))
+            threads = [thread for thread in active
+                       if getattr(thread, "parent_id", None) in self.settings.channel_ids]
+        except Exception as error:
+            thread_blind.update(self.settings.channel_ids)
+            log.warning("Discord active-thread discovery paused cause=%s", type(error).__name__)
+        parents = []
+        for channel_id in self.settings.channel_ids:
+            try:
+                channel = self.client.get_channel(channel_id)
+                if channel is None:
+                    channel = await asyncio.wait_for(self.client.fetch_channel(channel_id), budget(5))
+                if not self._approved_channel(channel, getattr(channel, "guild", None)):
+                    raise RuntimeError("Discord recovery parent is outside the configured guild")
+                parents.append(channel)
+            except Exception as error:
+                blocked.add(channel_id)
+                log.warning("Discord parent recovery discovery paused scope_hash=%s cause=%s",
+                            SessionKey(self.agent, "discord", str(channel_id)).scope_hash,
+                            type(error).__name__)
+        for channel in parents:
+            if hasattr(channel, "archived_threads"):
+                try:
+                    async def archived() -> list[Any]:
+                        return [thread async for thread in channel.archived_threads(limit=101)]
+                    listing = await asyncio.wait_for(archived(), budget(5))
+                    if len(listing) > 100:
+                        raise RuntimeError("Discord archived-thread enumeration exceeds 100 per parent")
+                    threads.extend(thread for thread in listing
+                                   if self._approved_channel(thread, getattr(thread, "guild", None)))
+                except Exception as error:
+                    thread_blind.add(int(channel.id))
+                    log.warning("Discord archived-thread discovery paused scope_hash=%s cause=%s",
+                                SessionKey(self.agent, "discord", str(channel.id)).scope_hash,
+                                type(error).__name__)
+        scopes = {int(channel.id): channel for channel in (*parents, *threads)
+                  if int(channel.id) not in blocked and
+                  getattr(channel, "parent_id", None) not in blocked}
+        ordered = sorted(scopes.values(), key=lambda channel: int(
+            getattr(channel, "last_message_id", None) or channel.id), reverse=True)
+        return ordered, blocked, thread_blind
+
+    async def _recover_scope(self, channel: Any, deadline: float | None = None,
+                             *, preserve_gap: bool = False) -> None:
+        """Best-effort reconstruction, not a replay of edits or deleted messages."""
+        import discord
+        key = SessionKey(self.agent, "discord", str(channel.id))
+        observed, accepted, status = await self.runtime.discord_recovery_state(key)
+        if status == "checkpoint_error":
+            raise RuntimeError("Discord scope needs checkpoint recovery")
+        parent_id = getattr(channel, "parent_id", None)
+        if not observed and not accepted and parent_id in self.settings.channel_ids:
+            parent = SessionKey(self.agent, "discord", str(parent_id))
+            parent_observed, _, _ = await self.runtime.discord_recovery_state(parent)
+            if parent_observed:
+                observed = str(max(int(parent_observed), int(channel.id)))
+        # An old checkpoint predating this feature is not a delivery cursor.
+        # Once an observation exists, the accepted ID also closes the crash
+        # window after Pi admission but before the observation was persisted.
+        cursor = (max(int(observed), int(accepted)) if observed and accepted else
+                  int(observed) if observed else self._recovery_floor)
+        cutoff = _snowflake_at(datetime.now(timezone.utc) - timedelta(hours=24))
+        reset = False
+        if not observed:
+            reason = "first_enable" if accepted else "fresh_install"
+            skipped = f"unknown since={accepted}" if accepted else "unknown"
+            if await self.runtime.record_discord_gap(key, reason, cursor, skipped):
+                self._gap_alert_pending = True
+                log.warning("Discord baseline_reset scope_hash=%s reason=%s boundary=%d skipped=%s",
+                            key.scope_hash, reason, cursor, skipped)
+            reset = True
+        if cursor < cutoff:
+            if await self.runtime.record_discord_gap(key, "age", cutoff, "unknown"):
+                self._gap_alert_pending = True
+                log.warning("Discord baseline_reset scope_hash=%s reason=age boundary=%d skipped=unknown",
+                            key.scope_hash, cutoff)
+            cursor = cutoff
+            reset = True
+        # The first release has no observation watermark. The process-start
+        # snowflake is the no-history baseline, not an invitation to old work.
+        await self.runtime.record_discord_observed(key, str(cursor))
+        after = discord.Object(id=cursor)
+        async def fetch() -> list[Any]:
+            return [message async for message in channel.history(
+                after=after, limit=301, oldest_first=False)]
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError("Discord recovery fetch budget elapsed")
+        messages = (await fetch() if remaining is None else
+                    await asyncio.wait_for(fetch(), timeout=remaining))
+        if len(messages) > 300:
+            messages = messages[:300]
+            boundary = min(int(message.id) for message in messages)
+            if await self.runtime.record_discord_gap(key, "count", boundary, ">=1"):
+                self._gap_alert_pending = True
+                log.warning("Discord baseline_reset scope_hash=%s reason=count boundary=%d skipped>=1",
+                            key.scope_hash, boundary)
+            await self.runtime.record_discord_observed(key, str(boundary - 1))
+            reset = True
+        for message in sorted(messages, key=lambda item: int(item.id)):
+            if deadline is not None and time.monotonic() >= deadline:
+                # Never cancel a Pi admission merely to meet the REST budget.
+                # The persisted watermark resumes this scope on the next READY.
+                raise TimeoutError("Discord recovery admission budget elapsed")
+            await self._on_message(message, recovering=True)
+        if not reset and not preserve_gap:
+            await self.runtime.clear_discord_gap(key)
+
+    async def _reconcile_ready(self, *, retry: bool = False) -> None:
+        """Hold live events until older REST history has entered each scope."""
+        async with self._recovery_lock:
+            self._recovery_ready.clear()
+            prior_blocked = set(self._blocked_channels) if retry else set()
+            prior_blind = set(self._blocked_thread_parents) if retry else set()
+            blocked: set[int] = set()
+            thread_blind: set[int] = set()
+            failed_inspection: set[int] = set()
+            self._gap_alert_pending = False
+            deadline = time.monotonic() + 60
+            try:
+                scopes, discovery_blocked, thread_blind = await self._recovery_scopes(deadline)
+                blocked.update(discovery_blocked)
+                failed_inspection.update(discovery_blocked)
+                if retry:
+                    discovered = {int(channel.id) for channel in scopes}
+                    missing_held = prior_blocked - discovered
+                    blocked.update(missing_held)
+                    failed_inspection.update(missing_held)
+                    pending = prior_blocked | prior_blind
+                    scopes = [channel for channel in scopes
+                              if int(channel.id) in pending or
+                              getattr(channel, "parent_id", None) in prior_blind]
+                for channel in scopes[10:]:
+                    blocked.add(int(channel.id))
+                    key = SessionKey(self.agent, "discord", str(channel.id))
+                    if await self.runtime.record_discord_gap(key, "limit", 0, "held"):
+                        self._gap_alert_pending = True
+                for channel in scopes[:10]:
+                    try:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("Discord recovery budget elapsed")
+                        failed_inspection.add(int(channel.id))
+                        await self._recover_scope(
+                            channel, deadline, preserve_gap=int(channel.id) in thread_blind)
+                    except Exception as error:
+                        blocked.add(int(channel.id))
+                        status = getattr(error, "status", None)
+                        cause = ("permission" if status == 403 else
+                                 "not_found" if status == 404 else
+                                 "transient" if status == 429 or
+                                 isinstance(status, int) and status >= 500 or
+                                 isinstance(error, TimeoutError) else
+                                 type(error).__name__)
+                        key = SessionKey(self.agent, "discord", str(channel.id))
+                        log.warning("Discord recovery paused scope_hash=%s cause=%s",
+                                    key.scope_hash, cause)
+                        marker_reason = cause if cause in {"permission", "not_found", "transient"} else "error"
+                        if await self.runtime.record_discord_gap(key, marker_reason, 0, "held"):
+                            self._gap_alert_pending = True
+                for channel_id in discovery_blocked:
+                    key = SessionKey(self.agent, "discord", str(channel_id))
+                    if await self.runtime.record_discord_gap(key, "discovery", 0, "held"):
+                        self._gap_alert_pending = True
+                for channel_id in thread_blind - blocked:
+                    key = SessionKey(self.agent, "discord", str(channel_id))
+                    if await self.runtime.record_discord_gap(key, "thread_discovery", 0, "held"):
+                        self._gap_alert_pending = True
+            except Exception as error:
+                blocked.update(self.settings.channel_ids)
+                failed_inspection.update(self.settings.channel_ids)
+                log.warning("Discord recovery discovery failed cause=%s", type(error).__name__)
+                for channel_id in self.settings.channel_ids:
+                    key = SessionKey(self.agent, "discord", str(channel_id))
+                    if await self.runtime.record_discord_gap(key, "discovery", 0, "held"):
+                        self._gap_alert_pending = True
+            finally:
+                try:
+                    await self._bound_recovery_holds(blocked, thread_blind, failed_inspection)
+                finally:
+                    self._blocked_channels = blocked
+                    self._blocked_thread_parents = thread_blind
+                    self._recovery_ready.set()
+            if blocked or thread_blind:
+                log.warning("Discord recovery has %d paused scope(s), %d thread-blind parent(s)",
+                            len(blocked), len(thread_blind))
+            if self._gap_alert_pending and self.settings.startup_channel_id is not None:
+                try:
+                    import discord
+                    channel_id = self.settings.startup_channel_id
+                    channel = self.client.get_channel(channel_id) or await self.client.fetch_channel(channel_id)
+                    await channel.send(
+                        "agent-bridge Discord catch-up skipped or paused a scope; inspect private bridge logs.",
+                        allowed_mentions=discord.AllowedMentions.none(),
+                        embed=self._metadata_embed("recovery_alert"))
+                except Exception:
+                    log.warning("Discord recovery alert could not be delivered")
+            if blocked or thread_blind:
+                if self._retry_task is None or self._retry_task.done():
+                    self._retry_task = asyncio.create_task(self._retry_recovery())
+            else:
+                self._retry_delay = 30
+                if self._retry_task is not None and self._retry_task is not asyncio.current_task():
+                    self._retry_task.cancel()
+
+    async def _bound_recovery_holds(self, blocked: set[int], thread_blind: set[int],
+                                    failed_inspection: set[int]) -> None:
+        """Expire only failed inspections, never scopes merely waiting behind the cap."""
+        present = {("channel", channel_id) for channel_id in blocked}
+        present.update(("thread", parent_id) for parent_id in thread_blind - blocked)
+        for token in tuple(self._hold_failures):
+            if token not in present:
+                del self._hold_failures[token]
+        attempted = {("channel", channel_id) for channel_id in blocked & failed_inspection}
+        attempted.update(("thread", parent_id) for parent_id in thread_blind - blocked)
+        for kind, channel_id in sorted(attempted):
+            token = (kind, channel_id)
+            failures = self._hold_failures.get(token, 0) + 1
+            if failures < 3:
+                self._hold_failures[token] = failures
+                continue
+            key = SessionKey(self.agent, "discord", str(channel_id))
+            boundary = _snowflake_at(datetime.now(timezone.utc))
+            reason = "thread_hold_expired" if kind == "thread" else "hold_expired"
+            if await self.runtime.record_discord_gap(key, reason, boundary, "unknown after=3"):
+                self._gap_alert_pending = True
+                log.warning("Discord baseline_reset scope_hash=%s reason=%s boundary=%d skipped=unknown",
+                            key.scope_hash, reason, boundary)
+            await self.runtime.record_discord_observed(key, str(boundary))
+            if kind == "thread":
+                thread_blind.discard(channel_id)
+            else:
+                blocked.discard(channel_id)
+            del self._hold_failures[token]
+
+    async def _retry_recovery(self) -> None:
+        """Retry held scopes without waiting for another gateway reconnect."""
+        while self._blocked_channels or self._blocked_thread_parents:
+            delay = self._retry_delay
+            log.warning("Discord recovery retry scheduled in %d seconds", delay)
+            await asyncio.sleep(delay)
+            self._retry_delay = min(delay * 2, 300)
+            try:
+                await self._reconcile_ready(retry=True)
+            except Exception:
+                log.exception("Discord recovery retry failed")
+
     async def _announce_startup(self) -> None:
         channel_id = self.settings.startup_channel_id
         if channel_id is None or self._startup_sent:
@@ -590,6 +923,9 @@ class DiscordAdapter:
         tree = discord.app_commands.CommandTree(client)
         self.client = client
 
+        self._recovery_floor = _snowflake_at(datetime.now(timezone.utc))
+        self._recovery_ready.clear()
+
         @client.event
         async def on_message(message: discord.Message) -> None:
             try:
@@ -600,6 +936,7 @@ class DiscordAdapter:
         @client.event
         async def on_ready() -> None:
             log.info("Discord connected for %s", self.agent)
+            await self._reconcile_ready()
             try:
                 await tree.sync(guild=discord.Object(id=self.settings.guild_id))
             except Exception:
@@ -608,6 +945,10 @@ class DiscordAdapter:
                 await self._announce_startup()
             except Exception:
                 log.exception("Discord startup notice failed")
+
+        @client.event
+        async def on_resumed() -> None:
+            await self._reconcile_ready()
 
         guild = discord.Object(id=self.settings.guild_id)
         for name, description, handler in (
@@ -622,8 +963,14 @@ class DiscordAdapter:
             tree.command(name=name, description=description, guild=guild)(handler)
 
         import os
-        await client.start(os.environ[self.settings.token_env])
+        try:
+            await client.start(os.environ[self.settings.token_env])
+        finally:
+            if self._retry_task is not None:
+                self._retry_task.cancel()
 
     async def stop(self) -> None:
+        if self._retry_task is not None:
+            self._retry_task.cancel()
         if self.client is not None:
             await self.client.close()

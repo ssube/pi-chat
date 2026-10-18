@@ -1083,6 +1083,7 @@ class DiscordDeliveryTests(unittest.IsolatedAsyncioTestCase):
             AllowedMentions=SimpleNamespace(none=lambda: "no-mentions"))
         adapter = DiscordAdapter("agent_two", DiscordSettings("TEST_DISCORD_TOKEN", 123,
                                  (456,), startup_channel_id=456), None)
+        adapter._reconcile_ready = AsyncMock()  # Startup notice; catch-up is covered separately.
         with patch.dict(sys.modules, {"discord": discord}), patch.dict(
                 os.environ, {"TEST_DISCORD_TOKEN": "test"}):
             await adapter.run()
