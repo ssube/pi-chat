@@ -6,6 +6,13 @@ const extension = createJiti(__filename)(path.resolve(__dirname, '../extensions/
 const tools = {};
 extension({ registerTool: (tool) => { tools[tool.name] = tool; } });
 const sleep = (time, signal, onUpdate, ctx) => tools.sleep_until.execute('id', { time }, signal, onUpdate, ctx);
+const freshSleep = () => {
+  // Load after MockTimers installs its promise-timer function. A module loaded
+  // earlier retains the native timer; advancing Date alone cannot wake it.
+  const tools = {};
+  createJiti(__filename, { moduleCache: false })(path.resolve(__dirname, '../extensions/pi-time.ts')).default({ registerTool: tool => tools[tool.name] = tool });
+  return (time, signal, onUpdate, ctx) => tools.sleep_until.execute('id', { time }, signal, onUpdate, ctx);
+};
 
 test('clock returns the selected epoch, ISO UTC, or human display', async () => {
   const before = Date.now();
@@ -81,21 +88,119 @@ test('already cancelled waits do not publish progress', async () => {
   assert.equal(updates.length, 0);
 });
 
-test('UI notice is emitted before waiting even when no progress callback is provided', async () => {
-  const controller = new AbortController();
-  const notices = [];
+test('tool progress is the only waiting display when a callback and UI are both available', async () => {
+  const controller = new AbortController(), updates = [], notices = [], statuses = [];
+  await assert.rejects(sleep('1 hour', controller.signal, update => {
+    updates.push(update); controller.abort();
+  }, { hasUI: true, ui: { notify: text => notices.push(text), setStatus: (...args) => statuses.push(args) } }), { name: 'AbortError' });
+  assert.equal(updates.length, 1); assert.deepEqual(notices, []); assert.deepEqual(statuses, []);
+});
+
+test('fallback uses one replaceable UI status and clears it on cancellation', async () => {
+  const controller = new AbortController(), statuses = [], notices = [];
   const pending = sleep('1 hour', controller.signal, undefined, {
-    hasUI: true, ui: { notify: (text, level) => notices.push({ text, level }) },
+    hasUI: true, ui: { setStatus: (...args) => statuses.push(args), notify: text => notices.push(text) },
   });
   try {
-    // execute has reached its first await: this must already be visible.
-    assert.equal(notices.length, 1);
-    assert.match(notices[0].text, /^Waiting 1 hour; expected wake: .*Z\.$/);
-    assert.equal(notices[0].level, 'info');
-  } finally {
-    controller.abort();
-    await assert.rejects(pending, { name: 'AbortError' });
+    assert.equal(statuses.length, 1); assert.match(statuses[0][1], /^Waiting 1 hour; expected wake: .*Z\.$/);
+    assert.deepEqual(notices, []);
+  } finally { controller.abort(); await assert.rejects(pending, { name: 'AbortError' }); }
+  assert.deepEqual(statuses.at(-1), [statuses[0][0], undefined]);
+});
+
+test('countdown publishes at a cadence appropriate to remaining duration', async t => {
+  for (const [time, cadence] of [['2 hours', 60000], ['30 minutes', 15000], ['3 minutes', 5000], ['30 seconds', 1000]]) {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.parse('2026-10-18T20:00:00Z') });
+    const controller = new AbortController(), updates = [];
+    const pending = freshSleep()(time, controller.signal, update => updates.push(update));
+    try {
+      assert.equal(updates.length, 1);
+      t.mock.timers.tick(cadence - 1); await Promise.resolve(); assert.equal(updates.length, 1);
+      t.mock.timers.tick(1); await Promise.resolve(); await Promise.resolve();
+      assert.equal(updates.length, 2, time);
+      assert.equal(updates[1].details.remainingMs, updates[0].details.durationMs - cadence);
+      assert.equal(updates[1].details.target, updates[0].details.target);
+      assert.match(updates[1].content[0].text, /remaining/);
+    } finally { controller.abort(); await assert.rejects(pending, { name: 'AbortError' }); t.mock.timers.reset(); }
   }
+});
+
+test('countdown accelerates in the final minute and completes at the original target', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.parse('2026-10-18T20:00:00Z') });
+  const controller = new AbortController(), updates = [];
+  const pending = freshSleep()('65 seconds', controller.signal, update => updates.push(update));
+  try {
+    t.mock.timers.tick(5000); await Promise.resolve(); await Promise.resolve();
+    assert.equal(updates.at(-1).details.remainingMs, 60000);
+    t.mock.timers.tick(1000); await Promise.resolve(); await Promise.resolve();
+    assert.equal(updates.at(-1).details.remainingMs, 59000);
+    t.mock.timers.tick(59000); const result = await pending;
+    assert.equal(result.details.target, '2026-10-18T20:01:05.000Z');
+    assert.equal(result.details.wokeAt, result.details.target); assert.equal(result.details.durationMs, 65000);
+  } finally { controller.abort(); await pending.catch(() => {}); }
+});
+
+test('fallback countdown replaces one status and clears it after success', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.parse('2026-10-18T20:00:00Z') });
+  const statuses = [], notices = [], controller = new AbortController();
+  const pending = freshSleep()('3 seconds', controller.signal, undefined, { hasUI: true,
+    ui: { setStatus: (...args) => statuses.push(args), notify: text => notices.push(text) } });
+  try {
+    t.mock.timers.tick(1000); await Promise.resolve(); await Promise.resolve();
+    assert.match(statuses.at(-1)[1], /Waiting 2 seconds remaining/);
+    t.mock.timers.tick(2000); await pending;
+    assert.deepEqual(statuses.at(-1), [statuses[0][0], undefined]);
+    assert.equal(new Set(statuses.map(([key]) => key)).size, 1); assert.deepEqual(notices, []);
+  } finally { controller.abort(); await pending.catch(() => {}); }
+});
+
+test('concurrent fallback waits use separate status keys and cancellation leaves no updates', async () => {
+  const a = new AbortController(), b = new AbortController(), visible = new Map();
+  const ctx = { hasUI: true, ui: { setStatus: (key, value) => value === undefined ? visible.delete(key) : visible.set(key, value) } };
+  const first = tools.sleep_until.execute('first', { time: '1 hour' }, a.signal, undefined, ctx);
+  const second = tools.sleep_until.execute('second', { time: '1 hour' }, b.signal, undefined, ctx);
+  assert.equal(visible.size, 2);
+  a.abort(); await assert.rejects(first, { name: 'AbortError' }); assert.equal(visible.size, 1);
+  b.abort(); await assert.rejects(second, { name: 'AbortError' }); assert.equal(visible.size, 0);
+});
+
+test('cancelled countdown has no later progress callbacks', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.parse('2026-10-18T20:00:00Z') });
+  const controller = new AbortController(), updates = [];
+  const pending = freshSleep()('30 seconds', controller.signal, update => updates.push(update));
+  controller.abort(); await assert.rejects(pending, { name: 'AbortError' });
+  t.mock.timers.tick(300000); await Promise.resolve(); assert.equal(updates.length, 1);
+});
+
+test('a real short wait emits a decreasing countdown without a duplicate UI notice', async () => {
+  const updates = [], notices = [];
+  const result = await sleep('1.05 seconds', undefined, update => updates.push(update), {
+    hasUI: true, ui: { notify: text => notices.push(text) },
+  });
+  assert.ok(updates.length >= 2); assert.deepEqual(notices, []);
+  assert.ok(updates[1].details.remainingMs < updates[0].details.remainingMs);
+  assert.equal(updates[1].details.target, result.details.target);
+  assert.ok(Date.parse(result.details.wokeAt) >= Date.parse(result.details.target));
+});
+
+test('callback-equipped headless clients receive countdown events without UI calls', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.parse('2026-10-18T20:00:00Z') });
+  const controller = new AbortController(), updates = [];
+  const pending = freshSleep()('30 seconds', controller.signal, update => updates.push(update), { hasUI: false,
+    ui: { setStatus: () => assert.fail('No headless UI status'), notify: () => assert.fail('No headless notification') } });
+  try {
+    t.mock.timers.tick(1000); await Promise.resolve(); await Promise.resolve();
+    assert.equal(updates.length, 2); assert.equal(updates[1].details.remainingMs, 29000);
+  } finally { controller.abort(); await assert.rejects(pending, { name: 'AbortError' }); }
+});
+
+test('a disposed fallback UI cannot mask cancellation or a successful result', async () => {
+  const ui = { setStatus: (_key, value) => { if (value === undefined) throw new Error('UI disposed'); } };
+  const controller = new AbortController();
+  const pending = sleep('1 hour', controller.signal, undefined, { hasUI: true, ui });
+  controller.abort(); await assert.rejects(pending, { name: 'AbortError' });
+  const result = await sleep('0.001 seconds', undefined, undefined, { hasUI: true, ui });
+  assert.ok(Date.parse(result.details.wokeAt) >= Date.parse(result.details.target));
 });
 
 test('headless and already-aborted waits do not send UI notices', async () => {
@@ -108,7 +213,7 @@ test('headless and already-aborted waits do not send UI notices', async () => {
 });
 
 test('rejects ambiguous, invalid, and sub-millisecond inputs', async () => {
-  for (const time of ['toagent-one', '3 months', '0 hours', '-2 hours', '0.0001 seconds',
+  for (const time of ['tomorrow', '3 months', '0 hours', '-2 hours', '0.0001 seconds',
     '2026-10-08T12:00:00', '2026-02-30T12:00:00Z', '2026-10-08T12:00:00+25:00',
     '2026-10-08T12:00:00+01:60',
     '999999999999999999 hours']) {

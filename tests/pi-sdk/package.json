@@ -1,0 +1,12 @@
+{
+  "name": "pi-tasks-sdk-contract",
+  "private": true,
+  "scripts": {
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.99.1",
+    "@types/node": "24.0.0",
+    "typescript": "5.9.3"
+  }
+}

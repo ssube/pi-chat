@@ -4,8 +4,8 @@ const path = require('node:path');
 const { createJiti } = require(require.resolve('jiti', { paths: [path.resolve(__dirname, '../extensions')] }));
 const { default: extension, parseVerdict, taskListMarkdown, recentTaskMessages } = createJiti(__filename)(path.resolve(__dirname, '../extensions/tasks.ts'));
 
-function setup(branch = []) {
-  const handlers = {}, tools = {}, commands = {}, sent = [], notices = [], widgets = [], requests = [], titles = [];
+function setup(branch = [], flags = {}) {
+  const handlers = {}, tools = {}, commands = {}, sent = [], notices = [], widgets = [], requests = [], titles = [], flagDefinitions = {}, focuses = [];
   let selections = [], inputs = [], confirms = [], idle = true, queued = false;
   let judge = async () => ({ verdict: 'accepted', reason: 'The supplied test output satisfies the criterion.', missing: [] });
   const ctx = {
@@ -24,17 +24,45 @@ function setup(branch = []) {
         const value = selections.shift();
         return typeof value === 'function' ? value(choices) : value;
       },
-      input: async () => inputs.shift(), confirm: async () => confirms.shift() ?? true,
+      input: async () => inputs.shift(), editor: async () => inputs.shift(), confirm: async () => confirms.shift() ?? true,
+      custom: async factory => {
+        let result, finished = false;
+        const component = await factory({ requestRender() {} }, ctx.ui.theme, {}, value => { result = value; finished = true; });
+        const original = component.list.getSelectedItem()?.value;
+        focuses.push(original);
+        const choices = [];
+        for (let index = 0; index < 110; index++) {
+          component.list.setSelectedIndex(index);
+          const value = component.list.getSelectedItem()?.value;
+          if (choices.includes(value)) break;
+          choices.push(value);
+        }
+        component.list.setSelectedIndex(choices.indexOf(original));
+        titles.push(component.render(200).join('\n'));
+        const planned = selections.shift();
+        const choice = typeof planned === 'function' ? planned(choices) : planned;
+        if (choice && typeof choice === 'object') {
+          if (choice.task !== undefined) component.list.setSelectedIndex(choices.findIndex(value => value.startsWith(`#${choice.task} `)));
+          component.handleInput(choice.key);
+        } else if (choice === undefined) component.handleInput('\x1b');
+        else {
+          assert.ok(choices.includes(choice), `Menu choice absent: ${choice}`);
+          component.list.setSelectedIndex(choices.indexOf(choice)); component.handleInput('\r');
+        }
+        assert.equal(finished, true); return result;
+      },
     },
   };
   extension({
     on: (name, handler) => { handlers[name] = handler; }, registerTool: tool => { tools[tool.name] = tool; },
     registerCommand: (name, command) => { commands[name] = command; },
+    registerFlag: (name, options) => { flagDefinitions[name] = options; },
+    getFlag: name => flags[name] ?? flagDefinitions[name]?.default,
     appendEntry: (customType, data) => branch.push({ type: 'custom', customType, data: structuredClone(data) }),
     sendMessage: (...args) => sent.push(args),
   });
   handlers.session_start({}, ctx);
-  return { handlers, tools, commands, ctx, branch, sent, notices, widgets, requests, titles,
+  return { handlers, tools, commands, ctx, branch, sent, notices, widgets, requests, titles, focuses,
     select: (...values) => { selections = values; }, inputs: (...values) => { inputs = values; },
     confirms: (...values) => { confirms = values; }, judge: fn => { judge = fn; },
     idle: value => { idle = value; }, queued: value => { queued = value; },
@@ -93,6 +121,7 @@ test('unblock respects stops, paused reminders and the no-progress budget', asyn
   await call(s, 'tasks_block', { task_id: 1, reason: 'Waiting again' });
   await call(s, 'tasks_unblock', { task_id: 1 });
   assert.equal(settle(s), undefined, 'unblock must not override a stop');
+  input(s); // A stopped menu offers Resume; genuine input enables the Pause action.
   s.select('Pause reminders', 'Close'); await s.commands.tasks.handler('', s.ctx);
   input(s);
   await call(s, 'tasks_block', { task_id: 1, reason: 'Paused' });
@@ -140,6 +169,7 @@ test('progress cannot replenish reminders or override stop/pause and cancels sta
   await call(s, 'tasks_progress', { task_id: 1 }); assert.equal(settle(s), undefined);
   s.handlers.input({ source: 'interactive', text: 'Stop' }, s.ctx);
   await call(s, 'tasks_progress', { task_id: 1, active: false }); assert.equal(settle(s), undefined);
+  input(s); // Exercise the real visible Pause action after the stop assertion.
   s.select('Pause reminders', 'Close'); await s.commands.tasks.handler('', s.ctx); input(s);
   await call(s, 'tasks_progress', { task_id: 1 }); assert.equal((await list(s)).paused, true); assert.equal(settle(s), undefined);
   let resolve; s.judge(() => new Promise(done => { resolve = done; })); const assessment = complete(s);
@@ -283,6 +313,46 @@ test('early termination gets at most two reminders; abort, errors, queues, and b
   input(s); await call(s, 'tasks_block', { task_id: 1, reason: 'Need the user to authorize spending.' });
   assert.equal(settle(s), undefined); assert.equal((await list(s)).tasks[0].status, 'blocked');
   assert.match(s.handlers.context({ messages: [] }, s.ctx).messages[0].content, /authorize spending/);
+});
+
+test('blocked/completed ledgers retire stale reminders and never schedule another turn', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  for (const statuses of [['blocked', 'blocked'], ['complete', 'complete'], ['blocked', 'complete']]) {
+    const s = setup(); await add(s, 'First'); await add(s, 'Second'); input(s);
+    const stale = settle(s).entries[0];
+    s.handlers.agent_settled({}, s.ctx);
+    for (const [index, status] of statuses.entries()) {
+      if (status === 'blocked') await call(s, 'tasks_block', { task_id: index + 1, reason: 'Waiting for an existing decision' });
+      else { s.select(pickTask(index + 1), 'Mark complete (user override)', 'Close'); await s.commands.tasks.handler('', s.ctx); }
+    }
+    s.sent.length = 0;
+    const userMessage = { role: 'user', content: 'User text must remain unchanged' };
+    const messages = s.handlers.context({ messages: [{ role: 'custom', customType: stale.customType, content: stale.content }, userMessage] }, s.ctx).messages;
+    assert.equal(messages.some(message => message.customType === 'tasks-reminder-v1'), false, 'historical pending snapshots must not re-prompt');
+    assert.deepEqual(messages[0], userMessage);
+    if (statuses.includes('blocked')) {
+      assert.match(messages.at(-1).content, /No actionable tasks/);
+      assert.doesNotMatch(messages.at(-1).content, /Work on pending|Submit each task/);
+    } else assert.equal(messages.length, 1, 'completed-only context needs no task prompt');
+    assert.equal(settle(s), undefined);
+    s.handlers.agent_settled({}, s.ctx); t.mock.timers.tick(180000); assert.equal(s.sent.length, 0);
+    s.select('Pause reminders', 'Resume reminders', 'Close'); await s.commands.tasks.handler('', s.ctx); assert.equal(s.sent.length, 0);
+  }
+});
+
+test('context has only the current ledger and respects suspension without stripping explicit user/list messages', async () => {
+  const s = setup(); await add(s); input(s);
+  const stale = settle(s).entries[0];
+  s.handlers.input({ source: 'interactive', text: 'Stop looping' }, s.ctx);
+  const explicit = [{ role: 'user', content: stale.content }, { role: 'custom', customType: 'tasks-list', content: 'Explicit list request' }];
+  const context = s.handlers.context({ messages: [{ role: 'custom', customType: stale.customType, content: stale.content }, ...explicit] }, s.ctx);
+  assert.equal(context.messages.some(message => message.customType === 'tasks-reminder-v1'), false);
+  assert.deepEqual(context.messages.slice(0, 2), explicit);
+  assert.match(context.messages.at(-1).content, /paused or suspended/);
+  assert.doesNotMatch(context.messages.at(-1).content, /Work on pending|Submit each task/);
+  input(s);
+  const active = s.handlers.context({ messages: [] }, s.ctx);
+  assert.match(active.messages[0].content, /Work on pending/);
 });
 
 test('three-minute idle fallback is deduplicated, bounded, and cleaned up on transitions', async t => {
@@ -591,4 +661,247 @@ test('TUI status labels use distinct theme colors with text retained; menu selec
   assert.doesNotMatch(JSON.stringify(await list(s)), /<accent>|<warning>|<success>|<mdLink>/);
   await s.commands['tasks-send'].handler('', s.ctx);
   assert.doesNotMatch(s.sent.at(-1)[0].content, /<accent>|<warning>|<success>|<mdLink>/);
+});
+
+test('widget prioritizes progress, blocked, pending, complete stably without reordering the ledger', async () => {
+  const tasks = [
+    { id: 1, summary: 'Pending A', acceptance: 'A', status: 'pending' },
+    { id: 2, summary: 'Complete A', acceptance: 'A', status: 'complete', completedBy: 'user' },
+    { id: 3, summary: 'Blocked A', acceptance: 'A', status: 'blocked', blocker: 'Waiting A' },
+    { id: 4, summary: 'Progress A', acceptance: 'A', status: 'progress' },
+    { id: 5, summary: 'Pending B', acceptance: 'A', status: 'pending' },
+    { id: 6, summary: 'Blocked B', acceptance: 'A', status: 'blocked', blocker: 'Waiting B' },
+    { id: 7, summary: 'Complete B', acceptance: 'A', status: 'complete', completedBy: 'user' },
+  ];
+  const s = setup([{ type: 'custom', customType: 'tasks-state-v1', data: { version: 1, nextId: 8, paused: false, tasks } }]);
+  const visible = () => s.widgets.at(-1).slice(1).map(row => Number(/^#(\d+)/.exec(row)[1]));
+  assert.deepEqual(visible(), [4, 3, 6]);
+  await call(s, 'tasks_unblock', { task_id: 3 });
+  assert.deepEqual(visible(), [4, 6, 1]);
+  assert.deepEqual((await list(s)).tasks.map(task => task.id), [1, 2, 3, 4, 5, 6, 7]);
+  assert.equal((await list(s)).tasks[2].status, 'pending');
+  const few = setup([{ type: 'custom', customType: 'tasks-state-v1', data: { version: 1, nextId: 3, paused: false,
+    tasks: [tasks[1], tasks[0]] } }]);
+  assert.deepEqual(few.widgets.at(-1).slice(1).map(row => Number(/^#(\d+)/.exec(row)[1])), [1, 2]);
+  const completeOnly = setup([{ type: 'custom', customType: 'tasks-state-v1', data: { version: 1, nextId: 3, paused: false,
+    tasks: [tasks[1]] } }]);
+  assert.match(completeOnly.widgets.at(-1)[0], /^0 open tasks/);
+  assert.match(completeOnly.widgets.at(-1)[1], /^#2 \[complete\]/);
+  assert.deepEqual(settle(completeOnly), undefined);
+  assert.equal(completeOnly.sent.length, 0);
+});
+
+test('menu keyboard priority moves a task first and posts exactly one explicit next-work steer', async () => {
+  const s = setup(); await add(s, 'First'); await add(s, 'Second'); await add(s, 'Third');
+  await call(s, 'tasks_block', { task_id: 2, reason: 'Resolve prerequisite first' });
+  s.select({ task: 2, key: 'p' }); await s.commands.tasks.handler('', s.ctx);
+  const tasks = (await list(s)).tasks;
+  assert.deepEqual(tasks.map(task => task.id), [2, 1, 3]);
+  assert.equal(tasks[0].status, 'blocked');
+  assert.equal(s.sent.length, 1); assert.equal(s.sent[0][0].customType, 'tasks-user-control-v1');
+  assert.match(s.sent[0][0].content, /work on this task next/);
+  assert.match(s.sent[0][0].content, /blocked task remains blocked/);
+  assert.deepEqual(s.sent[0][1], { deliverAs: 'steer', triggerTurn: true });
+  assert.equal(s.requests.length, 0);
+  const restored = setup(s.branch); assert.deepEqual((await list(restored)).tasks.map(task => task.id), [2, 1, 3]);
+});
+
+test('cancel shortcut requests a safe stop only for progress, without waking an idle agent or completing it', async () => {
+  const s = setup(); await add(s); await call(s, 'tasks_progress', { task_id: 1 }); input(s);
+  s.select({ task: 1, key: 'c' }); await s.commands.tasks.handler('', s.ctx);
+  assert.equal((await list(s)).tasks[0].status, 'pending');
+  assert.equal(s.sent.length, 1); assert.match(s.sent[0][0].content, /Stop work on this task at the next safe boundary/);
+  assert.match(s.sent[0][0].content, /does not terminate an already-running tool/);
+  assert.deepEqual(s.sent[0][1], { deliverAs: 'steer', triggerTurn: false });
+  assert.equal(settle(s), undefined); assert.equal(s.requests.length, 0);
+  s.sent.length = 0;
+  s.select({ task: 1, key: 'c' }); await s.commands.tasks.handler('', s.ctx);
+  assert.equal(s.sent.length, 0); assert.match(s.notices.at(-1)[0], /unavailable/);
+});
+
+test('delete excludes progress, confirms other states, and rejects stale targets', async () => {
+  const s = setup(); await add(s); await call(s, 'tasks_progress', { task_id: 1 });
+  let confirmations = 0; s.ctx.ui.confirm = async () => { confirmations++; return true; };
+  s.select({ task: 1, key: 'x' }); await s.commands.tasks.handler('', s.ctx);
+  assert.equal(confirmations, 0); assert.equal((await list(s)).tasks.length, 1);
+  await call(s, 'tasks_progress', { task_id: 1, active: false });
+  s.ctx.ui.confirm = async () => { confirmations++; await call(s, 'tasks_progress', { task_id: 1 }); return true; };
+  s.select({ task: 1, key: 'x' }); await s.commands.tasks.handler('', s.ctx);
+  assert.equal((await list(s)).tasks[0].status, 'progress'); assert.match(s.notices.at(-1)[0], /Task changed/);
+  await call(s, 'tasks_progress', { task_id: 1, active: false });
+  s.ctx.ui.confirm = async () => false;
+  s.select({ task: 1, key: 'x' }); await s.commands.tasks.handler('', s.ctx);
+  assert.equal((await list(s)).tasks.length, 1);
+  s.ctx.ui.confirm = async () => true;
+  s.select({ task: 1, key: 'x' }); await s.commands.tasks.handler('', s.ctx);
+  assert.equal((await list(s)).tasks.length, 0); assert.equal(s.sent.length, 0);
+  await add(s, 'Completed'); await complete(s, 2);
+  s.select({ task: 2, key: 'x' }); await s.commands.tasks.handler('', s.ctx);
+  assert.equal((await list(s)).tasks.length, 0);
+});
+
+test('cancel invalidates a pending assessment and priority never reopens completed work', async () => {
+  const s = setup(); await add(s); await call(s, 'tasks_progress', { task_id: 1 });
+  let resolve; s.judge(() => new Promise(done => { resolve = done; })); const assessment = complete(s);
+  s.select({ task: 1, key: 'c' }); await s.commands.tasks.handler('', s.ctx);
+  assert.equal(s.requests[0][2].signal.aborted, true);
+  resolve({ verdict: 'accepted', reason: 'Late result.', missing: [] }); await assessment;
+  assert.equal((await list(s)).tasks[0].status, 'pending');
+  s.judge(async () => ({ verdict: 'accepted', reason: 'Output verified.', missing: [] })); await complete(s);
+  s.sent.length = 0; s.select({ task: 1, key: 'p' }); await s.commands.tasks.handler('', s.ctx);
+  assert.equal((await list(s)).tasks[0].status, 'complete'); assert.equal(s.sent.length, 0);
+});
+
+test('menu n creates a task, q and Escape close, and focus defaults to progress or Add', async () => {
+  const s = setup(); await add(s, 'First'); await add(s, 'Second');
+  await call(s, 'tasks_progress', { task_id: 2 });
+  s.select({ key: 'q' }); await s.commands.tasks.handler('', s.ctx);
+  assert.match(s.focuses.at(-1), /^#2 /); assert.equal(s.sent.length, 0);
+  await call(s, 'tasks_progress', { task_id: 2, active: false });
+  s.select({ key: 'q' }); await s.commands.tasks.handler('', s.ctx);
+  assert.equal(s.focuses.at(-1), 'Add task');
+  s.inputs('New via keyboard', 'A concrete criterion', ''); s.select({ key: 'n' }, { key: 'q' });
+  await s.commands.tasks.handler('', s.ctx);
+  assert.equal((await list(s)).tasks.at(-1).summary, 'New via keyboard');
+  assert.equal((await list(s)).tasks.at(-1).acceptance, 'A concrete criterion');
+  const configured = setup(s.branch, { 'tasks-menu-focus': 'add' });
+  await call(configured, 'tasks_progress', { task_id: 2 });
+  configured.select({ key: 'q' }); await configured.commands.tasks.handler('', configured.ctx);
+  assert.equal(configured.focuses.at(-1), 'Add task');
+  const before = configured.sent.length;
+  configured.select(undefined); await configured.commands.tasks.handler('', configured.ctx);
+  assert.equal(configured.sent.length, before);
+});
+
+test('preview count and initial-focus options validate bounds and preserve ledger order', async () => {
+  for (const value of ['-1', '1.5', '101', 'bad', '']) assert.throws(() => setup([], { 'tasks-widget-count': value }), /integer 0–100/);
+  assert.throws(() => setup([], { 'tasks-menu-focus': 'anything' }), /progress or add/);
+  const s = setup([], { 'tasks-widget-count': '5' });
+  for (let i = 0; i < 6; i++) await add(s, `Item ${i}`);
+  assert.equal(s.widgets.at(-1).length, 6);
+  assert.deepEqual((await list(s)).tasks.map(task => task.id), [1, 2, 3, 4, 5, 6]);
+  const hidden = setup(s.branch, { 'tasks-widget-count': '0' }); assert.equal(hidden.widgets.at(-1), undefined);
+});
+
+test('single-line preview uses terminal-cell and ANSI-aware truncation without changing task data', async () => {
+  const { visibleWidth } = createJiti(__filename)(require.resolve('@earendil-works/pi-tui', { paths: [path.resolve(__dirname, '../extensions')] }));
+  const s = setup([], { 'tasks-widget-single-line': true });
+  s.ctx.ui.theme.fg = (_color, value) => `\x1b[34m${value}\x1b[0m`;
+  const summary = '漢字🙂'.repeat(50); await add(s, summary);
+  assert.equal(typeof s.widgets.at(-1), 'function');
+  const component = s.widgets.at(-1)();
+  for (const width of [1, 5, 20, 80]) {
+    const rows = component.render(width);
+    assert.equal(rows.length, 2); for (const row of rows) assert.ok(visibleWidth(row) <= width);
+  }
+  assert.equal((await list(s)).tasks[0].summary, summary);
+  const normal = setup(s.branch); assert.equal(Array.isArray(normal.widgets.at(-1)), true);
+});
+
+test('criteria editing keeps title/ID, preserves evidence, clears obsolete verdict and confirms reopening', async () => {
+  const s = setup(); await add(s, 'Write-once title', { acceptance: 'Old criterion' }); await complete(s);
+  const evidence = (await list(s)).tasks[0].evidence;
+  s.inputs('New clarified criterion'); s.confirms(false);
+  s.select(pickTask(1), 'Edit acceptance criteria'); await s.commands.tasks.handler('', s.ctx);
+  assert.equal((await list(s)).tasks[0].acceptance, 'Old criterion'); assert.equal((await list(s)).tasks[0].status, 'complete');
+  s.inputs('New clarified criterion'); s.confirms(true);
+  s.select(pickTask(1), 'Edit acceptance criteria'); await s.commands.tasks.handler('', s.ctx);
+  const task = (await list(s)).tasks[0];
+  assert.equal(task.id, 1); assert.equal(task.summary, 'Write-once title'); assert.equal(task.acceptance, 'New clarified criterion');
+  assert.equal(task.status, 'pending'); assert.equal(task.assessment, undefined); assert.equal(task.completedBy, undefined);
+  assert.equal(task.evidence, evidence); assert.equal(s.sent.length, 0);
+  const restored = setup(s.branch); assert.equal((await list(restored)).tasks[0].acceptance, 'New clarified criterion');
+});
+
+test('criteria editing rejects blank/oversized/cancelled/stale edits and aborts only accepted changes', async () => {
+  const s = setup(); await add(s);
+  const initial = (await list(s)).tasks[0];
+  for (const value of [' ', 'x'.repeat(1001), undefined]) {
+    s.inputs(value); s.select(pickTask(1), 'Edit acceptance criteria'); await s.commands.tasks.handler('', s.ctx);
+    assert.deepEqual((await list(s)).tasks[0], initial);
+  }
+  s.ctx.ui.editor = async () => { await call(s, 'tasks_block', { task_id: 1, reason: 'Changed while dialog open' }); return 'Stale edit'; };
+  s.select(pickTask(1), 'Edit acceptance criteria'); await s.commands.tasks.handler('', s.ctx);
+  assert.equal((await list(s)).tasks[0].acceptance, initial.acceptance); assert.match(s.notices.at(-1)[0], /Task changed/);
+  let resolve; s.judge(() => new Promise(done => { resolve = done; })); const assessment = complete(s);
+  s.ctx.ui.editor = async () => 'Updated criterion';
+  s.select(pickTask(1), 'Edit acceptance criteria'); await s.commands.tasks.handler('', s.ctx);
+  assert.equal(s.requests[0][2].signal.aborted, true);
+  resolve({ verdict: 'accepted', reason: 'Stale result.', missing: [] }); await assessment;
+  assert.equal((await list(s)).tasks[0].acceptance, 'Updated criterion'); assert.equal((await list(s)).tasks[0].status, 'blocked');
+});
+
+test('real menu component navigates with arrows, selects with Enter and scopes shortcuts to its popup', () => {
+  const { taskMenuComponent } = createJiti(__filename)(path.resolve(__dirname, '../extensions/tasks.ts'));
+  const choices = ['One', 'Two', 'Three'], results = []; let redraws = 0;
+  const component = taskMenuComponent('Tasks', choices, 1, { fg: (_color, value) => value }, value => results.push(value), () => redraws++);
+  assert.equal(component.list.getSelectedItem().value, 'Two');
+  component.handleInput('\x1b[B'); assert.equal(component.list.getSelectedItem().value, 'Three');
+  component.handleInput('\x1b[B'); assert.equal(component.list.getSelectedItem().value, 'One');
+  component.handleInput('\x1b[A'); assert.equal(component.list.getSelectedItem().value, 'Three');
+  component.handleInput('p'); assert.deepEqual(results.at(-1), { value: 'Three', key: 'p' });
+  component.handleInput('\r'); assert.deepEqual(results.at(-1), { value: 'Three' });
+  component.handleInput('\x1b'); assert.deepEqual(results.at(-1), {});
+  assert.ok(component.render(40).some(row => row.includes('n new'))); assert.ok(redraws >= 3);
+});
+
+test('new user controls cannot cross session changes or publish after failed persistence', async () => {
+  const s = setup(); await add(s, 'Old session');
+  s.select(choices => { s.handlers.session_start({}, { ...s.ctx, sessionManager: { getBranch: () => [] } }); return { task: 1, key: 'p' }; });
+  await s.commands.tasks.handler('', s.ctx);
+  assert.equal((await list(s)).tasks.length, 0); assert.equal(s.sent.length, 0);
+  await add(s, 'A'); await add(s, 'B');
+  const original = await list(s); const push = s.branch.push;
+  s.branch.push = () => { throw new Error('Persistence failed'); };
+  s.select({ task: 2, key: 'p' });
+  await assert.rejects(s.commands.tasks.handler('', s.ctx), /Persistence failed/);
+  s.branch.push = push;
+  assert.deepEqual(await list(s), original); assert.equal(s.sent.length, 0);
+});
+
+test('criteria reopening preserves the open-task cap and rejected reopen leaves completion intact', async () => {
+  const tasks = Array.from({ length: 20 }, (_, i) => ({ id: i + 1, summary: `Pending ${i}`, acceptance: 'Existing', status: 'pending' }));
+  tasks.push({ id: 21, summary: 'Done', acceptance: 'Existing', status: 'complete', completedBy: 'user' });
+  const s = setup([{ type: 'custom', customType: 'tasks-state-v1', data: { version: 1, nextId: 22, paused: false, tasks } }]);
+  s.inputs('Changed'); s.select(pickTask(21), 'Edit acceptance criteria');
+  await s.commands.tasks.handler('', s.ctx);
+  assert.equal((await list(s)).tasks.at(-1).status, 'complete'); assert.equal((await list(s)).tasks.at(-1).acceptance, 'Existing');
+  assert.match(s.notices.at(-1)[0], /At most 20 open tasks/); assert.equal(s.sent.length, 0);
+});
+
+test('task inspector also supports cancel and new-task shortcuts, with progress deletion absent', async () => {
+  const s = setup(); await add(s); await call(s, 'tasks_progress', { task_id: 1 });
+  s.select(pickTask(1), choices => { assert.equal(choices.includes('Remove task'), false); assert.ok(choices.includes('Cancel task')); return { key: 'c' }; });
+  await s.commands.tasks.handler('', s.ctx);
+  assert.equal((await list(s)).tasks[0].status, 'pending'); assert.equal(s.sent.length, 1);
+  s.inputs('From inspector', '', ''); s.select(pickTask(1), { key: 'n' }, { key: 'q' });
+  await s.commands.tasks.handler('', s.ctx);
+  assert.equal((await list(s)).tasks.at(-1).summary, 'From inspector');
+});
+
+test('compact blocked preview keeps its reason separate, wraps at most two lines and counts tasks not rows', async () => {
+  const { visibleWidth } = createJiti(__filename)(require.resolve('@earendil-works/pi-tui', { paths: [path.resolve(__dirname, '../extensions')] }));
+  const s = setup([], { 'tasks-widget-single-line': true, 'tasks-widget-count': '2' });
+  await add(s, 'Long title '.repeat(40)); await add(s, 'Second task'); await add(s, 'Excluded third');
+  const reason = 'Review approval needed before continuing; ' + '漢字🙂'.repeat(60);
+  await call(s, 'tasks_block', { task_id: 1, reason });
+  const render = width => s.widgets.at(-1)().render(width);
+  const rows = render(40);
+  assert.equal(rows.length, 5, 'header + blocked title + two reason lines + second task');
+  assert.match(rows[1], /^#1 \[blocked\]/); assert.doesNotMatch(rows[1], /Blocker:/);
+  assert.match(rows[2], /^ {4}Blocker: Review approval/);
+  assert.ok(rows[3].startsWith('    ')); assert.ok(rows[3].endsWith('…'));
+  assert.match(rows[4], /^#2 /); assert.equal(rows.some(row => row.startsWith('#3 ')), false);
+  for (const width of [1, 5, 20, 80]) for (const row of render(width)) assert.ok(visibleWidth(row) <= width);
+  assert.deepEqual(render(0), []);
+  assert.equal((await list(s)).tasks[0].blocker, reason, 'full reason is stored, not display-truncated');
+  const normal = setup(s.branch); assert.equal(Array.isArray(normal.widgets.at(-1)), true);
+  assert.equal(normal.widgets.at(-1).length, 4, 'ordinary wrapping path remains one source row per task');
+});
+
+test('short compact blockers need no ellipsis or spare reason row', async () => {
+  const s = setup([], { 'tasks-widget-single-line': true }); await add(s, 'Pending review');
+  await call(s, 'tasks_block', { task_id: 1, reason: 'Waiting for review' });
+  const rows = s.widgets.at(-1)().render(80);
+  assert.equal(rows.length, 3); assert.equal(rows[2], '    Blocker: Waiting for review');
 });
