@@ -194,18 +194,25 @@ test('a launch reaches the user manager when XDG_RUNTIME_DIR is unset', async t 
   assert.match(final.output, /runtime-fallback-ok/);
 });
 
-test('a launch refuses without creating artifacts when the user manager is unreachable', async t => {
-  const original = { XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS: process.env.DBUS_SESSION_BUS_ADDRESS };
-  process.env.XDG_RUNTIME_DIR = '/nonexistent-pi-runtime-dir';
+// Refusal must also execute in CI without a user manager, unlike live lifecycle tests.
+nodeTest('a launch refuses without creating artifacts when the user manager is unreachable', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-background-refusal-test-'));
+  const original = { XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR,
+    DBUS_SESSION_BUS_ADDRESS: process.env.DBUS_SESSION_BUS_ADDRESS, TMPDIR: process.env.TMPDIR };
+  process.env.XDG_RUNTIME_DIR = path.join(directory, 'missing-runtime');
   // An exported bus address is an independent connection route on desktops.
-  process.env.DBUS_SESSION_BUS_ADDRESS = 'unix:path=/nonexistent-pi-runtime-dir/bus';
-  t.after(() => { for (const [key, value] of Object.entries(original)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
+  process.env.DBUS_SESSION_BUS_ADDRESS = `unix:path=${directory}/missing-runtime/bus`;
+  process.env.TMPDIR = directory;
+  t.after(() => { for (const [key, value] of Object.entries(original)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+    fs.rmSync(directory, { recursive: true, force: true }); });
   const s = setup(t);
-  const count = () => fs.readdirSync(os.tmpdir()).filter(name => name.startsWith('pi-background-systemd-')).length;
-  const before = count();
+  await s.ready;
   await assert.rejects(s.start('echo must-not-run'), /No reachable systemd user manager/);
-  assert.equal(count(), before);
+  // Only this test owns the temporary root; unrelated jobs cannot change it.
+  assert.deepEqual(fs.readdirSync(directory), []);
   assert.equal((await s.call('background_list')).total, 0);
+  assert.deepEqual(s.branch, []);
+  assert.deepEqual(s.sent, []);
 });
 
 test('/jobs shows elapsed status and live output, and offers confirmed cancellation', async t => {

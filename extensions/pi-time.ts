@@ -1,4 +1,4 @@
-import { setTimeout as delay } from "node:timers/promises";
+import * as timers from "node:timers/promises";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -41,6 +41,13 @@ function humanInterval(milliseconds: number): string {
     milliseconds %= size;
   }
   return parts.join(", ") || "0 seconds";
+}
+
+function countdownInterval(remainingMs: number): number {
+  if (remainingMs >= 3_600_000) return 60_000;
+  if (remainingMs >= 300_000) return 15_000;
+  if (remainingMs > 60_000) return 5_000;
+  return 1_000;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -86,14 +93,32 @@ export default function (pi: ExtensionAPI) {
       const durationMs = Math.max(0, target - now);
       const interval = humanInterval(durationMs);
       const expected = new Date(target).toISOString();
-      const waiting = `Waiting ${interval}; expected wake: ${expected}.`;
-      if (ctx?.hasUI) ctx.ui.notify(waiting, "info");
-      onUpdate?.({ content: [{ type: "text", text: waiting }], details: { target: expected, durationMs } });
-      while (target > Date.now()) {
-        await delay(Math.min(target - Date.now(), MAX_TIMER_MS), undefined, { signal });
+      // One display channel: partial tool results replace one another. Clients
+      // without that callback get one per-call footer status, not notifications.
+      const statusKey = !onUpdate && ctx?.hasUI ? `sleep-until-${_id}` : undefined;
+      const publish = (remainingMs: number, initial = false) => {
+        const waiting = `Waiting ${humanInterval(remainingMs)}${initial ? "" : " remaining"}; expected wake: ${expected}.`;
+        if (onUpdate) onUpdate({ content: [{ type: "text", text: waiting }],
+          details: { target: expected, durationMs, remainingMs } });
+        else if (statusKey) ctx.ui.setStatus(statusKey, waiting);
+      };
+      try {
+        publish(durationMs, true);
+        while (target > Date.now()) {
+          const remainingMs = target - Date.now();
+          const cadence = onUpdate || statusKey ? countdownInterval(remainingMs) : MAX_TIMER_MS;
+          await timers.setTimeout(Math.min(remainingMs, cadence), undefined, { signal });
+          const remaining = Math.max(0, target - Date.now());
+          if (remaining > 0) publish(remaining);
+        }
+        const details = { target: expected, wokeAt: new Date().toISOString(), durationMs };
+        return { content: [{ type: "text", text: `Woke at ${details.wokeAt}; expected wake: ${expected}; interval: ${interval}.` }], details };
+      } finally {
+        if (statusKey) {
+          try { ctx.ui.setStatus(statusKey, undefined); }
+          catch { /* A disposed UI must not replace the result or abort reason. */ }
+        }
       }
-      const details = { target: expected, wokeAt: new Date().toISOString(), durationMs };
-      return { content: [{ type: "text", text: `Woke at ${details.wokeAt}; expected wake: ${expected}; interval: ${interval}.` }], details };
     },
   });
 }

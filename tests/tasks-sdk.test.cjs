@@ -83,7 +83,11 @@ test('Pi SDK: real settlement boundary continues early stops, injects task conte
     const latestState = manager.getBranch().filter(entry => entry.type === 'custom' && entry.customType === 'tasks-state-v1').at(-1).data;
     assert.equal(latestState.tasks[0].status, 'pending', 'advice never completes a task');
     nextTool = { type: 'toolCall', id: 'block-tool', name: 'tasks_block', arguments: { task_id: 1, reason: 'Waiting for prerequisite' } };
+    const beforeBlock = requests.length;
     await session.prompt('Block the task.');
+    assert.equal(requests.length, beforeBlock + 2, 'tool call and final answer only; blocked-only work never auto-continues');
+    assert.doesNotMatch(JSON.stringify(requests.at(-1)), /Task reminder|Task menu updated pending work|Work on pending/);
+    assert.match(JSON.stringify(requests.at(-1)), /No actionable tasks/);
     assert.equal(manager.getBranch().filter(entry => entry.type === 'custom' && entry.customType === 'tasks-state-v1').at(-1).data.tasks[0].status, 'blocked');
     nextTool = { type: 'toolCall', id: 'unblock-tool', name: 'tasks_unblock', arguments: { task_id: 1 } };
     await session.prompt('The prerequisite is resolved; unblock the task.');

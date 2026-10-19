@@ -2,7 +2,7 @@
 
 | Entrypoint | Behavior |
 | --- | --- |
-| `extensions/pi-time.ts` | Clock formats and abortable waits with an explicit expected wake time |
+| `extensions/pi-time.ts` | Clock formats and abortable waits with one adaptive countdown and an explicit expected wake time |
 | `extensions/tasks.ts` | Session task ledger, evidence judging, user menu, list sharing and advisory summary steering; see [tasks](tasks.md) |
 | `extensions/background-jobs.ts` | Stable, opt-in systemd jobs, status, cancellation and completion steering; see [runbook](background-jobs.md) |
 | `extensions/room-lease.ts` | Temporary interactive Matrix inbox, steering, edit coalescing, lease status and release |
@@ -36,7 +36,7 @@ Bridge RPC prompts provide scope-specific helper commands and capabilities. Hist
 
 The bridge supports an optional temporary image-description Pi session when `image_model` is configured. The selected image model uses the configured provider. Provider/RPC failures are recorded with bounded structured metadata in the same local observability outbox. Session archives, evidence files, credentials, and model configuration remain private runtime data.
 
-`pi-time` registers `clock` (`epoch_ms`, `iso_utc`, `human_utc`, `human_local`) and `sleep_until` (a positive duration or ISO timestamp with explicit timezone). Waits use Pi's abort signal and announce the expected wake time before waiting. They require no credentials.
+`pi-time` registers `clock` (`epoch_ms`, `iso_utc`, `human_utc`, `human_local`) and `sleep_until` (a positive duration or ISO timestamp with explicit timezone). Waits use Pi's abort signal and announce the expected wake time before waiting. The countdown refreshes more often near its deadline and uses Pi's update callback instead of duplicating the same display in status. They require no credentials.
 
 Bridge member discovery returns canonical mention targets and aliases through the existing history capability, including bounded pagination. Missing or incomplete membership is not proof of absence. Outgoing ambiguous or unknown mentions are refused with feedback; broadcast pings require an explicit enabled-room/channel allowlist.
 

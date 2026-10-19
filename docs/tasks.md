@@ -83,7 +83,7 @@ The judge is instructed to use only the recorded criteria, not invent optional p
 
 ## Awareness, continuation, and stop behavior
 
-The active branch's open ledger is injected on **each model request**, including after compaction. Existing messages are preserved, and the transient task-context snapshot is replaced rather than duplicated. Completed tasks are available through `tasks_list`, not repeatedly injected.
+The active branch's open ledger is injected on **each model request**, including after compaction. The transient task-context snapshot is replaced rather than duplicated. Historical extension-owned reminder messages stay in the transcript but are omitted from model context: their old pending-work snapshots must not re-prompt after tasks change. Real user messages and explicit list/summary posts are preserved. Completed-only ledgers inject no task prompt. Blocked-only ledgers are informational (“No actionable tasks”), and paused/suspended ledgers do not contain continuation instructions. Completed tasks remain available through `tasks_list`.
 
 At `agent_before_settle`, pending and progress tasks can add an attributed reminder and request continuation. The extension appends a custom message before requesting continuation: an initial boundary with `canContinue: false` after an assistant response is normal, not a reason to abandon the task list. The SDK recalculates the proposed context with that message.
 
@@ -91,9 +91,66 @@ The fallback waits three minutes after settlement, then sends an attributed foll
 
 Both paths share a budget of **two automatic reminders without verified completion**. An accepted task, genuine new user input, or explicit menu resume resets the budget; rejection, tool activity, and extension-generated input do not. Thus a list can progress through many verified tasks, but cannot generate an unbounded no-progress continuation loop. Exhaustion leaves tasks open; `/tasks` offers Resume reminders.
 
-Abort/error outcomes suspend automatic reminders until new user input or explicit menu resume. Common direct stop/pause phrases at the start of user input also suspend them; this is conservative phrase matching, not full natural-language intent recognition. **Escape cancellation and `/tasks` → Pause reminders are the reliable stop controls.** Menu pause persists across reloads; loading/resuming/navigating a session alone does not start inference. User or extension queued messages take priority over a task reminder. Blocking is explicit and is never inferred from arbitrary assistant prose.
+Abort/error outcomes suspend automatic reminders until new user input or explicit menu resume. Common direct stop/pause phrases at the start of user input also suspend them; this is conservative phrase matching, not full natural-language intent recognition. **Escape cancellation and `/tasks` → Pause reminders are the reliable stop controls.** Menu pause persists across reloads; loading/resuming/navigating a session alone does not start inference. User or extension queued messages take priority over a task reminder. Blocking is explicit and is never inferred from arbitrary assistant prose. When no actionable tasks remain, the idle timer is cleared and settlement, idle and menu-close paths do not enqueue a new turn. A turn already accepted by the host before the state changed cannot be retracted by this extension; the current-context filter prevents it from receiving the stale reminder snapshot.
 
 Snapshots are appended as versioned Pi custom entries. Restoration follows `getBranch()`, not all session entries, so forks/navigation use only their own history. Compaction does not erase the ledger. Invalid state disables mutations/reminders with a visible diagnostic rather than silently replacing tasks with an empty list. The extension does not write project files or a second database.
+
+## Task-menu keys and clarification
+
+The interactive `/tasks` popup keeps arrow/Enter navigation. Its shortcuts apply
+only while that popup has focus, not to typing in the main editor:
+
+| Key | Action |
+| --- | --- |
+| `p` | Move the selected incomplete task to the front of the ledger and post one visible steering request to work on it next at a safe boundary. Starts an idle agent; does not mark progress, unblock a task, expand authority or change a persistent reminder pause. |
+| `c` | For the in-progress task only: return its marker to pending, suspend automatic reminders, and steer a stop request. Does not wake an idle agent, claim completion, or terminate an already-running tool/external job. Escape remains the agent interruption control. |
+| `x` | Confirm deletion of a selected task that is **not** in progress. In-progress tasks cannot be deleted; cancel/return them to pending first. |
+| `n` | Open Add task directly. |
+| `q` / Escape | Close the menu without starting work. |
+
+The same task actions are available after selecting a task with Enter. Completed
+tasks cannot be prioritized as new work. Guards re-check the selected task after
+asynchronous dialogs; stale choices cannot overwrite a newer task/session.
+Prioritization changes authoritative ledger order explicitly; widget status
+priority still applies separately. Cancellation posts a request, not proof that
+execution has stopped. A failed steering post is reported rather than claimed
+as delivered.
+
+**Edit acceptance criteria** adds or clarifies task details while keeping title
+and ID unchanged. It is user-only, validates the existing 1–1000-character
+limit, and cancels obsolete in-flight assessments. Previous evidence remains
+available, but an old verdict cannot approve changed criteria. Changing criteria
+on a completed task requires confirmation to reopen it as pending, clears its
+old verdict/completion attribution, and respects the open-task cap. Browsing or
+editing does not itself wake the agent. No model-callable edit/delete tool is
+added.
+
+### Extension options
+
+Pass these Pi extension flags when launching Pi:
+
+- `--tasks-widget-count 3`: number of preview tasks, integer 0–100; `0` hides the widget.
+- `--tasks-menu-focus progress`: initially select the in-progress task, or Add
+  task when none is in progress. Use `--tasks-menu-focus add` to always select
+  Add task instead.
+- `--tasks-widget-single-line`: keep each task title to one terminal line
+  using ANSI- and Unicode-cell-aware truncation. Blocked tasks show their reason
+  separately underneath, indented and wrapped to at most two lines with an
+  ellipsis when needed. The count option counts tasks, not these display lines.
+  Full stored titles/reasons and the task inspector remain unchanged. Omit this
+  flag to retain the existing ordinary wrapping path.
+
+Defaults are three rows, progress-or-Add initial focus, and normal wrapping.
+Invalid count/focus values produce a clear extension-load error, not a silent
+fallback. Options affect presentation only, not continuation/spending budgets.
+
+## Widget display order
+
+The on-screen preview shows the configured number of tasks (three by default), ordered **progress, blocked,
+pending, complete**, preserving ledger order within each status. Completed
+entries fill remaining preview slots; a completed-only ledger can remain visible
+without starting reminders. This is presentation only: task IDs, authoritative
+ledger order, menu order and model context are unchanged.
 
 ## Verification
 
@@ -103,11 +160,25 @@ node --test tests/tasks.test.cjs
 
 The unit suite covers ordering, IDs, invalid inputs and limits; judge isolation/usage, acceptance, actionable rejection and assessment errors; branch restoration and compaction-style context refresh; bounded end/idle reminders; stops, blockers, busy/queued/menu guards; user-only mutations, confirmation cancellation, overrides; deadlines and stale/cancelled result races.
 
-Run the optional offline contract test against an explicitly selected installed Pi SDK:
+CI installs the locked `tests/pi-sdk` toolchain (Pi 0.99.1, TypeScript 5.9.3,
+Node types 24.0.0), strictly typechecks this extension, and explicitly selects
+that SDK for the offline contract test. Reproduce those checks from the repo root:
 
 ```sh
-PI_TASKS_SDK_MODULE=/absolute/path/to/pi-coding-agent/dist/index.js \
-  node --test tests/tasks-sdk.test.cjs
+npm ci --prefix extensions --ignore-scripts --no-audit
+npm ci --prefix tests/pi-sdk --ignore-scripts --no-audit
+npm run --prefix tests/pi-sdk typecheck
+PI_TASKS_SDK_MODULE="$PWD/tests/pi-sdk/node_modules/@earendil-works/pi-coding-agent/dist/index.js" \
+  node --test tests/tasks.test.cjs tests/tasks-sdk.test.cjs
 ```
 
-It loads only this extension with isolated configuration and an in-memory session, replaces the model stream with fake responses, and checks **actual Pi settlement continuation**, model-visible task context, tool registration, direct-stop behavior, and `/tasks` dispatch without provider inference. It also exercises real slash-command steering and a model-issued `tasks_summary` call: both post visible summaries, wake/deliver to the main agent, and leave completion state unchanged. Its ordinary CI invocation skips unless the SDK module is specified. Verified locally against Pi 0.99.1. Real-model judge quality and interactive visual rendering still need a separately authorized live trial; unit/SDK tests do not establish them.
+A separately installed SDK can still be selected with `PI_TASKS_SDK_MODULE`;
+ordinary local unit runs skip the contract only when that variable is absent.
+A configured but unavailable SDK fails rather than skipping.
+
+It loads only this extension with isolated configuration and an in-memory session, replaces the model stream with fake responses, and checks **actual Pi settlement continuation**, model-visible task context, tool registration, direct-stop behavior, and `/tasks` dispatch without provider inference. It also exercises real slash-command steering and a model-issued `tasks_summary` call: both post visible summaries, wake/deliver to the main agent, and leave completion state unchanged. The pinned CI invocation does not skip this test. Real-model judge quality and interactive visual rendering still need a separately authorized live trial; unit/SDK tests do not establish them.
+
+Issue #137 still tracks bounded persistence (mutations currently append full
+snapshots), a hard run-wide continuation budget independent of completion resets,
+and bounded injected text/menu detail rendering. The pinned SDK/typecheck slice
+does not claim those criteria are implemented or authorize unattended rollout.
