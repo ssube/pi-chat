@@ -2,6 +2,7 @@
 
 | Entrypoint | Behavior |
 | --- | --- |
+| `extensions/short-context-models.ts` | Opt-in half-context aliases for user-selected local models; see [setup and limits](short-context-models.md) |
 | `extensions/pi-time.ts` | Clock formats and abortable waits with one adaptive countdown and an explicit expected wake time |
 | `extensions/tasks.ts` | Session task ledger, evidence judging, user menu, list sharing and advisory summary steering; see [tasks](tasks.md) |
 | `extensions/background-jobs.ts` | Stable, opt-in systemd jobs, status, cancellation and completion steering; see [runbook](background-jobs.md) |
