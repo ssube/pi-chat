@@ -14,7 +14,7 @@ Read [attention, awareness, and continuity](docs/attention.md) for the mechanism
 | Directory | Purpose |
 | --- | --- |
 | `bridge/` | Matrix/Discord adapters, Pi RPC lifecycle, room leases, socket services, review queue |
-| `extensions/` | Interactive inbox, room labels, shell suggestions, questions, web tools, clock, stable systemd background jobs, capture, topic labels |
+| [`extensions/`](extensions/README.md) | Extension inventory and interactive/headless context guide: inbox, labels, shell suggestions, questions, web tools, clock, background jobs, capture and model aliases |
 | `tools/` | Canonical Matrix operations, messaging, history, reactions, activity/session clients, ledger and fix tooling |
 | `skills/` | Agent-facing guidance for messaging, reading, awareness, reviews, and ledger use |
 | `tests/` | Synthetic fixtures and offline behavior tests |
