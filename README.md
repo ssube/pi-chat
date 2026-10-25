@@ -24,6 +24,10 @@ The bridge runs on Linux with Python 3.11+ and a compatible Pi executable. Exten
 
 ## Latest features
 
+- Task file/URL evidence and opt-in recent-context judging, linked questions/reviews, optional subagent/job tracking, editing and confirmed pruning.
+- TUI attention bells with a [minimal tmux snippet](docs/attention-bells.md).
+- Counts-only bridge [task/subagent workload metrics](docs/workload-metrics.md), with explicit coverage and freshness.
+- Peer/native slash-text controls, safer mode recovery, quoted-reply context and room-bucketed indicators.
 - Reload supported profile settings without restarting the bridge.
 - Configurable conversation model modes, with explicit switching on Matrix and Discord.
 - Bounded Discord reconnect recovery with per-scope holds and retries.

@@ -59,6 +59,30 @@ class FailureContractTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(any("A tool may have run" in item["body"] for item in h.sent))
                 self.assertEqual(h.runtime.telemetry.counts[transport, "provider", "retry"], 0)
 
+    async def test_rejected_sign_in_names_the_credential_on_both_transports(self):
+        for transport in ("matrix", "discord"):
+            with self.subTest(transport=transport), tempfile.TemporaryDirectory() as directory:
+                h = Harness(Path(directory), transport)
+                self.addAsyncCleanup(h.close)
+                original = h.runtime.client_factory
+
+                def factory(key, path):
+                    client = original(key, path)
+                    client.prompt = AsyncMock(side_effect=PiProviderError(
+                        None, provider="openai", auth=True))
+                    return client
+
+                h.runtime.client_factory = factory
+                await h.deliver(h.event(1))
+                await h.idle()
+                # A dead credential cannot heal by itself: one attempt, no retry.
+                h.clients[0].prompt.assert_awaited_once()
+                self.assertEqual(h.runtime.telemetry.counts[transport, "provider", "retry"], 0)
+                body = next(item["body"] for item in h.sent if "sign-in" in item["body"])
+                self.assertIn("the sign-in for openai is no longer valid", body)
+                self.assertIn("Re-authorize that provider's credential in Pi", body)
+                self.assertNotIn("Please retry", body)
+
     async def test_checkpoint_write_failure_keeps_sound_summary_and_stops_client(self):
         for transport in ("matrix", "discord"):
             with self.subTest(transport=transport), tempfile.TemporaryDirectory() as directory:

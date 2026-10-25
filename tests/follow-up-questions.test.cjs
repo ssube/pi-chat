@@ -3,9 +3,18 @@ const assert = require('node:assert/strict');
 const path = require('node:path');
 const { createJiti } = require(require.resolve('jiti', { paths: [path.resolve(__dirname, '../extensions')] }));
 const extension = createJiti(__filename)(path.resolve(__dirname, '../extensions/follow-up-questions.ts')).default;
+const tasksExtension = createJiti(__filename)(path.resolve(__dirname, '../extensions/tasks.ts')).default;
 
-function setup(branch = []) {
-  const handlers = {}, tools = {}, commands = {}, sent = [], widgets = [], selectTitles = [];
+function createBus() {
+  const listeners = new Map();
+  return {
+    on: (channel, handler) => { const handlers = listeners.get(channel) ?? []; handlers.push(handler); listeners.set(channel, handlers); return () => {}; },
+    emit: (channel, data) => { for (const handler of listeners.get(channel) ?? []) handler(data); },
+  };
+}
+
+function setup(branch = [], events = createBus(), onSend) {
+  const handlers = {}, tools = {}, commands = {}, sent = [], widgets = [], selectTitles = [], notices = [];
   let selections = [], answer, confirmed = true;
   const ctx = {
     mode: 'tui', sessionManager: { getBranch: () => branch },
@@ -14,7 +23,7 @@ function setup(branch = []) {
       select: async (title) => { selectTitles.push(title); return selections.shift(); },
       editor: async () => answer,
       confirm: async () => confirmed,
-      notify() {},
+      notify: (...args) => notices.push(args),
     },
   };
   extension({
@@ -22,10 +31,10 @@ function setup(branch = []) {
     registerTool: (tool) => { tools[tool.name] = tool; },
     registerCommand: (name, cmd) => { commands[name] = cmd; },
     appendEntry: (customType, data) => branch.push({ type: 'custom', customType, data }),
-    sendUserMessage: async (...args) => sent.push(args),
+    sendUserMessage: (...args) => { onSend?.(...args); sent.push(args); }, events,
   });
   handlers.session_start({}, ctx);
-  return { ctx, handlers, tools, commands, branch, sent, widgets, selectTitles,
+  return { ctx, handlers, tools, commands, branch, sent, widgets, selectTitles, notices, events,
     choose: (...values) => { selections = values; },
     answer: (value) => { answer = value; },
     confirm: (value) => { confirmed = value; },
@@ -103,10 +112,160 @@ test('optional context is stored, validated, and shown when reviewing the questi
   assert.equal(s.selectTitles.at(-2), '#2 Why me?\n\nThe choice changes the design.');
 });
 
+test('task-linked questions validate the open task and carry the link into the answer', async () => {
+  const s = setup();
+  const unavailable = await call(s, { action: 'add', question: 'No ledger?', task_id: 7 });
+  assert.match(unavailable.content[0].text, /task #7 is not open/);
+  assert.equal(unavailable.details.nextId, 1);
+  s.events.on('tasks:lookup-v1', request => { request.available = request.task_id === 7; });
+  const rejected = await call(s, { action: 'add', question: 'Wrong task?', task_id: 8 });
+  assert.match(rejected.content[0].text, /task #8 is not open/);
+  assert.equal(rejected.details.questions.length, 0);
+  const linked = await call(s, { action: 'add', question: 'Which approach?', task_id: 7, context: 'The result changes task #7.' });
+  assert.match(linked.content[0].text, /Queued #1 for task #7/);
+  assert.equal(linked.details.questions[0].task_id, 7);
+  const restored = setup(s.branch);
+  assert.equal(restored.widgets.at(-1)[0], '? 1 question · /questions to answer or clear');
+  restored.choose('#1 [task #7] Which approach?', 'Answer'); restored.answer('Use the small patch.');
+  await restored.commands.questions.handler('', restored.ctx);
+  assert.deepEqual(restored.sent, [['Task #7 — queued question\n\n> Which approach?\n\nUse the small patch.', { deliverAs: 'steer' }]]);
+  assert.deepEqual(restored.branch.at(-1).data.questions, []);
+});
+
+test('answer clears a waiting question before steering and restores it after synchronous send refusal', async () => {
+  const events = createBus(); events.on('tasks:lookup-v1', query => { query.available = query.task_id === 1; });
+  let observed;
+  const s = setup([], events, () => {
+    const lookup = { task_id: 1 }; events.emit('questions:lookup-v1', lookup);
+    observed = { waiting_ids: lookup.waiting_ids, persisted: s.branch.at(-1).data.questions };
+  });
+  await call(s, { action: 'add', question: 'Ready?', task_id: 1, wait_for_answer: true });
+  s.choose('#1 [task #1] [waiting] Ready?', 'Answer'); s.answer('Yes.');
+  await s.commands.questions.handler('', s.ctx);
+  assert.deepEqual(observed, { waiting_ids: [], persisted: [] }, 'the answer turn sees the cleared queue');
+  assert.equal(s.sent.length, 1);
+
+  const refusedEvents = createBus(); refusedEvents.on('tasks:lookup-v1', query => { query.available = query.task_id === 1; });
+  const refused = setup([], refusedEvents, () => { throw new Error('synchronous refusal'); });
+  await call(refused, { action: 'add', question: 'Retry?', task_id: 1, wait_for_answer: true });
+  refused.choose('#1 [task #1] [waiting] Retry?', 'Answer'); refused.answer('Not yet.');
+  await refused.commands.questions.handler('', refused.ctx);
+  assert.equal(refused.sent.length, 0);
+  assert.equal(refused.branch.at(-1).data.questions[0].id, 1, 'refusal restores the durable question');
+  assert.match(refused.notices.at(-1)[0], /question restored/);
+});
+
+test('real shared bus derives question state, suppresses reminders, and preserves the progress slot', async () => {
+  const branch = [], events = createBus();
+  const s = setup(branch, events);
+  const handlers = {}, tools = {}, flags = {}, taskWidgets = [], taskSent = [];
+  const ctx = { mode: 'tui', sessionManager: { getBranch: () => branch },
+    hasPendingMessages: () => false, isIdle: () => true,
+    ui: { notify() {}, setWidget: (_key, value) => taskWidgets.push(value), theme: { fg: (_color, value) => value } } };
+  tasksExtension({
+    events, on: (name, handler) => { handlers[name] = handler; },
+    registerFlag: (name, options) => { flags[name] = options; },
+    getFlag: name => flags[name]?.default,
+    registerTool: tool => { tools[tool.name] = tool; }, registerCommand() {},
+    appendEntry: (customType, data) => branch.push({ type: 'custom', customType, data: structuredClone(data) }),
+    sendMessage: (...args) => taskSent.push(args),
+  });
+  handlers.session_start({}, ctx);
+  const taskCall = (name, args = {}) => tools[name].execute('tool', args, undefined, undefined, ctx);
+  const taskList = async () => (await taskCall('tasks_list')).details.tasks;
+  await taskCall('tasks_add', { summary: 'Review the result' });
+  const beforeQuestion = structuredClone(branch);
+  const linked = await call(s, { action: 'add', question: 'Which result?', task_id: 1, wait_for_answer: true });
+  const queuedBranch = structuredClone(branch);
+  assert.equal(linked.details.questions[0].task_id, 1);
+  assert.equal((await taskList())[0].status, 'pending', 'persisted task state is unchanged');
+  assert.equal((await taskList())[0].effective_status, 'question');
+  assert.equal((await taskList())[0].effective_waiting_on, 'user');
+  assert.deepEqual((await taskList())[0].question_ids, [1]);
+  assert.deepEqual((await taskList())[0].waiting_question_ids, [1]);
+  assert.match(taskWidgets.at(-1).join('\n'), /\[question\]/);
+  s.handlers.session_tree({}, { ...s.ctx, sessionManager: { getBranch: () => beforeQuestion } });
+  handlers.session_tree({}, { ...ctx, sessionManager: { getBranch: () => beforeQuestion } });
+  assert.equal((await taskList())[0].effective_status, 'pending', 'a branch without the question has no overlay');
+  s.handlers.session_tree({}, { ...s.ctx, sessionManager: { getBranch: () => queuedBranch } });
+  handlers.session_tree({}, { ...ctx, sessionManager: { getBranch: () => queuedBranch } });
+  assert.equal((await taskList())[0].effective_status, 'question', 'an unanswered link restores from its branch');
+  handlers.input({ source: 'interactive', text: 'Continue' }, ctx);
+  assert.equal(handlers.agent_before_settle({ outcome: 'completed', context: { canContinue: true } }, ctx), undefined);
+  assert.equal(taskSent.length, 0, 'the unanswered question causes no duplicate task reminder');
+  const missing = await call(s, { action: 'add', question: 'Unknown?', task_id: 2 });
+  assert.match(missing.content[0].text, /task #2 is not open/);
+
+  await taskCall('tasks_progress', { task_id: 1 });
+  await taskCall('tasks_add', { summary: 'Second task' });
+  await assert.rejects(taskCall('tasks_progress', { task_id: 2 }), /At most 1 task/,
+    'the question overlay does not silently free a progress slot');
+  await taskCall('tasks_progress', { task_id: 1, active: false });
+  await taskCall('tasks_progress', { task_id: 2 });
+  assert.equal((await taskList())[0].effective_status, 'question');
+  s.choose('#1 [task #1] [waiting] Which result?', 'Answer'); s.answer('Use the small patch.');
+  await s.commands.questions.handler('', s.ctx);
+  assert.match(s.sent.at(-1)[0], /^Task #1 — queued question/);
+  assert.equal((await taskList())[0].status, 'pending');
+  assert.equal((await taskList())[0].effective_status, 'pending');
+  assert.equal((await taskList())[0].effective_waiting_on, undefined);
+  assert.deepEqual((await taskList())[0].question_ids, []);
+
+  await call(s, { action: 'add', question: 'Another?', task_id: 1, wait_for_answer: true });
+  assert.equal((await taskList())[0].effective_status, 'question');
+  await call(s, { action: 'clear', id: 2 });
+  assert.equal((await taskList())[0].effective_status, 'pending');
+  await call(s, { action: 'add', question: 'Optional detail?', task_id: 1 });
+  assert.equal((await taskList())[0].effective_status, 'pending', 'an ordinary linked question is non-blocking');
+  assert.equal((await taskList())[0].effective_waiting_on, undefined);
+  assert.deepEqual((await taskList())[0].question_ids, [3]);
+  assert.deepEqual((await taskList())[0].waiting_question_ids, []);
+  await call(s, { action: 'clear', id: 3 });
+  await taskCall('tasks_review', { task_id: 1, reviewer: 'Reviewer', artifact: 'PR #43',
+    check_at: new Date(Date.now() + 86_400_000).toISOString() });
+  assert.equal((await taskList())[0].effective_status, 'blocked');
+  assert.equal((await taskList())[0].effective_waiting_on, 'Reviewer');
+  await call(s, { action: 'add', question: 'Reviewer detail?', task_id: 1, wait_for_answer: true });
+  assert.equal((await taskList())[0].status, 'blocked');
+  assert.equal((await taskList())[0].effective_status, 'question');
+  assert.equal((await taskList())[0].effective_waiting_on, 'user');
+  await call(s, { action: 'clear', id: 4 });
+  assert.equal((await taskList())[0].effective_status, 'blocked', 'clearing the question does not unblock review');
+  assert.equal((await taskList())[0].effective_waiting_on, 'Reviewer');
+
+  s.handlers.session_tree({}, { ...s.ctx, sessionManager: { getBranch: () => beforeQuestion } });
+  handlers.session_tree({}, { ...ctx, sessionManager: { getBranch: () => beforeQuestion } });
+  assert.equal((await taskList())[0].effective_status, 'pending', 'branch without question has no overlay');
+  s.handlers.session_tree({}, s.ctx); handlers.session_tree({}, ctx);
+  assert.equal((await taskList())[0].effective_status, 'blocked', 'answered/cleared questions stay absent after restore');
+});
+
 test('invalid and full queues do not add questions', async () => {
   const s = setup();
   assert.equal((await call(s, { action: 'add', question: '   ' })).details.questions.length, 0);
+  assert.match((await call(s, { action: 'add', question: 'Unlinked wait?', wait_for_answer: true })).content[0].text, /requires task_id/);
+  assert.match((await call(s, { action: 'add', question: 'Invalid wait?', wait_for_answer: 'yes' })).content[0].text, /must be boolean/);
+  assert.equal(s.branch.at(-1).message.details.nextId, 1, 'invalid waiting choices do not consume IDs');
   for (let i = 0; i < 20; i++) await call(s, { action: 'add', question: `Question ${i}?` });
   assert.match((await call(s, { action: 'add', question: 'Extra?' })).content[0].text, /full/);
   assert.equal(s.branch.at(-1).message.details.questions.length, 20);
+});
+
+test('only accepted new questions ring; rejection, clearing, restoration and headless modes stay silent', async () => {
+  await require('./bell-capture.cjs')(async count => {
+    const s = setup();
+    assert.equal(count(), 0);
+    await call(s, { action: 'add', question: 'New?' });
+    assert.equal(count(), 1);
+    s.handlers.session_tree({}, s.ctx);
+    await call(s, { action: 'add', question: ' ' });
+    await call(s, { action: 'add', question: 'Invalid link?', task_id: 999 });
+    await call(s, { action: 'clear' });
+    assert.equal(count(), 1);
+    for (const mode of ['rpc', 'json', 'print']) {
+      s.ctx.mode = mode;
+      await call(s, { action: 'add', question: mode });
+    }
+    assert.equal(count(), 1);
+  });
 });

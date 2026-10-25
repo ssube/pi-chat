@@ -1,0 +1,14 @@
+# HELP agent_bridge_presence Current lifecycle presence (1 when active).
+# TYPE agent_bridge_presence gauge
+agent_bridge_presence{agent="test",state="awake"} 1
+agent_bridge_presence{agent="test",state="connected"} 0
+agent_bridge_presence{agent="test",state="disconnected"} 0
+# HELP agent_bridge_scopes Loaded conversation scopes by lifecycle state.
+# TYPE agent_bridge_scopes gauge
+agent_bridge_scopes{agent="test",state="total"} 3
+agent_bridge_scopes{agent="test",state="active"} 1
+agent_bridge_scopes{agent="test",state="awake"} 2
+agent_bridge_scopes{agent="test",state="critical"} 1
+# HELP agent_bridge_last_push_timestamp_seconds Unix time of the last push.
+# TYPE agent_bridge_last_push_timestamp_seconds gauge
+agent_bridge_last_push_timestamp_seconds{agent="test"} 1000.0

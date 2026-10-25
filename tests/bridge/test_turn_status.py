@@ -14,7 +14,7 @@ from bridge.reaction_service import validate_request
 from bridge.runtime.pi_rpc import PiRunResult
 from bridge.runtime.session import BridgeRuntime, Incoming, ReplyRejected
 from bridge.runtime.state import SessionKey
-from bridge.turn_status import TURN_EMOJI, TurnIndicators
+from bridge.turn_status import Deferred, Indicator, MAX_TRANSPORT_RETRY_SECONDS, TURN_EMOJI, TurnIndicators
 from test_bridge_runtime import FakeRpc
 
 
@@ -406,6 +406,31 @@ class AdapterStatusTests(unittest.IsolatedAsyncioTestCase):
                                          adapter.turn_status, interval=0)
         return adapter, key, request
 
+    async def test_discord_public_rate_limit_defers_and_client_uses_supported_bound(self):
+        import discord
+        adapter, key, request = self.discord()
+        request.add_reaction.side_effect = discord.RateLimited(45.0)
+        record = Indicator(key, "20", 1)
+        self.assertEqual(await adapter.turn_status(record, "running"), Deferred("discord", 45.0))
+        request.add_reaction.assert_awaited_once_with("⏳")
+
+        options = {}
+
+        def refuse_network(**kwargs):
+            options.update(kwargs)
+            raise RuntimeError("client construction captured")
+
+        with patch("discord.Client", side_effect=refuse_network):
+            with self.assertRaisesRegex(RuntimeError, "client construction captured"):
+                await adapter.run()
+        self.assertEqual(options["max_ratelimit_timeout"], MAX_TRANSPORT_RETRY_SECONDS)
+        client = discord.Client(intents=discord.Intents.default(),
+                                max_ratelimit_timeout=MAX_TRANSPORT_RETRY_SECONDS)
+        self.assertGreaterEqual(client.http.max_ratelimit_timeout, MAX_TRANSPORT_RETRY_SECONDS)
+        await client.close()
+        from bridge.__main__ import ADAPTER_STOP_SECONDS, INDICATOR_DRAIN_SECONDS
+        self.assertLess(INDICATOR_DRAIN_SECONDS + ADAPTER_STOP_SECONDS, 20.0)
+
     async def test_discord_history_does_not_replace_lifecycle_reactions(self):
         adapter, key, request = self.discord()
         await adapter.output(key, "ack", "Working", "20")
@@ -462,3 +487,52 @@ class AdapterStatusTests(unittest.IsolatedAsyncioTestCase):
             request = {"transport": "matrix", "scope": "!room:test:main", "message_id": "$first",
                        "capability": "x" * 40, "emoji": emoji}
             self.assertEqual(validate_request(request)["emoji"], emoji)
+
+
+class IndicatorFailureTests(unittest.IsolatedAsyncioTestCase):
+    """A failed cosmetic emit releases its caller; the intent is replayed alone."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.key = SessionKey("agent_one", "matrix", "!room:test:main")
+        self.now = 1000.0
+        self.attempts = []
+
+    def indicators(self, *, fail_on):
+        async def emit(record, status):
+            self.attempts.append(status)
+            if len(self.attempts) == fail_on:
+                raise RuntimeError("transport unavailable")
+            return "receipt"
+        indicators = TurnIndicators(Path(self.temp.name) / "status.json", "agent_one", emit,
+                                    interval=0, now=lambda: self.now)
+        self.addCleanup(indicators.close)
+        return indicators
+
+    async def apply(self, indicators, status, epoch=1):
+        update = asyncio.create_task(indicators.update(self.key, "$first", status, epoch))
+        await asyncio.sleep(0)
+        await indicators.flush_once()
+        await asyncio.wait_for(update, 1)
+
+    async def test_failed_running_emit_releases_the_waiter_and_retries_alone(self):
+        indicators = self.indicators(fail_on=1)
+        await self.apply(indicators, "running")
+        record = indicators.records[(self.key, "$first", 1)]
+        self.assertEqual((record.desired, record.applied), ("running", None))
+        self.now += 3
+        await indicators.flush_once()
+        self.assertEqual(self.attempts, ["running", "running"])
+        self.assertEqual(record.applied, "running")
+
+    async def test_failed_terminal_emit_releases_the_waiter_and_retries_alone(self):
+        indicators = self.indicators(fail_on=2)
+        await self.apply(indicators, "running")
+        await self.apply(indicators, "done")
+        self.assertEqual(self.attempts, ["running", "done"])
+        self.assertEqual(indicators.records[(self.key, "$first", 1)].applied, "running")
+        self.now += 3
+        await indicators.flush_once()
+        self.assertEqual(self.attempts, ["running", "done", "done"])
+        self.assertNotIn((self.key, "$first", 1), indicators.records)

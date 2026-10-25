@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, Mock
 from urllib.parse import unquote
 
 from bridge.runtime.state import SessionKey
-from bridge.turn_status import TurnIndicators
+from bridge.turn_status import Deferred, Indicator, TurnIndicators
 from test_bridge_delivery import OPERATOR, discord_adapter, matrix_adapter, matrix_key, matrix_runtime
 
 
@@ -113,7 +113,7 @@ class FileMatrix:
         self.redacted = []
         self.count = len(self.transactions)
 
-    async def request(self, method, path, data=None):
+    async def request(self, method, path, data=None, *, defer_on_limit=False):
         if method == "GET":
             return {"event_id": unquote(path.split("/event/", 1)[1]),
                     "type": "m.room.message", "sender": OPERATOR,
@@ -313,6 +313,213 @@ class OutboxTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([call[2] for call in calls], ["running", "running", "done", "done"])
             self.assertTrue(all(b[0] - a[0] >= 2 for a, b in zip(calls, calls[1:])))
             self.assertFalse(store.records)
+
+    async def test_flush_pass_does_not_overlap_targets_in_one_bucket(self):
+        for key in (matrix_key(), SessionKey("agent_one", "discord", "2")):
+            with self.subTest(transport=key.transport), tempfile.TemporaryDirectory() as directory:
+                entered, release = asyncio.Event(), asyncio.Event()
+                calls = []
+
+                async def emit(record, phase):
+                    calls.append((record.request_id, phase))
+                    if record.request_id == "first":
+                        entered.set()
+                        await release.wait()
+                    return "$pending"
+
+                store = TurnIndicators(Path(directory) / "status.json", "agent_one", emit, interval=0)
+                first = await enqueue(store, key, "first", "running")
+                second = await enqueue(store, key, "second", "running")
+                flushing = asyncio.create_task(store.flush_once())
+                try:
+                    await asyncio.wait_for(entered.wait(), 1)
+                    await asyncio.sleep(0)
+                    self.assertEqual(calls, [("first", "running")])
+                finally:
+                    release.set()
+                await asyncio.wait_for(flushing, 1)
+                await asyncio.gather(first, second)
+                self.assertEqual(calls, [("first", "running"), ("second", "running")])
+
+    async def test_validated_transport_deferral_persists_without_spending_scope_cooldown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            clock = [100.0]
+            calls = []
+            matrix_first = matrix_key()
+            matrix_second = SessionKey("agent_one", "matrix", "!other:test:main")
+            discord = SessionKey("agent_one", "discord", "2")
+
+            async def emit(record, phase):
+                calls.append((record.key.transport, record.key.scope, phase))
+                if record.key == matrix_first and len(calls) == 1:
+                    return Deferred("matrix", 5.0)
+                return "$pending"
+
+            path = Path(directory) / "status.json"
+            store = TurnIndicators(path, "agent_one", emit, interval=2, now=lambda: clock[0])
+            first = await enqueue(store, matrix_first, "$first", "running")
+            second = await enqueue(store, matrix_second, "$second", "running")
+            third = await enqueue(store, discord, "20", "running")
+            await store.flush_once()
+            await third
+            self.assertEqual(calls, [("matrix", matrix_first.scope, "running"),
+                                     ("discord", discord.scope, "running")])
+            self.assertEqual(store.transport_not_before, {"matrix": 105.0})
+            self.assertNotIn(matrix_first, store.last_scope_attempt)
+            self.assertEqual(store.records[(matrix_first, "$first", 1)].last_attempt, 0)
+            self.assertFalse(store.records[(matrix_first, "$first", 1)].pending_attempted)
+            self.assertFalse(store.failures)
+            saved = json.loads(path.read_text())
+            self.assertEqual(saved["schema"], 2)
+            self.assertEqual(saved["transport_not_before"], [{"transport": "matrix", "at": 105.0}])
+            restored = TurnIndicators(path, "agent_one", emit, interval=2, now=lambda: clock[0])
+            self.assertEqual(restored.transport_not_before, {"matrix": 105.0})
+            done = await enqueue(store, matrix_first, "$first", "done")
+            clock[0] = 104.0
+            await store.flush_once()
+            self.assertEqual(len(calls), 2)
+            clock[0] = 106.0
+            await store.flush_once()
+            await asyncio.gather(first, second, done)
+            self.assertEqual(calls[2:], [("matrix", matrix_first.scope, "done"),
+                                         ("matrix", matrix_second.scope, "running")])
+            self.assertFalse(store.transport_not_before)
+
+    async def test_v1_indicator_state_loads_and_upgrades_on_next_save(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "status.json"
+            path.write_text(json.dumps({"records": [], "last_updates": []}))
+            store = TurnIndicators(path, "agent_one", AsyncMock(), now=lambda: 100.0)
+            self.assertFalse(store.load_error)
+            store.recover()
+            saved = json.loads(path.read_text())
+            self.assertEqual(saved["schema"], 2)
+            self.assertEqual(saved["transport_not_before"], [])
+            self.assertEqual(saved["records"], [])
+
+    async def test_future_transport_gate_is_bounded_on_load_without_rewriting_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "status.json"
+            raw = {"schema": 2, "records": [], "last_updates": [],
+                   "transport_not_before": [{"transport": "matrix", "at": 10000.0}]}
+            path.write_text(json.dumps(raw))
+            clock = [100.0]
+            store = TurnIndicators(path, "agent_one", AsyncMock(), now=lambda: clock[0])
+            self.assertFalse(store.load_error)
+            self.assertEqual(store.transport_not_before, {"matrix": 130.0})
+            self.assertEqual(json.loads(path.read_text()), raw)
+            store.recover()  # An unrelated state write must not shorten the raw deadline.
+            self.assertEqual(json.loads(path.read_text()), raw)
+            clock[0] = 131.0
+            store._save()
+            self.assertEqual(json.loads(path.read_text())["transport_not_before"], [])
+            for malformed in ({**raw, "unexpected": True}, {**raw, "schema": True},
+                              {**raw, "transport_not_before": [{"transport": "matrix", "at": True}]}):
+                with self.subTest(malformed=malformed):
+                    path.write_text(json.dumps(malformed))
+                    invalid = TurnIndicators(path, "agent_one", AsyncMock(), now=lambda: 100.0)
+                    self.assertTrue(invalid.load_error)
+                    self.assertEqual(json.loads(path.read_text()), malformed)
+
+    async def test_mid_pass_other_bucket_proceeds_and_repeated_ticks_do_not_duplicate(self):
+        for transport, first_scope, second_scope in (
+                ("matrix", "!first:test:main", "!second:test:main"),
+                ("discord", "1", "2")):
+            with self.subTest(transport=transport), tempfile.TemporaryDirectory() as directory:
+                first_key = SessionKey("agent_one", transport, first_scope)
+                second_key = SessionKey("agent_one", transport, second_scope)
+                entered, release = asyncio.Event(), asyncio.Event()
+                calls = []
+
+                async def emit(record, phase):
+                    calls.append((record.key.scope, phase))
+                    if record.key == first_key:
+                        entered.set()
+                        await release.wait()
+                    return "$pending"
+
+                store = TurnIndicators(Path(directory) / "status.json", "agent_one", emit, interval=0)
+                first = await enqueue(store, first_key, "first", "running")
+                store.schedule_once()
+                try:
+                    await asyncio.wait_for(entered.wait(), 1)
+                    second = await enqueue(store, second_key, "second", "running")
+                    for _ in range(4):
+                        store.schedule_once()
+                    await asyncio.wait_for(second, 1)
+                    self.assertEqual(calls.count((first_scope, "running")), 1)
+                    self.assertEqual(calls.count((second_scope, "running")), 1)
+                    self.assertFalse(first.done())
+                    path = Path(directory) / "status.json"
+                    saved = json.loads(path.read_text())
+                    self.assertEqual({row["request_id"] for row in saved["records"]},
+                                     {"first", "second"})
+                    restored = TurnIndicators(path, "agent_one", emit, interval=0)
+                    self.assertFalse(restored.load_error)
+                    self.assertEqual(set(restored.records),
+                                     {(first_key, "first", 1), (second_key, "second", 1)})
+                finally:
+                    release.set()
+                await asyncio.wait_for(first, 1)
+                store.close()
+
+    async def test_matrix_threads_share_one_bucket_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first_key = SessionKey("agent_one", "matrix", "!room:test:thread:$one")
+            second_key = SessionKey("agent_one", "matrix", "!room:test:thread:$two")
+            entered, release = asyncio.Event(), asyncio.Event()
+            calls = []
+
+            async def emit(record, phase):
+                calls.append(record.request_id)
+                if record.request_id == "first":
+                    entered.set()
+                    await release.wait()
+                return "$pending"
+
+            store = TurnIndicators(Path(directory) / "status.json", "agent_one", emit, interval=0)
+            first = await enqueue(store, first_key, "first", "running")
+            store.schedule_once()
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                second = await enqueue(store, second_key, "second", "running")
+                for _ in range(4):
+                    store.schedule_once()
+                await asyncio.sleep(0)
+                self.assertEqual(calls, ["first"])
+            finally:
+                release.set()
+            await asyncio.wait_for(first, 1)
+            store.schedule_once()
+            await asyncio.wait_for(second, 1)
+            self.assertEqual(calls, ["first", "second"])
+            store.close()
+
+    async def test_drain_cancels_stragglers_without_failure_or_orphan_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entered = asyncio.Event()
+
+            async def emit(record, phase):
+                entered.set()
+                await asyncio.Event().wait()
+
+            path = Path(directory) / "status.json"
+            store = TurnIndicators(path, "agent_one", emit, interval=0)
+            record = Indicator(SessionKey("agent_one", "discord", "2"), "20", 1)
+            store.records[record.target] = record
+            store._save()
+            store._save = Mock(wraps=store._save)
+            store.schedule_once()
+            await asyncio.wait_for(entered.wait(), 1)
+            await store.drain(timeout=0.01)
+            calls_after_drain = store._save.call_count
+            self.assertFalse(store.failures)
+            self.assertEqual(json.loads(path.read_text())["records"][0]["desired"], "running")
+            store.close()
+            store.close()
+            await asyncio.sleep(0)
+            self.assertEqual(store._save.call_count, calls_after_drain)
+            self.assertEqual(asyncio.all_tasks(), {asyncio.current_task()})
 
     async def test_coalesces_before_tick_and_discards_stale_epoch_terminal(self):
         with tempfile.TemporaryDirectory() as directory:

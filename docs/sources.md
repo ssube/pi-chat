@@ -1,5 +1,33 @@
 # Source provenance
 
+## Tagged refresh — 2026-10-25
+
+| Component source | Verified tag | Peeled commit |
+| --- | --- | --- |
+| Shared skills and extensions | `v0.15.0` | `d210d210cd9514074bbd86cc0a09159f9f2ea809` |
+| Shared bridge | `v0.9.0` | `aef51fd31f04deb3490cb34e9ea3e192252a7edb` |
+
+Release signatures were checked against the pinned release certificate. This is
+a selective public port, not an exact tag mirror or an installed-runtime claim.
+The approved additions are task upgrades, attention bells (including a minimal
+tmux example), workload metrics and chat-control/indicator improvements, with
+their existing-component fixes, regression tests and documentation.
+
+**Announcement-feed policy and the environment-doctor skill are excluded.** The
+bridge code delta ends at signed `v0.8.5`
+(`37e37e9073895ac62a19f80cea4bf66b101cfdd0`); all subsequent changes through
+`v0.9.0` concern the excluded feed feature. Existing exported Matrix skills have
+no applicable non-feed changes in the selected skills delta, so their public
+adaptations are retained. No unrelated skill is added.
+
+Private routing, deployment/council/owner-review orchestration and identities
+remain excluded. Profiles keep configurable providers; fixtures use synthetic
+names. No live settings, transcripts, logs, credentials or generated exports are
+included. Public ledger SQL migrations and checksums are unchanged. Components
+remain opt-in; this refresh does not install or restart services.
+
+## Previous source baseline
+
 This refresh was prepared from the following upstream `main` refs, fetched and checked on 2026-10-18. These are exact source snapshots, not automatic synchronization with later changes.
 
 | Component source | Commit | Snapshot date |

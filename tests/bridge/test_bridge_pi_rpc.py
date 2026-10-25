@@ -7,8 +7,8 @@ from unittest.mock import patch
 
 from bridge.runtime.pi_rpc import (CONTROL_COMMAND_TIMEOUT_SECONDS, STDERR_TAIL_CHARS,
                                    STEER_RECEIPT_GRACE_SECONDS, PiProviderError, PiRpcClient,
-                                   PiRpcError, PiRpcProtocolError, PiRpcTimeout, stderr_digest,
-                                   stderr_fingerprint)
+                                   PiRpcError, PiRpcProtocolError, PiRpcTimeout, is_auth_failure,
+                                   stderr_digest, stderr_fingerprint)
 
 
 FAKE_PI_HELD_STEER = r'''
@@ -97,6 +97,20 @@ for line in sys.stdin:
     print(json.dumps({"type": "message_end", "message": {
         "role": "assistant", "stopReason": "error", "content": [],
         "errorMessage": "500: private upstream diagnostic must stay private"}}), flush=True)
+    print(json.dumps({"type": "agent_end"}), flush=True)
+'''
+
+FAKE_PI_AUTH_ERROR = r'''
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({"type": "response", "id": request["id"],
+                      "success": True}), flush=True)
+    print(json.dumps({"type": "message_end", "message": {
+        "role": "assistant", "stopReason": "error", "content": [],
+        "provider": "openai", "model": "gpt-test",
+        "errorMessage": "OAuth refresh failed for openai: OpenAI OAuth token request "
+                        "failed (400): {\"error\": \"invalid_grant\"}"}}), flush=True)
     print(json.dumps({"type": "agent_end"}), flush=True)
 '''
 
@@ -324,6 +338,36 @@ for line in sys.stdin:
             self.assertEqual(caught.exception.status, 500)
             self.assertNotIn("private upstream diagnostic", str(caught.exception))
             self.assertFalse(client.running)
+
+    async def test_rejected_sign_in_is_reported_as_auth_without_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "fake_pi_auth_error.py"
+            script.write_text(FAKE_PI_AUTH_ERROR)
+            client = PiRpcClient([sys.executable, str(script)], Path(directory),
+                                 {"PATH": "/usr/bin:/bin"}, timeout_seconds=5,
+                                 settle_on_agent_end=True)
+
+            async def on_event(event):
+                pass
+
+            with self.assertRaises(PiProviderError) as caught:
+                await client.prompt("hello", on_event)
+            self.assertIsNone(caught.exception.status)
+            self.assertTrue(caught.exception.auth)
+            self.assertEqual(caught.exception.provider, "openai")
+            # Neither attribute nor message may carry the provider's text.
+            self.assertNotIn("invalid_grant", str(caught.exception))
+            self.assertNotIn("OAuth", str(caught.exception))
+            self.assertFalse(client.running)
+
+    def test_auth_markers_are_narrow_and_values_are_not_kept(self):
+        self.assertTrue(is_auth_failure("OAuth refresh failed for openai: bad"))
+        self.assertTrue(is_auth_failure("request failed (400): {\"error\":\"invalid_grant\"}"))
+        self.assertTrue(is_auth_failure("Credential missing; reconnect ChatGPT"))
+        self.assertFalse(is_auth_failure("500: upstream timeout"))
+        self.assertFalse(is_auth_failure(None))
+        # A provider value that is not a plain identifier is dropped entirely.
+        self.assertEqual(PiProviderError(500, provider="openai/token?x=1").provider, "")
 
     async def test_short_session_compaction_skips_without_extra_prompt(self):
         with tempfile.TemporaryDirectory() as directory:

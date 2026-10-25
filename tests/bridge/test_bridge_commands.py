@@ -8,6 +8,7 @@ slash commands. Both adapters must scope every command to its conversation key
 and to the human who owns the active request.
 """
 
+import json
 import os
 import tempfile
 import unittest
@@ -278,13 +279,14 @@ class DiscordTextCommandTests(unittest.IsolatedAsyncioTestCase):
         runtime.cancel.assert_not_awaited()
         message.reply.assert_not_awaited()
 
-    async def test_bot_mention_is_not_a_command(self):
+    async def test_bot_mention_can_cancel_its_own_request(self):
         runtime = discord_runtime()
         adapter = discord_adapter(runtime)
         message = discord_message("<@9> cancel", bot=True)
         await adapter._on_message(message)
-        runtime.cancel.assert_not_awaited()
-        runtime.submit.assert_awaited_once()
+        runtime.cancel.assert_awaited_once()
+        self.assertEqual(runtime.cancel.await_args.args[1], "3")
+        runtime.submit.assert_not_awaited()
 
     async def test_command_outside_an_enabled_channel_is_ignored(self):
         runtime = discord_runtime()
@@ -399,6 +401,111 @@ class DiscordSlashCommandTests(unittest.IsolatedAsyncioTestCase):
         await adapter.bridge_recover_command(interaction)
         interaction.response.send_message.assert_awaited_once_with(
             "No failed checkpoint belonging to you in this channel.", ephemeral=True)
+
+
+class PeerCommandParityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_matrix_peer_all_bang_and_slash_session_commands(self):
+        for command, method in (("debug", None), ("stop", "stop_session"),
+                                ("cancel", "cancel"), ("recover", "recover")):
+            for prefix in ("!", "/", "/bridge_"):
+                with self.subTest(command=command, prefix=prefix), tempfile.TemporaryDirectory() as directory:
+                    runtime = matrix_runtime()
+                    adapter = matrix_adapter(directory, runtime)
+                    event = matrix_event(prefix + command, mentions=[AGENT_ID])
+                    event["sender"] = "@peer-agent:example.test"
+                    event["content"]["org.example.pi_bridge"] = {
+                        "kind":"final", "hop":1, "invitations":[AGENT_ID]}
+                    await adapter._handle_event(ROOM, event)
+                    if method:
+                        call = getattr(runtime, method)
+                        call.assert_awaited_once()
+                        self.assertEqual(call.await_args.args[1], event["sender"])
+                    else:
+                        self.assertIn("Bridge debug", adapter.output.await_args.args[2])
+                    runtime.submit.assert_not_awaited()
+
+    async def test_discord_bot_all_bang_and_slash_session_commands(self):
+        for command, method in (("debug", None), ("stop", "stop_session"),
+                                ("cancel", "cancel"), ("recover", "recover")):
+            for prefix in ("!", "/", "/bridge_"):
+                with self.subTest(command=command, prefix=prefix):
+                    runtime = discord_runtime()
+                    adapter = discord_adapter(runtime)
+                    message = discord_message("<@9> " + prefix + command, bot=True)
+                    await adapter._on_message(message)
+                    if method:
+                        call = getattr(runtime, method)
+                        call.assert_awaited_once()
+                        self.assertEqual(call.await_args.args[1], "3")
+                    else:
+                        self.assertIn("Bridge debug", message.reply.await_args.args[0])
+                    runtime.submit.assert_not_awaited()
+
+    async def test_invitation_only_peers_dispatch_every_native_control(self):
+        for command, method in (("debug", None), ("stop", "stop_session"),
+                                ("cancel", "cancel"), ("recover", "recover")):
+            for prefix in ("!", "/", "/bridge_"):
+                with self.subTest(command=command, prefix=prefix), tempfile.TemporaryDirectory() as directory:
+                    runtime = matrix_runtime()
+                    adapter = matrix_adapter(directory, runtime)
+                    event = matrix_event(prefix + command)
+                    event["sender"] = "@peer-agent:example.test"
+                    event["content"]["org.example.pi_bridge"] = {
+                        "kind": "final", "hop": 1, "invitations": [AGENT_ID]}
+                    await adapter._handle_event(ROOM, event)
+                    runtime.submit.assert_not_awaited()
+                    if method:
+                        getattr(runtime, method).assert_awaited_once()
+                    else:
+                        self.assertIn("Bridge debug", adapter.output.await_args.args[2])
+                    runtime = discord_runtime()
+                    adapter = discord_adapter(runtime)
+                    message = discord_message(prefix + command, mentioned=False, bot=True)
+                    message.embeds = [SimpleNamespace(footer=SimpleNamespace(text=
+                        "agent-bridge:v1:" + json.dumps({"kind": "final", "hop": 1,
+                                                       "invitations": ["9"]})))]
+                    await adapter._on_message(message)
+                    runtime.submit.assert_not_awaited()
+                    if method:
+                        getattr(runtime, method).assert_awaited_once()
+                    else:
+                        self.assertIn("Bridge debug", message.reply.await_args.args[0])
+
+    async def test_blocked_history_bare_debug_stop_never_become_prompts(self):
+        for token in ("!debug", "/debug", "/bridge_debug", "!stop", "/stop", "/bridge_stop"):
+            with self.subTest(token=token):
+                runtime = discord_runtime()
+                adapter = discord_adapter(runtime)
+                adapter._blocked_channels.add(2)
+                await adapter._on_message(discord_message(token, mentioned=False))
+                runtime.submit.assert_not_awaited()
+                runtime.stop_session.assert_not_awaited()
+
+    async def test_discord_slash_callbacks_accept_peer_identity(self):
+        for command in ("debug", "stop", "cancel", "recover"):
+            runtime = discord_runtime()
+            adapter = discord_adapter(runtime)
+            interaction = slash_interaction()
+            interaction.user.bot = True
+            await getattr(adapter, "bridge_" + command + "_command")(interaction)
+            interaction.response.send_message.assert_awaited_once()
+            if command == "debug":
+                self.assertIn("Bridge debug", interaction.response.send_message.await_args.args[0])
+            else:
+                method = "stop_session" if command == "stop" else command
+                call = getattr(runtime, method)
+                call.assert_awaited_once()
+                self.assertEqual(call.await_args.args[1], "3")
+
+    async def test_peer_cancel_remains_available_during_history_recovery(self):
+        for prefix in ("", "!", "/"):
+            with self.subTest(prefix=prefix):
+                runtime = discord_runtime()
+                adapter = discord_adapter(runtime)
+                adapter._blocked_channels.add(2)
+                await adapter._on_message(discord_message("<@9> " + prefix + "cancel", bot=True))
+                runtime.cancel.assert_awaited_once()
+                self.assertEqual(runtime.cancel.await_args.args[1], "3")
 
 
 if __name__ == "__main__":

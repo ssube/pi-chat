@@ -43,3 +43,10 @@ Load other extensions explicitly as needed; do not indiscriminately load the who
 Review automation and PostgreSQL ingestion are optional. Configure them using [reviews](reviews.md) and [ledger](ledger.md). No service installation, live-account operation, or paid model smoke test is performed by the test suite.
 
 Use the [canonical Matrix tool](matrix.md) for bounded reads, media and reactions. The [stable background-jobs backend](background-jobs.md) requires a working Linux systemd user manager and must be loaded explicitly. Web HTML conversion requires `uv` with a resolvable/cached converter dependency, or an explicit `PI_WEB_READ_PYTHON` command.
+
+For optional terminal alerts, load `extensions/attention-bell.ts` and use the
+[minimal tmux configuration](attention-bells.md#minimal-tmux-configuration).
+For counts-only bridge observability, explicitly load
+`extensions/bridge-workload-metrics.ts` in bridge/RPC Pi's private extension
+configuration; see [source coverage and Prometheus setup](workload-metrics.md).
+Neither component is installed or enabled by merging this repository.

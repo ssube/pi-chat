@@ -8,11 +8,11 @@ const path = require('node:path');
 const os = require('node:os');
 const { setTimeout: delay } = require('node:timers/promises');
 const { createJiti } = require(require.resolve('jiti', { paths: [path.resolve(__dirname, '../extensions')] }));
-const { default: extension, retentionConfig, expiredJobs } = createJiti(__filename)(path.resolve(__dirname, '../extensions/background-jobs.ts'));
+const { default: extension, retentionConfig, expiredJobs, exactUnitMatches } = createJiti(__filename)(path.resolve(__dirname, '../extensions/background-jobs.ts'));
 
 nodeTest('stable backend registers its tools without a draft label', () => {
   const tools = {};
-  extension({ on() {}, registerTool: tool => tools[tool.name] = tool, registerCommand() {} });
+  extension({ events: { on() {}, emit() {} }, on() {}, registerTool: tool => tools[tool.name] = tool, registerCommand() {} });
   assert.deepEqual(Object.keys(tools).sort(), [
     'background_cancel', 'background_list', 'background_start', 'background_status',
   ]);
@@ -26,9 +26,14 @@ function setup(t, mode = 'tui', env = {}) {
   const ctx = { mode, cwd: process.cwd(), sessionManager: { getSessionId: () => 'test-session', getBranch: () => branch },
     ui: { setStatus: (...args) => statuses.push(args), setWidget() {}, notify() {}, confirm: async () => confirmed,
       select: async (title, choices) => { titles.push(title); choicesShown.push(choices); const choice = selections.shift(); return typeof choice === 'number' ? choices[choice] : choice; } } };
+  const listeners = new Map();
+  const events = {
+    on: (name, fn) => { const list = listeners.get(name) ?? []; list.push(fn); listeners.set(name, list); },
+    emit: (name, payload) => { for (const fn of listeners.get(name) ?? []) fn(payload); },
+  };
   const original = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
   Object.assign(process.env, env);
-  try { extension({ on: (name, fn) => handlers[name] = fn, registerTool: tool => tools[tool.name] = tool,
+  try { extension({ events, on: (name, fn) => handlers[name] = fn, registerTool: tool => tools[tool.name] = tool,
     registerCommand: (name, cmd) => commands[name] = cmd, sendMessage: (...args) => sent.push(args),
     appendEntry: (customType, data) => branch.push({ type: 'custom', customType, data }) });
   } finally { for (const [key, value] of Object.entries(original)) {
@@ -38,7 +43,7 @@ function setup(t, mode = 'tui', env = {}) {
   t.after(() => handlers.session_shutdown({ reason: 'quit' }, ctx));
   const call = async (name, args = {}, signal, context = ctx) => (await tools[name].execute('call', args, signal, undefined, context)).structuredContent;
   const start = (command, options = {}) => call('background_start', { command, timeout_seconds: 5, ...options });
-  return { ready, branch, ctx, handlers, tools, commands, sent, statuses, selections, titles, choicesShown, call, start,
+  return { events, ready, branch, ctx, handlers, tools, commands, sent, statuses, selections, titles, choicesShown, call, start,
     confirm: value => { confirmed = value; } };
 }
 async function until(fn, timeout = 6000) {
@@ -215,6 +220,233 @@ nodeTest('a launch refuses without creating artifacts when the user manager is u
   assert.deepEqual(s.sent, []);
 });
 
+nodeTest('exact unit identity requires the recorded description, slice and accepted submission', () => {
+  const job = { id: 'job-1', label: 'Background job', slice: 'pi-jobs-session.slice', submission_state: 'confirmed',
+    systemd: { LoadState: 'loaded', Slice: 'pi-jobs-session.slice', Description: 'Pi job-1: Background job' } };
+  assert.equal(exactUnitMatches(job), true);
+  assert.equal(exactUnitMatches({ ...job, systemd: { ...job.systemd, Description: 'Other job' } }), false);
+  assert.equal(exactUnitMatches({ ...job, systemd: { ...job.systemd, Slice: 'another-session.slice' } }), false);
+  assert.equal(exactUnitMatches({ ...job, systemd: { ...job.systemd, LoadState: 'not-found' } }), false);
+  assert.equal(exactUnitMatches({ ...job, submission_state: 'rejected' }), false);
+});
+
+nodeTest('uncertain submission retains exact identity and private environment without resubmission', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-background-uncertain-test-'));
+  const bin = path.join(root, 'bin'); fs.mkdirSync(bin, { mode: 0o700 });
+  const marker = path.join(root, 'attempts');
+  fs.writeFileSync(path.join(bin, 'systemctl'), String.raw`#!/bin/sh
+if [ "$3" = "--property=Version" ]; then printf 'Version=256\n'; exit 0; fi
+if [ "$FAKE_UNIT_STATE" = "loaded" ]; then
+  printf 'LoadState=loaded\nActiveState=activating\nSubState=start\nSlice=%s\nDescription=Pi job-1: Background job\n' "$FAKE_SLICE"
+elif [ "$FAKE_UNIT_STATE" = "loaded-wrong-description" ]; then
+  printf 'LoadState=loaded\nActiveState=activating\nSubState=start\nSlice=%s\nDescription=Another job\n' "$FAKE_SLICE"
+elif [ "$FAKE_UNIT_STATE" = "loaded-inactive" ]; then
+  printf 'LoadState=loaded\nActiveState=failed\nSubState=failed\nSlice=%s\nDescription=Pi job-1: Background job\n' "$FAKE_SLICE"
+else
+  printf 'LoadState=not-found\nActiveState=inactive\nSubState=dead\n'
+fi
+`, { mode: 0o700 });
+  fs.writeFileSync(path.join(bin, 'systemd-run'), String.raw`#!/bin/sh
+printf 'attempt\n' >> "$FAKE_SUBMISSION_MARKER"
+printf 'simulated manager loss\n' >&2
+exit 1
+`, { mode: 0o700 });
+  const original = { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR,
+    FAKE_SUBMISSION_MARKER: process.env.FAKE_SUBMISSION_MARKER,
+    FAKE_UNIT_STATE: process.env.FAKE_UNIT_STATE, FAKE_SLICE: process.env.FAKE_SLICE };
+  const s = setup(t);
+  try {
+    process.env.PATH = `${bin}:${original.PATH}`;
+    process.env.TMPDIR = root;
+    process.env.FAKE_SUBMISSION_MARKER = marker;
+    assert.equal(os.tmpdir(), root);
+    await s.ready;
+    const job = await s.start('echo must-not-run', { unsafe_to_terminate: true });
+    assert.equal(job.status, 'unknown');
+    assert.equal(job.submission_state, 'uncertain');
+    assert.match(job.error, /Submission not confirmed/);
+    assert.ok(job.directory.startsWith(root + path.sep));
+    assert.match(job.unit, /^pi-bg-[0-9a-f-]+[.]service$/);
+    assert.equal(fs.readFileSync(marker, 'utf8'), 'attempt\n');
+    assert.equal(fs.existsSync(job.completion_path), false);
+    assert.equal(fs.statSync(job.directory).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(path.join(job.directory, 'environment')).mode & 0o777, 0o600);
+    const request = JSON.parse(fs.readFileSync(path.join(job.directory, 'request.json'), 'utf8'));
+    assert.equal(request.unit, job.unit);
+    const status = await s.call('background_status', { id: job.id });
+    assert.equal(status.status, 'unknown');
+    assert.equal(status.submission_state, 'uncertain', 'unit absence is not proof of rejection or non-execution');
+    process.env.FAKE_UNIT_STATE = 'loaded'; process.env.FAKE_SLICE = job.slice;
+    const matched = await s.call('background_status', { id: job.id });
+    assert.equal(matched.submission_state, 'confirmed');
+    assert.equal(matched.status, 'running', 'a live exact-identity unit can be reattached');
+    process.env.FAKE_UNIT_STATE = 'loaded-wrong-description';
+    const wrongDescription = await s.call('background_status', { id: job.id });
+    assert.equal(wrongDescription.status, 'unknown');
+    assert.match(wrongDescription.error, /identity could not be confirmed/);
+    process.env.FAKE_UNIT_STATE = 'loaded-inactive';
+    const inactive = await s.call('background_status', { id: job.id });
+    assert.equal(inactive.status, 'unknown', 'a non-live unit without hook data has no known outcome');
+    assert.match(inactive.error, /outcome unknown/);
+    process.env.FAKE_UNIT_STATE = 'loaded'; process.env.FAKE_SLICE = 'another-session.slice';
+    const mismatch = await s.call('background_status', { id: job.id });
+    assert.equal(mismatch.status, 'unknown');
+    assert.match(mismatch.error, /identity could not be confirmed/);
+    process.env.FAKE_UNIT_STATE = 'not-found';
+    const absent = await s.call('background_status', { id: job.id });
+    assert.equal(absent.status, 'unknown');
+    assert.match(absent.error, /outcome unknown/);
+    await s.call('background_list');
+    assert.equal(fs.readFileSync(marker, 'utf8'), 'attempt\n', 'observation must not resubmit');
+    assert.equal(fs.existsSync(path.join(job.directory, 'environment')), true);
+    assert.equal(s.sent.length, 0);
+  } finally {
+    try { await s.handlers.session_shutdown({ reason: 'test' }, s.ctx); }
+    finally {
+      for (const [key, value] of Object.entries(original)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+      // The fake runner cannot create a live unit; remove only this test-owned root.
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+nodeTest('local spawn rejection is distinct from uncertain creation and retains the private snapshot', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-background-spawn-rejection-test-'));
+  const bin = path.join(root, 'bin'); fs.mkdirSync(bin, { mode: 0o700 });
+  fs.writeFileSync(path.join(bin, 'systemctl'), String.raw`#!/bin/sh
+if [ "$3" = "--property=Version" ]; then printf 'Version=256\n'; exit 0; fi
+printf 'LoadState=not-found\nActiveState=inactive\nSubState=dead\n'
+`, { mode: 0o700 });
+  const original = { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR };
+  const s = setup(t);
+  try {
+    process.env.PATH = bin; process.env.TMPDIR = root;
+    await s.ready;
+    const job = await s.start('echo must-not-run', { unsafe_to_terminate: true });
+    assert.equal(job.status, 'unknown');
+    assert.equal(job.submission_state, 'rejected');
+    assert.match(job.error, /rejected before systemd-run started/);
+    assert.equal(fs.existsSync(job.completion_path), false);
+    assert.equal(fs.statSync(path.join(job.directory, 'environment')).mode & 0o777, 0o600);
+    const observed = await s.call('background_status', { id: job.id });
+    assert.equal(observed.submission_state, 'rejected');
+    assert.equal(observed.status, 'unknown');
+    assert.equal((await s.call('background_list')).total, 1);
+    assert.equal(s.sent.length, 0);
+    assert.equal(fs.existsSync(path.join(job.directory, 'environment')), true);
+  } finally {
+    try { await s.handlers.session_shutdown({ reason: 'test' }, s.ctx); }
+    finally {
+      for (const [key, value] of Object.entries(original)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+nodeTest('prepared submission after a manager-loss gap reattaches only a matching live unit', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-background-prepared-recovery-test-'));
+  const bin = path.join(root, 'bin'); fs.mkdirSync(bin, { mode: 0o700 });
+  const marker = path.join(root, 'attempts');
+  fs.writeFileSync(path.join(bin, 'systemctl'), String.raw`#!/bin/sh
+if [ "$3" = "--property=Version" ]; then printf 'Version=256\n'; exit 0; fi
+if [ "$FAKE_UNIT_STATE" = "loaded" ]; then
+  printf 'LoadState=loaded\nActiveState=activating\nSubState=start\nSlice=%s\nDescription=Pi job-1: Background job\n' "$FAKE_SLICE"
+else
+  printf 'LoadState=not-found\nActiveState=inactive\nSubState=dead\n'
+fi
+`, { mode: 0o700 });
+  fs.writeFileSync(path.join(bin, 'systemd-run'), String.raw`#!/bin/sh
+printf 'attempt\n' >> "$FAKE_SUBMISSION_MARKER"
+exit 1
+`, { mode: 0o700 });
+  const original = { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR,
+    FAKE_SUBMISSION_MARKER: process.env.FAKE_SUBMISSION_MARKER,
+    FAKE_UNIT_STATE: process.env.FAKE_UNIT_STATE, FAKE_SLICE: process.env.FAKE_SLICE };
+  const s = setup(t);
+  try {
+    process.env.PATH = `${bin}:${original.PATH}`; process.env.TMPDIR = root;
+    process.env.FAKE_SUBMISSION_MARKER = marker;
+    await s.ready;
+    const job = await s.start('echo must-not-run', { unsafe_to_terminate: true });
+    await s.handlers.session_shutdown({ reason: 'simulate-reload' }, s.ctx);
+    // Simulate a crash after request persistence but before systemd-run returned.
+    fs.writeFileSync(job.metadata_path, fs.readFileSync(path.join(job.directory, 'request.json')), { mode: 0o600 });
+    process.env.FAKE_UNIT_STATE = 'loaded'; process.env.FAKE_SLICE = job.slice;
+    await s.handlers.session_start({}, s.ctx);
+    const recovered = await s.call('background_status', { id: job.id });
+    assert.equal(recovered.unit, job.unit);
+    assert.equal(recovered.status, 'running');
+    assert.equal(recovered.submission_state, 'confirmed');
+    await s.handlers.session_shutdown({ reason: 'simulate-unconfirmed-stop' }, s.ctx);
+    const unresolved = JSON.parse(fs.readFileSync(job.metadata_path, 'utf8'));
+    Object.assign(unresolved, { status: 'unknown', error: 'Stop not confirmed: synthetic manager loss', submission_state: 'confirmed' });
+    fs.writeFileSync(job.metadata_path, JSON.stringify(unresolved), { mode: 0o600 });
+    await s.handlers.session_start({}, s.ctx);
+    const stillUnknown = await s.call('background_status', { id: job.id });
+    assert.equal(stillUnknown.status, 'unknown', 'a loaded unit does not resolve an unconfirmed stop');
+    assert.match(stillUnknown.error, /Stop not confirmed/);
+    assert.equal(fs.readFileSync(marker, 'utf8'), 'attempt\n', 'recovery never submits a second unit');
+    assert.equal(fs.existsSync(path.join(job.directory, 'environment')), true);
+    assert.equal(s.sent.length, 0);
+  } finally {
+    try { await s.handlers.session_shutdown({ reason: 'test' }, s.ctx); }
+    finally {
+      for (const [key, value] of Object.entries(original)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+nodeTest('cancel refuses a loaded same-slice unit with the wrong description', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-background-cancel-identity-test-'));
+  const bin = path.join(root, 'bin'); fs.mkdirSync(bin, { mode: 0o700 });
+  const stopMarker = path.join(root, 'stop-attempted');
+  fs.writeFileSync(path.join(bin, 'systemctl'), String.raw`#!/bin/sh
+if [ "$3" = "--property=Version" ]; then printf 'Version=256\n'; exit 0; fi
+if [ "$2" = "stop" ]; then printf 'stop\n' >> "$FAKE_STOP_MARKER"; exit 0; fi
+if [ "$4" = "--property=ActiveState" ] && [ "$5" = "--value" ]; then printf 'inactive\n'; exit 0; fi
+printf 'LoadState=loaded\nActiveState=activating\nSubState=start\nSlice=%s\nDescription=Other job\n' "$FAKE_SLICE"
+`, { mode: 0o700 });
+  fs.writeFileSync(path.join(bin, 'systemd-run'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
+  const original = { PATH: process.env.PATH, TMPDIR: process.env.TMPDIR,
+    FAKE_SLICE: process.env.FAKE_SLICE, FAKE_STOP_MARKER: process.env.FAKE_STOP_MARKER };
+  const s = setup(t);
+  try {
+    process.env.PATH = `${bin}:${original.PATH}`; process.env.TMPDIR = root;
+    process.env.FAKE_STOP_MARKER = stopMarker;
+    await s.ready;
+    const job = await s.start('echo must-not-run');
+    process.env.FAKE_SLICE = job.slice;
+    await s.call('background_cancel', { id: job.id });
+    const refused = await until(async () => {
+      const metadata = JSON.parse(fs.readFileSync(job.metadata_path, 'utf8'));
+      return /Stop request failed/.test(metadata.error ?? '') && metadata;
+    });
+    assert.equal(refused.status, 'unknown');
+    assert.match(refused.error, /Cannot confirm exact unit identity/);
+    assert.equal(fs.existsSync(stopMarker), false, 'no systemctl stop was sent');
+    // Retire only this fake test job so the shared test harness can shut down cleanly.
+    fs.writeFileSync(job.completion_path, JSON.stringify({ status: 'failed', finished_at: new Date().toISOString(),
+      exit_code: null, signal: null, error: 'synthetic test result', systemd_result: 'failure', deadline_exceeded: false }), { mode: 0o600 });
+    await s.call('background_status', { id: job.id });
+    assert.equal(fs.existsSync(stopMarker), false);
+  } finally {
+    try { await s.handlers.session_shutdown({ reason: 'test' }, s.ctx); }
+    finally {
+      for (const [key, value] of Object.entries(original)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test('/jobs shows elapsed status and live output, and offers confirmed cancellation', async t => {
   const s = setup(t);
   const job = await s.start('echo visible; sleep 20', { label: 'CI wait' });
@@ -244,16 +476,23 @@ test('completion hook retains results after unsafe detach and unit collection, w
   const s = setup(t);
   const job = await s.start('sleep 0.2; echo independent-hook; exit 7', { unsafe_to_terminate: true });
   await s.handlers.session_shutdown({ reason: 'reload' }, s.ctx);
+  // A stale observer can retain an uncertain submission until the hook record is read.
+  const metadata = JSON.parse(fs.readFileSync(job.metadata_path, 'utf8'));
+  Object.assign(metadata, { submission_state: 'uncertain', status: 'detached', finished_at: null });
+  fs.writeFileSync(job.metadata_path, JSON.stringify(metadata), { mode: 0o600 });
   await until(() => fs.existsSync(job.completion_path));
   const completion = JSON.parse(fs.readFileSync(job.completion_path, 'utf8'));
   assert.equal(completion.status, 'failed');
   assert.equal(completion.exit_code, 7);
+  assert.equal(completion.submission_state, undefined, 'the standalone hook records outcome, not Pi classification');
   assert.equal(fs.existsSync(path.join(job.directory, 'environment')), false);
   assert.equal(fs.statSync(job.completion_path).mode & 0o777, 0o600);
   assert.equal(s.sent.length, 0);
   s.handlers.session_start({}, s.ctx);
   const restored = await ended(s, job.id);
   assert.equal(restored.exit_code, 7); assert.match(restored.output, /independent-hook/);
+  assert.equal(restored.submission_state, 'confirmed', 'the observer confirms creation from the hook record');
+  assert.equal(JSON.parse(fs.readFileSync(job.metadata_path, 'utf8')).submission_state, 'confirmed');
   assert.equal(s.sent.length, 1);
   await s.call('background_status', { id: job.id });
   assert.equal(s.sent.length, 1);
@@ -415,7 +654,15 @@ test('history pruning persists across resume, preserves logs, and never reuses I
   assert.equal(list.active, 1);
   for (const job of done.slice(0, -1)) {
     await assert.rejects(s.call('background_status', { id: job.id }), /Unknown background job/);
+    assert.ok(s.branch.some(entry => entry.customType === 'background-systemd-job' && entry.data.id === job.id));
+    assert.ok(s.branch.some(entry => entry.customType === 'background-systemd-jobs-pruned' && entry.data.ids.includes(job.id)));
     assert.equal(fs.readFileSync(job.log_path, 'utf8'), 'retained\n');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(job.directory, 'request.json'), 'utf8')).unit, job.unit);
+    assert.equal(JSON.parse(fs.readFileSync(job.metadata_path, 'utf8')).id, job.id);
+    const completion = JSON.parse(fs.readFileSync(job.completion_path, 'utf8'));
+    assert.equal(completion.status, 'succeeded');
+    assert.equal(completion.exit_code, 0);
+    assert.equal(fs.existsSync(path.join(job.directory, 'environment')), false, 'only the normal hook removed its temporary snapshot');
   }
   await s.handlers.session_shutdown({}, s.ctx);
   s.branch.push({ type: 'custom', customType: 'background-systemd-jobs-pruned', data: { ids: ['job-NaN'] } });
@@ -457,4 +704,105 @@ nodeTest('malformed prune markers cannot abort session restore', async t => {
   }
   await s.handlers.session_start({}, s.ctx);
   assert.equal((await s.call('background_list')).total, 0);
+});
+
+
+const { default: tasksExtension } = createJiti(__filename)(path.resolve(__dirname, '../extensions/tasks.ts'));
+function attachTasks(s) {
+  const tools = {}, handlers = {}, messages = [];
+  tasksExtension({ events: s.events, registerFlag() {}, getFlag() {},
+    registerTool: tool => { tools[tool.name] = tool; }, registerCommand() {},
+    on: (name, fn) => { handlers[name] = fn; },
+    appendEntry: (customType, data) => s.branch.push({ type: 'custom', customType, data: structuredClone(data) }),
+    sendMessage: (...args) => messages.push(args),
+  });
+  handlers.session_start({}, s.ctx);
+  return { handlers, messages,
+    call: async (name, args = {}) => (await tools[name].execute('task-call', args, undefined, undefined, s.ctx)).details,
+  };
+}
+const lookupJob = (s, job_id, session_id = 'test-session') => {
+  const query = { version: 1, session_id, job_id }; s.events.emit('background:lookup-v1', query); return query;
+};
+
+test('optional peer lookup exposes only session-scoped metadata and works without tasks', async t => {
+  const s = setup(t, 'rpc'); await s.ready;
+  const changes = []; s.events.on('background:changed-v1', event => changes.push(event));
+  const job = await s.start('echo private-job-output; sleep 0.2');
+  const query = lookupJob(s, job.id);
+  assert.equal(query.available, true);
+  assert.deepEqual(Object.keys(query.job).sort(), ['finished_at', 'id', 'session_id', 'status', 'unit']);
+  assert.equal(query.job.unit, job.unit); assert.equal(query.job.finished_at, null);
+  assert.equal(lookupJob(s, job.id, 'another-session').available, undefined);
+  assert.equal(lookupJob(s, 'job-9999').available, true); assert.equal(lookupJob(s, 'job-9999').job, undefined);
+  await until(() => s.sent.length === 1);
+  assert.equal(lookupJob(s, job.id).job.status, 'succeeded');
+  assert.ok(changes.length >= 1);
+  assert.ok(changes.every(event => JSON.stringify(event) === JSON.stringify({ version: 1, session_id: 'test-session' })));
+  await s.handlers.session_shutdown({}, s.ctx);
+  assert.equal(lookupJob(s, job.id).available, undefined);
+});
+
+test('real background completion unblocks tasks before its sole completion wake, including failed jobs', async t => {
+  const s = setup(t, 'rpc'); await s.ready; const tasks = attachTasks(s);
+  for (const exitCode of [0, 7]) {
+    const task = (await tasks.call('tasks_add', { summary: `Inspect job exit ${exitCode}` })).task;
+    await tasks.call('tasks_progress', { task_id: task.id });
+    const job = await s.start(`sleep 0.25; echo finished; exit ${exitCode}`);
+    const blocked = await tasks.call('tasks_block', { task_id: task.id, reason: 'Waiting for result', background_job_id: job.id });
+    assert.equal(blocked.task.status, 'blocked');
+    const before = s.sent.length;
+    await until(() => s.sent.length > before);
+    const result = (await tasks.call('tasks_list')).tasks.find(item => item.id === task.id);
+    assert.equal(result.status, 'progress'); assert.equal(result.background_job, undefined);
+    assert.equal(result.completedBy, undefined); assert.equal(tasks.messages.length, 0);
+    assert.equal(s.sent.at(-1)[0].details.exit_code, exitCode);
+    assert.equal(s.sent.length, before + 1);
+    await tasks.call('tasks_progress', { task_id: task.id, active: false });
+  }
+});
+
+test('reconnecting background jobs reconciles dependencies in either extension startup order', async t => {
+  const s = setup(t, 'rpc'); await s.ready; const tasks = attachTasks(s);
+  const task = (await tasks.call('tasks_add', { summary: 'Await detached job' })).task;
+  const job = await s.start('sleep 0.4; echo restored', { unsafe_to_terminate: true });
+  await tasks.call('tasks_block', { task_id: task.id, reason: 'Waiting for result', background_job_id: job.id });
+  await s.handlers.session_shutdown({}, s.ctx);
+  assert.equal((await tasks.call('tasks_list')).tasks[0].background_job_availability, 'unavailable');
+  await until(() => fs.existsSync(job.completion_path));
+  // Tasks starts first, while background provider is unavailable.
+  tasks.handlers.session_start({}, s.ctx);
+  assert.equal((await tasks.call('tasks_list')).tasks[0].status, 'blocked');
+  await s.handlers.session_start({}, s.ctx);
+  assert.equal((await tasks.call('tasks_list')).tasks[0].status, 'pending');
+  assert.equal(s.sent.length, 1); assert.equal(tasks.messages.length, 0);
+  // Replaying the pre-unblock branch with background already ready exercises reverse order.
+  const resumeIndex = s.branch.findLastIndex(entry => entry.customType === 'tasks-delta-v2' && entry.data.upsert.some(task => task.status === 'pending' && task.id === 1));
+  assert.ok(resumeIndex >= 0);
+  s.branch.splice(resumeIndex);
+  tasks.handlers.session_start({}, s.ctx);
+  assert.equal((await tasks.call('tasks_list')).tasks[0].status, 'pending');
+  assert.equal(s.sent.length, 1);
+});
+
+test('completion rings once, while progress, queries, restored notified jobs and headless jobs stay silent', async t => {
+  await require('./bell-capture.cjs')(async count => {
+    const s = setup(t); await s.ready;
+    const job = await s.start('sleep 0.15; printf done');
+    assert.equal(count(), 0);
+    await ended(s, job.id);
+    await until(() => s.sent.length === 1);
+    assert.equal(count(), 1);
+    await s.call('background_status', { id: job.id });
+    await s.call('background_list');
+    assert.equal(count(), 1);
+    await s.handlers.session_shutdown({ reason: 'reload' }, s.ctx);
+    await s.handlers.session_start({}, s.ctx);
+    assert.equal(count(), 1);
+    s.ctx.mode = 'rpc';
+    const other = await s.start('printf headless');
+    await ended(s, other.id);
+    await until(() => s.sent.length === 2);
+    assert.equal(count(), 1);
+  });
 });

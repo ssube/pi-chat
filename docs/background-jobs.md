@@ -36,3 +36,21 @@ Inspect the recorded unit with `systemctl --user show UNIT` and read only the jo
 Per-session active capacity defaults to **5** jobs. Configure `PI_BACKGROUND_MAX_ACTIVE` (integer ≥ 1). Restored active/unknown jobs count toward capacity; reaching the cap refuses submission without stopping existing jobs.
 
 Completed registry history defaults to the newest **100** jobs and **24 hours**. Configure `PI_BACKGROUND_HISTORY_LIMIT` (integer ≥ 0) and `PI_BACKGROUND_HISTORY_TTL_SECONDS` (integer ≥ 0, default 86400 seconds). Pruning does not delete private artifact files or historical Pi session entries, cancel jobs, or change active capacity. Expired/pruned jobs are omitted from the registry view; retained artifact paths remain private.
+
+## Uncertain submissions and task dependencies
+
+Creation and the requested command's outcome are separate facts. `prepared` or
+`uncertain` submission never authorizes automatic resubmission or artifact cleanup.
+A matching loaded unit confirms creation; absence without a retained completion
+record is unknown. Cancellation verifies the recorded unit's exact slice and
+description before stopping it. An unconfirmed stop remains unknown on recovery,
+not cancelled or running merely because the manager responds again. Keep private
+environment files and other recovery evidence until the outcome is established.
+
+When Tasks is also loaded, `tasks_block(..., background_job_id="job-1")` can await
+one exact current-session job. A verified terminal result restores pending/prior
+progress (subject to the one-progress limit), never marks complete and adds no
+second completion wake. Missing providers, pruned records or mismatched units
+remain blocked for explicit recovery. See [dependency semantics](tasks.md#optional-background-job-dependencies).
+
+Terminal notifications ring once in TUI/TTY only; see [attention bells](attention-bells.md).

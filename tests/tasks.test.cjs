@@ -1,16 +1,23 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { createJiti } = require(require.resolve('jiti', { paths: [path.resolve(__dirname, '../extensions')] }));
-const { default: extension, parseVerdict, taskListMarkdown, recentTaskMessages } = createJiti(__filename)(path.resolve(__dirname, '../extensions/tasks.ts'));
+const { default: extension, parseVerdict, taskListMarkdown, recentTaskMessages, recentJudgeMessages, readEvidenceFile, evidenceUrls } = createJiti(__filename)(path.resolve(__dirname, '../extensions/tasks.ts'));
 
-function setup(branch = [], flags = {}) {
-  const handlers = {}, tools = {}, commands = {}, sent = [], notices = [], widgets = [], requests = [], titles = [], flagDefinitions = {}, focuses = [];
-  let selections = [], inputs = [], confirms = [], idle = true, queued = false;
+function setup(branch = [], flags = {}, readUrl) {
+  const handlers = {}, tools = {}, commands = {}, sent = [], notices = [], widgets = [], requests = [], titles = [], editors = [], flagDefinitions = {}, focuses = [];
+  const listeners = new Map();
+  const events = {
+    on: (channel, handler) => { const handlers = listeners.get(channel) ?? []; handlers.push(handler); listeners.set(channel, handlers); return () => listeners.set(channel, handlers.filter(item => item !== handler)); },
+    emit: (channel, data) => { for (const handler of listeners.get(channel) ?? []) handler(data); },
+  };
+  let selections = [], inputs = [], confirms = [], idle = true, queued = false, activeTools = [];
   let judge = async () => ({ verdict: 'accepted', reason: 'The supplied test output satisfies the criterion.', missing: [] });
   const ctx = {
-    mode: 'tui', model: { provider: 'test', id: 'offline-judge' },
-    sessionManager: { getBranch: () => branch }, isIdle: () => idle, hasPendingMessages: () => queued,
+    mode: 'tui', cwd: process.cwd(), model: { provider: 'test', id: 'offline-judge' },
+    sessionManager: { getBranch: () => branch, getSessionId: () => "test-session" }, isIdle: () => idle, hasPendingMessages: () => queued,
     modelRegistry: { complete: async (...args) => {
       requests.push(args);
       const value = await judge(...args);
@@ -24,7 +31,7 @@ function setup(branch = [], flags = {}) {
         const value = selections.shift();
         return typeof value === 'function' ? value(choices) : value;
       },
-      input: async () => inputs.shift(), editor: async () => inputs.shift(), confirm: async () => confirms.shift() ?? true,
+      input: async () => inputs.shift(), editor: async (...args) => { editors.push(args); return inputs.shift(); }, confirm: async () => confirms.shift() ?? true,
       custom: async factory => {
         let result, finished = false;
         const component = await factory({ requestRender() {} }, ctx.ui.theme, {}, value => { result = value; finished = true; });
@@ -59,10 +66,11 @@ function setup(branch = [], flags = {}) {
     registerFlag: (name, options) => { flagDefinitions[name] = options; },
     getFlag: name => flags[name] ?? flagDefinitions[name]?.default,
     appendEntry: (customType, data) => branch.push({ type: 'custom', customType, data: structuredClone(data) }),
-    sendMessage: (...args) => sent.push(args),
-  });
+    sendMessage: (...args) => sent.push(args), events, getAllTools: () => Object.values(tools), getActiveTools: () => activeTools,
+  }, readUrl);
   handlers.session_start({}, ctx);
-  return { handlers, tools, commands, ctx, branch, sent, notices, widgets, requests, titles, focuses,
+  return { handlers, tools, commands, ctx, branch, sent, notices, widgets, requests, titles, editors, focuses, events,
+    activeTools: (...names) => { activeTools = names; },
     select: (...values) => { selections = values; }, inputs: (...values) => { inputs = values; },
     confirms: (...values) => { confirms = values; }, judge: fn => { judge = fn; },
     idle: value => { idle = value; }, queued: value => { queued = value; },
@@ -86,6 +94,158 @@ test('ordered, stable IDs; limits/invalid input; no agent removal or override', 
   assert.equal(s.tools.tasks_remove, undefined); assert.equal(s.tools.tasks_override, undefined);
   for (let i = 2; i < 20; i++) await add(s, `Task ${i}`);
   await assert.rejects(add(s), /limit/);
+});
+
+test('task lookup for queued questions exposes only current open IDs', async () => {
+  const s = setup(); await add(s, 'Open task');
+  const lookup = id => { const query = { task_id: id }; s.events.emit('tasks:lookup-v1', query); return query.available; };
+  assert.equal(lookup(1), true);
+  assert.equal(lookup(2), false);
+  assert.equal(lookup(-1), undefined);
+  await complete(s, 1);
+  assert.equal(lookup(1), false, 'completed tasks cannot receive new linked questions');
+  s.handlers.session_tree({}, { ...s.ctx, sessionManager: { getBranch: () => [] } });
+  assert.equal(lookup(1), false, 'navigating to another branch cannot reuse the old task');
+});
+
+test('registered guidance distinguishes tracked review dependencies from routine waits', async () => {
+  const s = setup(); await add(s, 'Wait for CI result');
+  assert.match(s.tools.tasks_block.description, /For a review that is the next dependency, use tasks_review/);
+  assert.match(s.tools.tasks_progress.description, /Routine CI, review and quick-question waits may stay pending or in progress/);
+  input(s);
+  const context = s.handlers.context({ messages: [] }, s.ctx).messages.at(-1).content;
+  assert.match(context, /tasks_review records the reviewer, artifact and next check/);
+  assert.match(context, /Ordinary CI, review or quick-question waits with independent work need no block/);
+  assert.doesNotMatch(context, /queue_question/);
+  assert.equal((await list(s)).tasks[0].status, 'pending', 'the guidance makes no automatic state change');
+});
+
+test('question guidance follows tool availability, including a fully blocked ledger', async () => {
+  const s = setup(); await add(s, 'Choose the report format'); input(s);
+  const context = () => s.handlers.context({ messages: [] }, s.ctx).messages.at(-1).content;
+  assert.doesNotMatch(context(), /queue_question/);
+  s.activeTools('queue_question');
+  for (const blocked of [false, true]) {
+    if (blocked) await call(s, 'tasks_block', { task_id: 1, reason: 'Need preferred format', waiting_on: 'user' });
+    const guidance = context();
+    assert.match(guidance, /prefer queue_question\(\{action: "add", task_id, question, context, wait_for_answer: true\}\)/);
+    assert.match(guidance, /For optional clarification, omit wait_for_answer/);
+    assert.match(guidance, /Do not queue required approval, spending, or consequential decisions; ask those directly/);
+    assert.match(guidance, /Reuse an existing linked question/);
+    assert.match(guidance, /After an answer resolves a persisted blocker, use tasks_unblock/);
+    assert.equal((await list(s)).tasks[0].status, blocked ? 'blocked' : 'pending');
+  }
+  s.activeTools();
+  assert.doesNotMatch(context(), /queue_question/);
+});
+
+test('generic blockers retain who or what can resolve them without inventing an approval gate', async () => {
+  const s = setup(); await add(s, 'Wait for CI');
+  const blocked = await call(s, 'tasks_block', { task_id: 1, reason: 'Build result needed', waiting_on: 'CI job #42' });
+  assert.equal(blocked.details.task.waiting_on, 'CI job #42');
+  const task = (await list(s)).tasks[0];
+  assert.equal(task.status, 'blocked'); assert.equal(task.effective_waiting_on, 'CI job #42');
+  assert.match(s.widgets.at(-1).join('\n'), /waiting on CI job #42/);
+  assert.match(s.handlers.context({ messages: [] }, s.ctx).messages.at(-1).content, /CI job #42/);
+  assert.equal((await list(setup(s.branch))).tasks[0].waiting_on, 'CI job #42');
+  for (const who of [' ', 'x'.repeat(121)]) {
+    await assert.rejects(call(s, 'tasks_block', { task_id: 1, reason: 'New reason', waiting_on: who }));
+    assert.equal((await list(s)).tasks[0].blocker, 'Build result needed');
+  }
+  const malformed = structuredClone(s.branch);
+  malformed.at(-1).data.upsert[0].status = 'pending';
+  await assert.rejects(list(setup(malformed)), /unavailable/, 'a pending task cannot retain a blocker owner');
+  await call(s, 'tasks_block', { task_id: 1, reason: 'Different prerequisite' });
+  assert.equal((await list(s)).tasks[0].waiting_on, undefined, 'generic re-blocking clears stale owner');
+  await call(s, 'tasks_unblock', { task_id: 1 });
+  assert.equal((await list(s)).tasks[0].effective_waiting_on, undefined);
+});
+
+test('review marker persists a blocked checkpoint and shows a due review without starting inference', async () => {
+  const s = setup(); await add(s, 'Review the task change'); input(s);
+  const check_at = new Date(Date.now() - 60_000).toISOString();
+  const result = await call(s, 'tasks_review', { task_id: 1, reviewer: 'Reviewer', artifact: 'example/project PR #42', check_at });
+  assert.equal(result.details.task.status, 'blocked');
+  assert.deepEqual(result.details.task.review, { reviewer: 'Reviewer', artifact: 'example/project PR #42', check_at });
+  assert.equal(result.details.task.waiting_on, 'Reviewer');
+  assert.equal((await list(s)).tasks[0].effective_waiting_on, 'Reviewer');
+  assert.equal(result.details.due, true);
+  assert.deepEqual((await list(s)).review_due_ids, [1]);
+  assert.match(s.widgets.at(-1).join('\n'), /blocked due/);
+  assert.match(s.handlers.context({ messages: [] }, s.ctx).messages.at(-1).content, /Review check due for task #1/);
+  assert.equal(settle(s), undefined, 'blocked review cannot start an automatic continuation');
+  assert.equal(s.sent.length, 0);
+  assert.equal(s.requests.length, 0, 'review marker does not call a provider');
+  const restored = setup(s.branch); assert.deepEqual((await list(restored)).tasks[0].review, result.details.task.review);
+  assert.deepEqual((await list(restored)).review_due_ids, [1]);
+  const branched = setup([]); assert.deepEqual((await list(branched)).review_due_ids, []);
+  await call(s, 'tasks_unblock', { task_id: 1 });
+  assert.equal((await list(s)).tasks[0].review, undefined);
+  assert.equal((await list(s)).tasks[0].waiting_on, undefined);
+  assert.deepEqual((await list(s)).review_due_ids, []);
+});
+
+test('review checkpoint is visible in task menu and clears on resume or changed criteria', async () => {
+  const s = setup(); await add(s, 'Review menu');
+  const future = new Date(Date.now() + 86_400_000).toISOString();
+  const mark = () => call(s, 'tasks_review', { task_id: 1, reviewer: 'Reviewer', artifact: 'PR #42', check_at: future });
+  await mark();
+  s.select(pickTask(1), 'Back', 'Close'); await s.commands.tasks.handler('', s.ctx);
+  assert.match(s.titles.join('\n'), /Review: Reviewer · PR #42/);
+  assert.match(s.titles.join('\n'), /Waiting on: Reviewer/);
+  s.select(pickTask(1), 'Resume task', 'Close'); await s.commands.tasks.handler('', s.ctx);
+  assert.equal((await list(s)).tasks[0].status, 'pending');
+  assert.equal((await list(s)).tasks[0].review, undefined);
+  await mark();
+  s.inputs('Changed criterion'); s.select(pickTask(1), 'Edit acceptance criteria');
+  await s.commands.tasks.handler('', s.ctx);
+  const task = (await list(s)).tasks[0];
+  assert.equal(task.status, 'pending'); assert.equal(task.acceptance, 'Changed criterion');
+  assert.equal(task.review, undefined, 'changed acceptance invalidates an outstanding review');
+  assert.equal(s.requests.length, 0);
+});
+
+test('review checkpoint validates inputs and clears on generic block or completion', async () => {
+  const s = setup(); await add(s, 'Review checkpoint');
+  const future = new Date(Date.now() + 86_400_000).toISOString();
+  const malformed = structuredClone(s.branch);
+  malformed.at(-1).data.upsert[0].review = { reviewer: 'Reviewer', artifact: 'PR #1', check_at: future };
+  await assert.rejects(list(setup(malformed)), /unavailable/, 'restoration refuses a review marker on a pending task');
+  for (const args of [
+    { task_id: 9, reviewer: 'Reviewer', artifact: 'PR #1', check_at: future },
+    { task_id: 1, reviewer: ' ', artifact: 'PR #1', check_at: future },
+    { task_id: 1, reviewer: 'Reviewer', artifact: ' ', check_at: future },
+    { task_id: 1, reviewer: 'Reviewer', artifact: 'PR #1', check_at: '2026-10-19T12:00:00' },
+    { task_id: 1, reviewer: 'Reviewer', artifact: 'PR #1', check_at: 'not a date' },
+  ]) await assert.rejects(call(s, 'tasks_review', args));
+  assert.equal((await list(s)).tasks[0].status, 'pending');
+  await call(s, 'tasks_review', { task_id: 1, reviewer: 'Reviewer', artifact: 'PR #1', check_at: future });
+  const mismatch = structuredClone(s.branch);
+  mismatch.at(-1).data.upsert[0].waiting_on = 'Someone else';
+  await assert.rejects(list(setup(mismatch)), /unavailable/, 'review owner cannot disagree with reviewer');
+  assert.deepEqual((await list(s)).review_due_ids, []);
+  await call(s, 'tasks_block', { task_id: 1, reason: 'Need a separate owner decision' });
+  assert.equal((await list(s)).tasks[0].review, undefined);
+  await assert.rejects(call(s, 'tasks_review', { task_id: 1, reviewer: 'Reviewer', artifact: 'PR #1', check_at: future }), /another blocker/);
+  assert.equal((await list(s)).tasks[0].blocker, 'Need a separate owner decision');
+  await call(s, 'tasks_unblock', { task_id: 1 });
+  await call(s, 'tasks_review', { task_id: 1, reviewer: 'Reviewer', artifact: 'PR #1', check_at: future });
+  await complete(s);
+  assert.equal((await list(s)).tasks[0].status, 'complete');
+  assert.equal((await list(s)).tasks[0].review, undefined);
+  await assert.rejects(call(s, 'tasks_review', { task_id: 1, reviewer: 'Reviewer', artifact: 'PR #1', check_at: future }), /already complete/);
+});
+
+test('optional linked questions stay actionable; only explicit waiting suppresses reminders', async () => {
+  const s = setup(); await add(s, 'Continue independent work'); input(s);
+  let waiting = false;
+  s.events.on('questions:lookup-v1', query => { query.ids = [7]; query.waiting_ids = waiting ? [7] : []; });
+  assert.equal((await list(s)).tasks[0].effective_status, 'pending');
+  assert.deepEqual((await list(s)).tasks[0].question_ids, [7]);
+  assert.equal(settle(s).continue, true, 'an optional question does not block the task');
+  waiting = true;
+  assert.equal((await list(s)).tasks[0].effective_status, 'question');
+  assert.equal(settle(s), undefined, 'waiting suppresses automatic reminders');
 });
 
 test('agent unblocks only blocked tasks, preserves assessment, and restores pending state', async () => {
@@ -253,6 +413,100 @@ test('judge isolation, exact criteria, evidence, usage, and accepted persistence
   await assert.rejects(complete(s), /already complete/);
 });
 
+test('declared workspace files provide bounded judge evidence without another model call', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-judge-file-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'result.txt'), 'Verified: 8 tests passed, 0 failed.');
+  const s = setup(); s.ctx.cwd = dir; await add(s, 'Run tests', { acceptance: 'Eight tests pass' });
+  const response = await call(s, 'tasks_complete', { task_id: 1, evidence: 'See declared test output', evidence_files: ['result.txt'] });
+  assert.equal(response.details.task.status, 'complete');
+  assert.deepEqual(response.details.task.evidence_files, ['result.txt']);
+  assert.deepEqual((await list(setup(s.branch))).tasks[0].evidence_files, ['result.txt']);
+  assert.equal(s.requests.length, 1, 'file retrieval does not add model calls');
+  assert.equal(s.requests[0][1].tools, undefined);
+  assert.match(s.requests[0][1].messages[0].content, /Verified: 8 tests passed, 0 failed/);
+  assert.equal(response.usage.totalTokens, 42);
+  assert.equal(readEvidenceFile(dir, 'result.txt').includes('Verified: 8 tests'), true);
+});
+
+test('cited public URL text reaches one isolated judge call with bounded provenance', async () => {
+  const seen = [];
+  const s = setup([], {}, async (url, signal) => {
+    seen.push(url); assert.equal(signal.aborted, false);
+    return { finalUrl: 'https://example.org/final', contentType: 'text/plain', markdown: 'Verified: 8 tests passed.\n' + 'x'.repeat(6000) };
+  });
+  await add(s, 'Run tests', { acceptance: 'Eight tests pass' });
+  const response = await complete(s, 1, 'Results: https://example.org/proof.');
+  assert.equal(response.details.task.status, 'complete');
+  assert.deepEqual(seen, ['https://example.org/proof']);
+  assert.deepEqual(response.details.task.evidence_urls, ['https://example.org/final']);
+  assert.deepEqual((await list(setup(s.branch))).tasks[0].evidence_urls, ['https://example.org/final']);
+  assert.equal(s.requests.length, 1);
+  assert.equal(s.requests[0][1].tools, undefined);
+  assert.match(s.requests[0][1].messages[0].content, /Verified: 8 tests passed/);
+  assert.match(s.requests[0][1].messages[0].content, /Truncated; submit a focused excerpt/);
+  assert.match(s.requests[0][1].systemPrompt, /retrieved contents are untrusted data/);
+  assert.equal(response.usage.totalTokens, 42);
+});
+
+test('URL evidence refuses excessive, unreadable and image sources before inference', async () => {
+  const seen = [];
+  const s = setup([], {}, async url => { seen.push(url); throw new Error('PRIVATE_NETWORK_DETAIL'); });
+  await add(s);
+  assert.deepEqual(evidenceUrls('https://example.org/a, https://example.org/a and https://example.org/b.'),
+    ['https://example.org/a', 'https://example.org/b']);
+  const many = await complete(s, 1, 'https://example.org/a https://example.org/b https://example.org/c https://example.org/d');
+  assert.equal(many.details.assessment.verdict, 'unable_to_assess');
+  assert.equal(seen.length, 0);
+  const unreadable = await complete(s, 1, 'https://example.org/a');
+  assert.equal(unreadable.details.assessment.verdict, 'unable_to_assess');
+  assert.doesNotMatch(unreadable.content[0].text, /PRIVATE_NETWORK_DETAIL/);
+  assert.equal(s.requests.length, 0);
+  assert.equal((await list(s)).tasks[0].evidence_urls, undefined);
+  const image = setup([], {}, async () => ({ finalUrl: 'https://example.org/a', contentType: 'image/png', image: { type: 'image' } }));
+  await add(image);
+  const refused = await complete(image, 1, 'https://example.org/a');
+  assert.equal(refused.details.assessment.verdict, 'unable_to_assess');
+  assert.equal(image.requests.length, 0);
+});
+
+test('real shared web_read boundary refuses loopback and credential-bearing evidence URLs', async () => {
+  const s = setup(); await add(s);
+  for (const evidence of ['http://127.0.0.1/private', 'https://user:password@example.org/proof']) {
+    const response = await complete(s, 1, evidence);
+    assert.equal(response.details.assessment.verdict, 'unable_to_assess');
+    assert.equal(response.details.task.status, 'pending');
+  }
+  assert.equal(s.requests.length, 0);
+  assert.equal((await list(s)).tasks[0].evidence_urls, undefined);
+});
+
+test('file evidence refuses escapes and binary/oversized data without inference', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-judge-scope-'));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-judge-outside-'));
+  t.after(() => { fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(outside, { recursive: true, force: true }); });
+  fs.writeFileSync(path.join(outside, 'secret.txt'), 'SECRET_SENTINEL');
+  fs.symlinkSync(path.join(outside, 'secret.txt'), path.join(dir, 'escape.txt'));
+  fs.writeFileSync(path.join(dir, 'binary.txt'), Buffer.from([0, 1, 2]));
+  fs.writeFileSync(path.join(dir, 'large.txt'), 'x'.repeat(64 * 1024 + 1));
+  fs.writeFileSync(path.join(dir, 'invalid.txt'), Buffer.from([0xff]));
+  fs.writeFileSync(path.join(dir, 'long.txt'), 'x'.repeat(9000));
+  assert.match(readEvidenceFile(dir, 'long.txt'), /Truncated; submit a focused excerpt/);
+  for (const file of ['../secret.txt', path.join(outside, 'secret.txt'), 'escape.txt', 'binary.txt', 'large.txt', 'invalid.txt']) {
+    assert.throws(() => readEvidenceFile(dir, file));
+  }
+  const s = setup([], {}, async () => { throw new Error('unavailable'); }); s.ctx.cwd = dir; await add(s);
+  for (const evidence_files of [['escape.txt'], ['binary.txt'], ['large.txt'], ['invalid.txt'], ['a', 'b', 'c', 'd'], ['bad\npath']]) {
+    const response = await call(s, 'tasks_complete', { task_id: 1, evidence: 'See file', evidence_files });
+    assert.equal(response.details.assessment.verdict, 'unable_to_assess');
+  }
+  const url = await complete(s, 1, 'https://example.org/proof');
+  assert.equal(url.details.assessment.verdict, 'unable_to_assess');
+  assert.equal(s.requests.length, 0, 'unsafe files and unreadable URL evidence never reach the provider');
+  assert.equal((await list(s)).tasks[0].status, 'pending');
+  assert.equal((await list(s)).tasks[0].evidence_files, undefined, 'failed reads are not recorded as inspected evidence');
+});
+
 test('rejection names missing evidence, remains pending, and is visible in subsequent context', async () => {
   const s = setup(); await add(s);
   s.judge(async () => ({ verdict: 'needs_work', reason: 'Failure-path tests are not shown.', missing: ['Provide output showing invalid inputs are rejected.'] }));
@@ -297,6 +551,113 @@ test('context survives compaction and reload without duplicate snapshots, branch
   assert.equal((await list(s)).tasks.length, 0);
   s.handlers.session_tree({}, s.ctx); assert.equal((await list(s)).tasks[0].summary, 'Still pending');
   assert.equal(settle(s), undefined, 'restoring alone does not start model inference');
+});
+
+test('versioned one-task deltas replay legacy history, forks and compaction without new snapshots', async () => {
+  const legacy = { type: 'custom', customType: 'tasks-state-v1', data: { version: 1, nextId: 2, paused: false,
+    tasks: [{ id: 1, summary: 'Legacy task', acceptance: 'Observe result', status: 'pending' }] } };
+  const s = setup([legacy]);
+  await add(s, 'Second task');
+  const fork = structuredClone(s.branch);
+  await call(s, 'tasks_progress', { task_id: 2 });
+  await call(s, 'tasks_block', { task_id: 1, reason: 'Need the result' });
+  assert.deepEqual(s.branch.slice(1).map(entry => entry.customType), Array(3).fill('tasks-delta-v2'));
+  assert.deepEqual(s.branch.slice(1).map(entry => entry.data.revision), [1, 2, 3]);
+  assert.deepEqual(s.branch.slice(1).map(entry => entry.data.upsert.length), [1, 1, 1]);
+  assert.deepEqual(await list(setup(s.branch)), await list(s));
+  const length = s.branch.length;
+  s.handlers.context({ messages: [] }, s.ctx);
+  s.handlers.context({ messages: [] }, s.ctx);
+  assert.equal(s.branch.length, length, 'compaction-context refresh does not append a checkpoint');
+  const other = setup(fork); await add(other, 'Fork only');
+  assert.deepEqual((await list(other)).tasks.map(task => task.id), [1, 2, 3]);
+  assert.deepEqual((await list(s)).tasks.map(task => task.id), [1, 2]);
+  s.handlers.session_tree({}, { ...s.ctx, sessionManager: { getBranch: () => fork } });
+  assert.deepEqual((await list(s)).tasks.map(task => task.id), [1, 2, 3]);
+  s.handlers.session_tree({}, s.ctx);
+  assert.deepEqual(await list(s), await list(setup(s.branch)));
+});
+
+test('invalid or out-of-order deltas fail closed, including a legacy snapshot after v2', async () => {
+  const s = setup(); await add(s, 'Keep this task');
+  const invalid = [
+    [...structuredClone(s.branch), { type: 'custom', customType: 'tasks-delta-v2', data: { ...s.branch[0].data, revision: 3 } }],
+    [...structuredClone(s.branch), { type: 'custom', customType: 'tasks-delta-v2', data: { ...s.branch[0].data, version: 3, revision: 2 } }],
+    [...structuredClone(s.branch), { type: 'custom', customType: 'tasks-delta-v2', data: { ...s.branch[0].data, revision: 2, order: [999] } }],
+    [...structuredClone(s.branch), { type: 'custom', customType: 'tasks-delta-v2', data: { ...s.branch[0].data, revision: 2, junk: 'x'.repeat(192 * 1024) } }],
+    [...structuredClone(s.branch), { type: 'custom', customType: 'tasks-state-v1', data: { version: 1, nextId: 1, paused: false, tasks: [] } }],
+  ];
+  for (const branch of invalid) {
+    const restored = setup(branch);
+    await assert.rejects(list(restored), /unavailable/);
+    await assert.rejects(add(restored, 'Must not erase old work'), /unavailable/);
+    input(restored); assert.equal(settle(restored), undefined);
+    assert.match(restored.notices[0][0], /invalid saved state/);
+  }
+});
+
+test('maximal retained ledger writes a bounded one-task delta, not another full snapshot', async () => {
+  const tasks = Array.from({ length: 100 }, (_, i) => ({ id: i + 1, summary: 'S'.repeat(500), acceptance: 'A'.repeat(1000),
+    status: i < 20 ? 'pending' : 'complete', ...(i < 20 ? {} : { completedBy: 'user' }), evidence: 'E'.repeat(12000),
+    assessment: { verdict: 'needs_work', reason: 'R'.repeat(2000), missing: Array(10).fill('M'.repeat(500)) } }));
+  const s = setup([{ type: 'custom', customType: 'tasks-state-v1', data: { version: 1, nextId: 101, paused: false, tasks } }]);
+  const oldBytes = Buffer.byteLength(JSON.stringify(s.branch[0].data));
+  await call(s, 'tasks_block', { task_id: 1, reason: 'B'.repeat(1000) });
+  const delta = s.branch[1];
+  assert.equal(delta.customType, 'tasks-delta-v2');
+  assert.deepEqual(delta.data.upsert.map(task => task.id), [1]);
+  assert.ok(oldBytes > 1_000_000);
+  assert.ok(Buffer.byteLength(JSON.stringify(delta.data)) < 48_000);
+  assert.deepEqual(await list(setup(s.branch)), await list(s));
+});
+
+test('six automatic continuations survive accepted progress and restoration; only user input or Resume resets', async () => {
+  const s = setup(); for (let i = 0; i < 8; i++) await add(s, `Task ${i + 1}`); input(s);
+  for (let id = 1; id <= 6; id++) {
+    assert.equal(settle(s).continue, true);
+    assert.equal(s.branch.at(-1).data.automaticContinuations, id);
+    assert.equal((await complete(s, id)).details.task.status, 'complete');
+  }
+  assert.equal(settle(s), undefined, 'accepted completions reset only the no-progress budget');
+  s.handlers.input({ source: 'extension', text: 'Continue' }, s.ctx);
+  assert.equal(settle(s), undefined, 'extension input does not reset the hard cap');
+  const restored = setup(s.branch);
+  restored.inputs('Another task', '', ''); restored.select('Add task', 'Close');
+  await restored.commands.tasks.handler('', restored.ctx);
+  assert.equal(restored.sent.length, 0, 'menu add is not a budget reset or unbounded follow-up');
+  assert.equal(settle(restored), undefined, 'restoration retained the exhausted count');
+  restored.select('Resume reminders', 'Close');
+  await restored.commands.tasks.handler('', restored.ctx);
+  assert.equal(restored.sent.length, 1, 'explicit Resume starts one counted follow-up');
+  assert.equal(restored.branch.at(-1).data.automaticContinuations, 1);
+  input(restored);
+  assert.equal(restored.branch.at(-1).data.automaticContinuations, 0, 'genuine user input resets the count');
+  assert.equal(settle(restored).continue, true);
+});
+
+test('idle fallback consumes the same six-count even when judges accept each task', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const s = setup(); for (let i = 0; i < 7; i++) await add(s, `Task ${i + 1}`); input(s);
+  for (let id = 1; id <= 6; id++) {
+    s.handlers.agent_settled({}, s.ctx); t.mock.timers.tick(180000);
+    assert.equal(s.sent.length, id);
+    assert.equal(s.branch.at(-1).data.automaticContinuations, id);
+    await complete(s, id);
+  }
+  s.handlers.agent_settled({}, s.ctx); t.mock.timers.tick(180000);
+  assert.equal(s.sent.length, 6);
+  assert.equal((await list(s)).tasks[6].status, 'pending');
+});
+
+test('failed budget persistence cannot emit an automatic continuation', async () => {
+  const s = setup(); await add(s); input(s);
+  const original = s.branch.push;
+  s.branch.push = () => { throw new Error('Persistence failed'); };
+  assert.equal(settle(s), undefined);
+  assert.equal(s.notices.at(-1)[1], 'error');
+  s.branch.push = original;
+  assert.equal(settle(s), undefined, 'failure suspends further reminders');
+  input(s); assert.equal(settle(s).continue, true);
 });
 
 test('early termination gets at most two reminders; abort, errors, queues, and blocked tasks never auto-continue', async () => {
@@ -353,6 +714,54 @@ test('context has only the current ledger and respects suspension without stripp
   input(s);
   const active = s.handlers.context({ messages: [] }, s.ctx);
   assert.match(active.messages[0].content, /Work on pending/);
+});
+
+test('maximal task fields stay bounded in injected context while tasks_list retains full details', async () => {
+  const tasks = Array.from({ length: 20 }, (_, index) => ({
+    id: index + 1, status: index < 10 ? 'pending' : 'blocked',
+    summary: '\\'.repeat(500), acceptance: 'A'.repeat(1000), blocker: index < 10 ? undefined : 'B'.repeat(1000),
+    evidence: 'E'.repeat(12000), assessment: { verdict: 'needs_work', reason: 'R'.repeat(2000), missing: Array(10).fill('M'.repeat(500)) },
+  }));
+  const s = setup([{ type: 'custom', customType: 'tasks-state-v1', data: { version: 1, nextId: 21, paused: false, tasks } }]);
+  input(s);
+  const injected = s.handlers.context({ messages: [] }, s.ctx).messages[0].content;
+  assert.ok(injected.length < 18000, `injected task context grew to ${injected.length} characters`);
+  assert.match(injected, /\"truncated\":true/);
+  assert.match(injected, /\"id\":20/);
+  assert.match(injected, /tasks_list for full criteria/);
+  assert.doesNotMatch(injected, /E{100}/, 'submitted evidence is not injected');
+  const reminder = settle(s).entries[0].content;
+  assert.ok(reminder.length < 18000, 'automatic reminder must use the same bounded snapshot');
+  const full = (await list(s)).tasks;
+  assert.equal(full.length, 20);
+  assert.equal(full[19].acceptance.length, 1000);
+  assert.equal(full[19].evidence.length, 12000);
+  assert.equal(full[19].assessment.missing.length, 10);
+});
+
+test('task inspector truncates the header and offers full private criteria/evidence views without mutation', async () => {
+  const s = setup(); await add(s, 'S'.repeat(500), { acceptance: 'A'.repeat(1000) });
+  s.judge(async () => ({ verdict: 'needs_work', reason: 'R'.repeat(2000), missing: ['M'.repeat(500)] }));
+  await complete(s, 1, 'E'.repeat(12000));
+  const snapshots = s.branch.length;
+  s.inputs('attempted criteria change');
+  s.select(pickTask(1), 'View full criteria (read-only)', 'Close');
+  await s.commands.tasks.handler('', s.ctx);
+  assert.equal(s.editors[0][1], 'A'.repeat(1000));
+  assert.match(s.editors[0][0], /changes discarded/);
+  const inspector = s.titles.find(title => title.includes('Full criteria/evidence'));
+  assert.ok(inspector, `inspector heading missing; captured title lengths: ${s.titles.map(title => title.length).join(', ')}`);
+  // Retain the criteria-only action alongside Edit task: one additional padded menu row.
+  assert.ok(inspector.length < 3200, `inspector popup grew to ${inspector.length} characters`);
+  assert.ok(s.titles.every(title => !title.includes('E'.repeat(300))), 'menu header does not render full evidence');
+  s.inputs('attempted evidence change');
+  s.select(pickTask(1), 'View full evidence (read-only)', 'Close');
+  await s.commands.tasks.handler('', s.ctx);
+  assert.equal(s.editors[1][1], 'E'.repeat(12000));
+  assert.equal(s.branch.length, snapshots, 'viewing full details does not persist edits');
+  assert.equal((await list(s)).tasks[0].acceptance, 'A'.repeat(1000));
+  assert.equal((await list(s)).tasks[0].evidence, 'E'.repeat(12000));
+  assert.equal(s.sent.length, 0, 'private detail views do not post model-visible messages');
 });
 
 test('three-minute idle fallback is deduplicated, bounded, and cleaned up on transitions', async t => {
@@ -509,8 +918,13 @@ test('/tasks-send steers Markdown incomplete first, stable within groups, withou
 
 test('Markdown snapshots handle empty lists and escape multiline/markup/control content', () => {
   assert.match(taskListMarkdown([]), /No tasks/);
-  const output = taskListMarkdown([{ id: 1, summary: '*bold*\n- [x] <img>\x1b', status: 'pending' }]);
+  const output = taskListMarkdown([{ id: 1, summary: '*bold*\n- [x] <img>\x1b', status: 'pending', question_ids: [2] }]);
   assert.match(output, /\\\*bold\\\*/); assert.match(output, /&lt;img&gt;/);
+  assert.match(output, /question #2 queued/);
+  assert.match(taskListMarkdown([{ id: 1, summary: 'Wait', status: 'pending', question_ids: [2], waiting_question_ids: [2] }]), /question #2 waiting for answer/);
+  assert.match(taskListMarkdown([{ id: 1, summary: 'Wait', status: 'blocked', blocker: 'Need result', waiting_on: 'CI <job>' }]), /waiting on CI &lt;job&gt;/);
+  const mixed = taskListMarkdown([{ id: 1, summary: 'Both', status: 'pending', question_ids: [2, 3], waiting_question_ids: [3] }]);
+  assert.match(mixed, /question #3 waiting for answer/); assert.match(mixed, /question #2 queued/);
   assert.equal(output.split('\n').filter(line => line.startsWith('- ')).length, 1);
   assert.doesNotMatch(output, /\x1b/);
 });
@@ -752,6 +1166,76 @@ test('cancel invalidates a pending assessment and priority never reopens complet
   assert.equal((await list(s)).tasks[0].status, 'complete'); assert.equal(s.sent.length, 0);
 });
 
+test('clear completed confirms exact IDs and atomically retains open tasks and monotonic IDs', async () => {
+  const s = setup(); await add(s, 'Done A'); await add(s, 'Open'); await add(s, 'Done B');
+  await complete(s, 1); await complete(s, 3);
+  const before = await list(s), beforeEntries = s.branch.length, beforeRequests = s.requests.length;
+  s.ctx.ui.confirm = async (title, message) => { assert.equal(title, 'Clear completed tasks'); assert.match(message, /#1, #3/); return false; };
+  s.select('Clear completed tasks', 'Close'); await s.commands.tasks.handler('', s.ctx);
+  assert.deepEqual(await list(s), before); assert.equal(s.branch.length, beforeEntries);
+  s.ctx.ui.confirm = async (title, message) => { assert.equal(title, 'Clear completed tasks'); assert.match(message, /#1, #3/); return true; };
+  s.select('Clear completed tasks', 'Close'); await s.commands.tasks.handler('', s.ctx);
+  const after = await list(s);
+  assert.deepEqual(after.tasks.map(task => task.id), [2]); assert.equal(after.tasks[0].status, 'pending');
+  assert.equal(after.nextId, 4); assert.deepEqual(s.branch.at(-1).data.remove, [1, 3]);
+  assert.deepEqual(s.branch.at(-1).data.upsert, []); assert.deepEqual(s.branch.at(-1).data.order, [2]);
+  assert.equal(s.requests.length, beforeRequests, 'clearing does not call the judge'); assert.equal(s.sent.length, 0);
+  assert.deepEqual(await list(setup(s.branch)), after, 'bulk removal replays after restart');
+  const malformed = structuredClone(s.branch);
+  malformed.at(-1).data.remove = [1, 2]; malformed.at(-1).data.order = [3];
+  await assert.rejects(list(setup(malformed)), /unavailable/, 'bulk removal of an open task is invalid');
+  await add(s, 'New task'); assert.equal((await list(s)).tasks.at(-1).id, 4, 'removed IDs are not reused');
+
+  const stale = setup(); await add(stale, 'Done'); await add(stale, 'Not yet'); await complete(stale, 1);
+  stale.ctx.ui.confirm = async () => { await complete(stale, 2); return true; };
+  stale.select('Clear completed tasks', 'Close'); await stale.commands.tasks.handler('', stale.ctx);
+  assert.deepEqual((await list(stale)).tasks.map(task => task.id), [1, 2]);
+  assert.match(stale.notices.at(-1)[0], /Completed tasks changed/);
+
+  const failed = setup(); await add(failed, 'Done A'); await add(failed, 'Done B');
+  await complete(failed, 1); await complete(failed, 2);
+  const snapshot = await list(failed), push = failed.branch.push;
+  failed.branch.push = () => { throw new Error('Persistence failed'); };
+  failed.ctx.ui.confirm = async () => true;
+  failed.select('Clear completed tasks', 'Close'); await failed.commands.tasks.handler('', failed.ctx);
+  failed.branch.push = push;
+  assert.deepEqual(await list(failed), snapshot, 'failed append leaves all completed tasks intact');
+  assert.match(failed.notices.at(-1)[0], /Persistence failed/);
+});
+
+test('/tasks-add prompts directly without opening the menu and preserves cancellation', async () => {
+  const s = setup(); s.inputs('Direct task', 'Show evidence', '');
+  await s.commands['tasks-add'].handler('', s.ctx);
+  assert.deepEqual((await list(s)).tasks.map(task => task.summary), ['Direct task']);
+  assert.equal((await list(s)).tasks[0].acceptance, 'Show evidence');
+  assert.equal(s.titles.length, 0, 'no task menu was opened');
+  assert.equal(s.sent.length, 1); assert.equal(s.sent[0][0].customType, 'tasks-reminder-v1');
+  assert.deepEqual(s.sent[0][1], { deliverAs: 'followUp', triggerTurn: true });
+  const before = await list(s);
+  s.inputs(undefined); await s.commands['tasks-add'].handler('', s.ctx);
+  s.inputs('Invalid position', 'Criterion', '99'); await s.commands['tasks-add'].handler('', s.ctx);
+  assert.deepEqual(await list(s), before); assert.equal(s.sent.length, 1);
+  assert.match(s.notices.at(-1)[0], /order must be between/);
+  await s.commands['tasks-add'].handler('', { ...s.ctx, mode: 'rpc' });
+  assert.deepEqual(await list(s), before); assert.match(s.notices.at(-1)[0], /requires interactive/);
+
+  const paused = setup(); input(paused); paused.select('Pause reminders', 'Close'); await paused.commands.tasks.handler('', paused.ctx);
+  paused.inputs('Paused task', '', ''); await paused.commands['tasks-add'].handler('', paused.ctx);
+  assert.equal((await list(paused)).tasks[0].summary, 'Paused task'); assert.equal(paused.sent.length, 0);
+
+  const stale = setup(); stale.ctx.ui.input = async () => {
+    stale.handlers.session_tree({}, { ...stale.ctx, sessionManager: { getBranch: () => [] } }); return 'Old session task';
+  };
+  await stale.commands['tasks-add'].handler('', stale.ctx);
+  assert.deepEqual((await list(stale)).tasks, []); assert.equal(stale.sent.length, 0);
+
+  const failed = setup(); failed.inputs('Unsaved task', '', '');
+  const push = failed.branch.push; failed.branch.push = () => { throw new Error('Persistence failed'); };
+  await failed.commands['tasks-add'].handler('', failed.ctx); failed.branch.push = push;
+  assert.deepEqual((await list(failed)).tasks, []); assert.equal(failed.sent.length, 0);
+  assert.match(failed.notices.at(-1)[0], /Persistence failed/);
+});
+
 test('menu n creates a task, q and Escape close, and focus defaults to progress or Add', async () => {
   const s = setup(); await add(s, 'First'); await add(s, 'Second');
   await call(s, 'tasks_progress', { task_id: 2 });
@@ -904,4 +1388,656 @@ test('short compact blockers need no ellipsis or spare reason row', async () => 
   await call(s, 'tasks_block', { task_id: 1, reason: 'Waiting for review' });
   const rows = s.widgets.at(-1)().render(80);
   assert.equal(rows.length, 3); assert.equal(rows[2], '    Blocker: Waiting for review');
+});
+
+test('counts-only metrics use effective question states and never expose task content', async () => {
+  const s = setup(); await add(s, 'PRIVATE pending'); await add(s, 'PRIVATE progress'); await add(s, 'PRIVATE blocked');
+  await call(s, 'tasks_progress', { task_id: 2 });
+  await call(s, 'tasks_block', { task_id: 3, reason: 'PRIVATE reason' });
+  const metrics = () => { const query = { version: 1 }; s.events.emit('tasks:metrics-v1', query); return query; };
+  assert.deepEqual(metrics(), { version: 1, counts: { pending: 1, progress: 1, blocked: 1, question: 0, complete: 0 } });
+  s.events.on('questions:lookup-v1', query => { if (query.task_id === 2) query.waiting_ids = [1]; });
+  assert.deepEqual(metrics().counts, { pending: 1, progress: 0, blocked: 1, question: 1, complete: 0 });
+  assert.doesNotMatch(JSON.stringify(metrics()), /PRIVATE|task_id|summary|reason/);
+  const wrongVersion = { version: 2 }; s.events.emit('tasks:metrics-v1', wrongVersion); assert.equal(wrongVersion.counts, undefined);
+  s.handlers.session_shutdown({}, s.ctx); assert.equal(metrics().counts, undefined);
+  const invalid = setup([{ type: 'custom', customType: 'tasks-state-v1', data: { version: 99 } }]);
+  const query = { version: 1 }; invalid.events.emit('tasks:metrics-v1', query); assert.equal(query.counts, undefined);
+});
+
+
+test('completion context selects 0–10 recent branch messages with tool traffic but no hidden content', async () => {
+  const s = setup(); await add(s);
+  for (let i = 0; i < 11; i++) s.branch.push({ type: 'message', message: { role: 'user', content: `message ${i}` } });
+  s.branch.push({ type: 'message', message: { role: 'assistant', content: [
+    { type: 'text', text: 'Running tests' },
+    { type: 'thinking', thinking: 'SECRET_THINKING' },
+    { type: 'image', data: 'SECRET_IMAGE' },
+    { type: 'toolCall', id: 'call-1', name: 'bash', arguments: { command: 'node --test' } },
+  ] } });
+  s.branch.push({ type: 'message', message: { role: 'toolResult', toolCallId: 'call-1', toolName: 'bash', isError: false,
+    content: [{ type: 'text', text: '8 passed' }, { type: 'image', data: 'SECRET_RESULT_IMAGE' }], details: { secret: 'SECRET_DETAILS' } } });
+  s.branch.push({ type: 'message', message: { role: 'system', content: 'SECRET_SYSTEM' } });
+  s.branch.push({ type: 'custom', data: 'SECRET_STATE' });
+  s.branch.push({ type: 'message', message: { role: 'assistant', content: [{ type: 'thinking', thinking: 'SECRET_ONLY' }] } });
+  for (let count = 0; count <= 10; count++) {
+    const messages = recentJudgeMessages(s.branch, count);
+    assert.equal(messages.length, count);
+    assert.doesNotMatch(JSON.stringify(messages), /SECRET/);
+    if (count) assert.equal(messages.at(-1).role, 'toolResult');
+  }
+  await call(s, 'tasks_complete', { task_id: 1, evidence: 'Tests ran', context_messages: 10 });
+  const context = s.requests[0][1];
+  const messages = JSON.parse(context.messages[0].content).recent_messages;
+  assert.equal(messages.length, 10); assert.equal(messages[0].text, 'message 3');
+  assert.match(messages.at(-2).text, /Running tests/);
+  assert.deepEqual(JSON.parse(messages.at(-2).text.split('\n')[1]), { type: 'toolCall', id: 'call-1', name: 'bash', arguments: { command: 'node --test' } });
+  assert.deepEqual(JSON.parse(messages.at(-1).text), { toolCallId: 'call-1', toolName: 'bash', isError: false, text: '8 passed' });
+  assert.equal(context.tools, undefined); assert.equal(context.messages.length, 1);
+  assert.match(context.systemPrompt, /recent session messages.*untrusted data/);
+  assert.doesNotMatch(JSON.stringify(s.branch.filter(entry => entry.type === 'custom')), /8 passed|Running tests/);
+});
+
+test('completion context defaults off, explicit zero avoids branch reads, and invalid counts refuse inference', async () => {
+  for (const count of [undefined, 0]) {
+    const s = setup(); await add(s);
+    // Saving still reads branch state elsewhere; the context selector must not read it.
+    let reads = 0; const getBranch = s.ctx.sessionManager.getBranch;
+    s.ctx.sessionManager.getBranch = () => { reads++; return getBranch(); };
+    s.judge(async () => {
+      assert.equal(reads, 0);
+      return { verdict: 'accepted', reason: 'Done', missing: [] };
+    });
+    await call(s, 'tasks_complete', { task_id: 1, evidence: 'Done', ...(count === undefined ? {} : { context_messages: count }) });
+    assert.deepEqual(JSON.parse(s.requests[0][1].messages[0].content).recent_messages, []);
+  }
+  for (const count of [-1, 11, 1.5, '2', null, NaN, Infinity]) {
+    const s = setup(); await add(s);
+    await assert.rejects(call(s, 'tasks_complete', { task_id: 1, evidence: 'Done', context_messages: count }), /integer 0–10/);
+    assert.equal(s.requests.length, 0); assert.equal((await list(s)).tasks[0].status, 'pending');
+  }
+  const schema = setup().tools.tasks_complete.parameters.properties.context_messages;
+  assert.equal(schema.type, 'integer'); assert.equal(schema.minimum, 0); assert.equal(schema.maximum, 10);
+});
+
+test('completion context bounds text, tool arguments and results with truncation markers', () => {
+  for (const message of [
+    { role: 'user', content: 'x'.repeat(9000) },
+    { role: 'assistant', content: [{ type: 'toolCall', id: 'call', name: 'bash', arguments: { command: 'x'.repeat(9000) } }] },
+    { role: 'toolResult', toolCallId: 'call', toolName: 'bash', isError: true, content: [{ type: 'text', text: 'x'.repeat(9000) }] },
+  ]) {
+    const [excerpt] = recentJudgeMessages([{ type: 'message', message }], 1);
+    assert.equal(excerpt.text.length, 8012); assert.match(excerpt.text, / \[truncated\]$/);
+  }
+  assert.deepEqual(recentJudgeMessages([], 10), []);
+});
+
+
+const jobUnit = n => `pi-bg-00000000-0000-0000-0000-${String(n).padStart(12, '0')}.service`;
+function jobProvider(s, initial = {}) {
+  const jobs = new Map(Object.entries(initial)); let available = true;
+  s.events.on('background:lookup-v1', query => {
+    if (!available || query.version !== 1 || query.session_id !== 'test-session') return;
+    query.available = true; query.job = jobs.get(query.job_id);
+  });
+  return { jobs, available: value => { available = value; },
+    changed: (session_id = 'test-session') => s.events.emit('background:changed-v1', { version: 1, session_id }) };
+}
+const observedJob = (status = 'running', id = 'job-1', unit = jobUnit(1)) => ({ id, unit, session_id: 'test-session', status,
+  finished_at: ['succeeded', 'failed', 'timed_out', 'cancelled'].includes(status) ? new Date().toISOString() : null });
+const blockOnJob = (s, task_id = 1, background_job_id = 'job-1') => call(s, 'tasks_block', { task_id, background_job_id, reason: 'Wait for test output' });
+
+test('background-job links are optional; absent provider, missing job and invalid IDs refuse without mutation', async () => {
+  const s = setup(); await add(s);
+  await assert.rejects(blockOnJob(s), /provider unavailable/);
+  const provider = jobProvider(s);
+  await assert.rejects(blockOnJob(s), /missing from this session/);
+  for (const id of ['', 'job-0', 'not-a-job', 3]) await assert.rejects(blockOnJob(s, 1, id), /Invalid background_job_id/);
+  assert.equal((await list(s)).tasks[0].status, 'pending');
+  assert.equal(s.sent.length, 0);
+  await call(s, 'tasks_block', { task_id: 1, reason: 'Ordinary manual blocker' });
+  provider.jobs.set('job-1', observedJob());
+  await assert.rejects(blockOnJob(s), /another blocker/);
+  assert.equal((await list(s)).tasks[0].blocker, 'Ordinary manual blocker');
+});
+
+test('terminal background results restore prior status, never completion, with one progress slot and no wake', async () => {
+  for (const status of ['succeeded', 'failed', 'timed_out', 'cancelled']) {
+    const s = setup(); await add(s); await call(s, 'tasks_progress', { task_id: 1 });
+    const p = jobProvider(s, { 'job-1': observedJob() });
+    const blocked = (await blockOnJob(s)).details.task;
+    assert.equal(blocked.status, 'blocked'); assert.equal(blocked.background_job.resume_status, 'progress');
+    assert.equal(blocked.background_job_availability, 'available');
+    assert.equal((await list(s)).tasks[0].background_job.unit, jobUnit(1));
+    assert.equal(await settle(s), undefined);
+    p.jobs.set('job-1', observedJob(status)); p.changed();
+    const restored = (await list(s)).tasks[0];
+    assert.equal(restored.status, 'progress'); assert.equal(restored.background_job, undefined);
+    assert.equal(restored.blocker, undefined); assert.equal(restored.completedBy, undefined);
+    const length = s.branch.length; p.changed(); assert.equal(s.branch.length, length, 'duplicate event is idempotent');
+    assert.equal(s.sent.length, 0, 'background plugin alone owns the completion wake');
+  }
+  const s = setup(); await add(s); await add(s, 'Other work');
+  const p = jobProvider(s, { 'job-1': observedJob() });
+  await call(s, 'tasks_progress', { task_id: 1 }); await blockOnJob(s);
+  await call(s, 'tasks_progress', { task_id: 2 });
+  p.jobs.set('job-1', observedJob('succeeded')); p.changed();
+  assert.deepEqual((await list(s)).tasks.map(task => task.status), ['pending', 'progress']);
+});
+
+test('already-finished jobs and completion during link save are reconciled without a lost wake', async () => {
+  const s = setup(); await add(s); jobProvider(s, { 'job-1': observedJob('failed') });
+  assert.equal((await blockOnJob(s)).details.task.status, 'pending');
+  const race = setup(); await add(race); const p = jobProvider(race, { 'job-1': observedJob() });
+  race.events.on('tasks:changed-v1', () => {
+    const job = p.jobs.get('job-1'); if (job.status !== 'running') return;
+    p.jobs.set('job-1', observedJob('succeeded')); p.changed();
+  });
+  assert.equal((await blockOnJob(race)).details.task.status, 'pending');
+});
+
+test('missing provider after restore is visible; delayed provider-ready event reconciles a retained result', async () => {
+  const s = setup(); await add(s); jobProvider(s, { 'job-1': observedJob() }); await blockOnJob(s);
+  const saved = structuredClone(s.branch);
+  const restored = setup(s.branch);
+  let task = (await list(restored)).tasks[0];
+  assert.equal(task.status, 'blocked'); assert.equal(task.background_job_availability, 'unavailable');
+  assert.match(restored.handlers.context({ messages: [] }, restored.ctx).messages[0].content, /background_job_availability.*unavailable/);
+  assert.match(restored.widgets.at(-1).join('\n'), /unavailable/);
+  const p = jobProvider(restored, { 'job-1': observedJob('succeeded') });
+  p.changed(); task = (await list(restored)).tasks[0];
+  assert.equal(task.status, 'pending'); assert.equal(restored.sent.length, 0);
+  const without = setup(saved);
+  // Independent manual recovery is always available, with no provider.
+  assert.equal((await list(without)).tasks[0].status, 'blocked');
+  await call(without, 'tasks_unblock', { task_id: 1 });
+  assert.equal((await list(without)).tasks[0].background_job, undefined);
+});
+
+test('restore reconciles terminal jobs already registered before tasks and preserves paused reminders', async () => {
+  const s = setup(); await add(s); const p = jobProvider(s, { 'job-1': observedJob() }); await blockOnJob(s);
+  input(s); s.select('Pause reminders', 'Close'); await s.commands.tasks.handler('', s.ctx);
+  p.jobs.set('job-1', observedJob('succeeded'));
+  s.handlers.session_start({}, s.ctx);
+  assert.equal((await list(s)).tasks[0].status, 'pending'); assert.equal((await list(s)).paused, true);
+  assert.equal(s.sent.length, 0);
+});
+
+test('foreign session, replaced unit, uncertain status and missing completion timestamp never release a dependency', async () => {
+  const s = setup(); await add(s); const p = jobProvider(s, { 'job-1': observedJob() }); await blockOnJob(s);
+  for (const job of [observedJob('unknown'), observedJob('deadline_exceeded'), observedJob('detached'),
+    observedJob('succeeded', 'job-1', jobUnit(2)), { ...observedJob('succeeded'), session_id: 'foreign' },
+    { ...observedJob('succeeded'), finished_at: null }, { ...observedJob('succeeded'), id: 'job-2' }]) {
+    p.jobs.set('job-1', job); p.changed(); assert.equal((await list(s)).tasks[0].status, 'blocked');
+  }
+  p.jobs.set('job-1', observedJob('succeeded')); p.changed('foreign');
+  assert.equal((await list(s)).tasks[0].status, 'blocked');
+  s.handlers.session_before_switch({}, s.ctx); p.changed();
+  assert.equal((await list(s)).tasks[0].status, 'blocked');
+});
+
+test('manual unblock/reblock, completion, removal and criteria changes detach old job dependencies', async () => {
+  for (const action of ['unblock', 'reblock', 'complete', 'override', 'resume', 'remove', 'criteria']) {
+    const s = setup(); await add(s); const p = jobProvider(s, { 'job-1': observedJob() }); await blockOnJob(s);
+    if (action === 'unblock') await call(s, 'tasks_unblock', { task_id: 1 });
+    if (action === 'reblock') await call(s, 'tasks_block', { task_id: 1, reason: 'Different prerequisite' });
+    if (action === 'complete') await complete(s);
+    if (['override', 'resume', 'remove', 'criteria'].includes(action)) {
+      const choices = { override: 'Mark complete (user override)', resume: 'Resume task', remove: 'Remove task', criteria: 'Edit acceptance criteria' };
+      if (action === 'criteria') s.inputs('Revised criterion');
+      s.select(pickTask(1), choices[action], 'Close'); await s.commands.tasks.handler('', s.ctx);
+    }
+    const before = (await list(s)).tasks;
+    assert.ok(before.every(task => task.background_job === undefined), action);
+    p.jobs.set('job-1', observedJob('succeeded')); p.changed();
+    assert.deepEqual((await list(s)).tasks, before, action);
+  }
+});
+
+test('restoring corrupted background dependencies fails closed', async () => {
+  const s = setup(); await add(s); jobProvider(s, { 'job-1': observedJob() }); await blockOnJob(s);
+  const task = (await list(s)).tasks[0]; delete task.background_job_availability; delete task.effective_status;
+  for (const patch of [{ status: 'pending' }, { background_job: { ...task.background_job, resume_status: 'complete' } },
+    { background_job: { ...task.background_job, unit: 'wrong' } }, { background_job: { ...task.background_job, session_id: '' } }]) {
+    const restored = setup([{ type: 'custom', customType: 'tasks-state-v1', data: { version: 1, nextId: 2, paused: false, tasks: [{ ...task, ...patch }] } }]);
+    await assert.rejects(list(restored), /ledger unavailable/);
+  }
+});
+
+
+test('/tasks-prune confirms exact completed IDs without opening the menu or touching open tasks', async () => {
+  const s = setup();
+  for (const title of ['Done A', 'Pending', 'Done B', 'Progress', 'Blocked']) await add(s, title);
+  await complete(s, 1); await complete(s, 3);
+  await call(s, 'tasks_progress', { task_id: 4 });
+  await call(s, 'tasks_block', { task_id: 5, reason: 'External prerequisite' });
+  const before = await list(s), requests = s.requests.length;
+  s.ctx.ui.confirm = async (title, message) => {
+    assert.equal(title, 'Clear completed tasks'); assert.match(message, /#1, #3/); return false;
+  };
+  await s.commands['tasks-prune'].handler('', s.ctx);
+  assert.deepEqual(await list(s), before);
+  s.ctx.ui.confirm = async (_title, message) => { assert.match(message, /#1, #3/); return true; };
+  await s.commands['tasks-prune'].handler('', s.ctx);
+  const after = await list(s);
+  assert.deepEqual(after.tasks, before.tasks.filter(task => task.status !== 'complete'));
+  assert.equal(after.nextId, 6); assert.deepEqual(s.branch.at(-1).data.remove, [1, 3]);
+  assert.equal(s.titles.length, 0); assert.equal(s.requests.length, requests); assert.equal(s.sent.length, 0);
+  assert.deepEqual(await list(setup(s.branch)), after);
+  await add(s, 'New'); assert.equal((await list(s)).tasks.at(-1).id, 6);
+});
+
+test('/tasks-prune is a no-op for empty/open ledgers and refuses headless confirmation', async () => {
+  const s = setup(); let confirms = 0;
+  s.ctx.ui.confirm = async () => { confirms++; return true; };
+  await s.commands['tasks-prune'].handler('', s.ctx);
+  await add(s); const before = await list(s), length = s.branch.length;
+  await s.commands['tasks-prune'].handler('', s.ctx);
+  assert.equal(confirms, 0); assert.match(s.notices.at(-1)[0], /No completed tasks/);
+  assert.deepEqual(await list(s), before); assert.equal(s.branch.length, length);
+  await complete(s); const completed = await list(s);
+  await s.commands['tasks-prune'].handler('', { ...s.ctx, mode: 'rpc' });
+  assert.deepEqual(await list(s), completed); assert.equal(confirms, 0);
+  assert.match(s.notices.at(-1)[0], /interactive confirmation/);
+});
+
+test('/tasks-prune refuses stale targets, session changes and failed persistence', async () => {
+  const stale = setup(); await add(stale); await add(stale); await complete(stale, 1);
+  stale.ctx.ui.confirm = async () => { await complete(stale, 2); return true; };
+  await stale.commands['tasks-prune'].handler('', stale.ctx);
+  assert.deepEqual((await list(stale)).tasks.map(task => task.id), [1, 2]);
+  assert.match(stale.notices.at(-1)[0], /Completed tasks changed/);
+  const switched = setup(); await add(switched); await complete(switched);
+  const before = await list(switched), length = switched.branch.length;
+  switched.ctx.ui.confirm = async () => { switched.handlers.session_before_switch({}, switched.ctx); return true; };
+  await switched.commands['tasks-prune'].handler('', switched.ctx);
+  assert.deepEqual(await list(switched), before); assert.equal(switched.branch.length, length);
+  const failed = setup(); await add(failed); await complete(failed);
+  const saved = await list(failed), push = failed.branch.push;
+  failed.ctx.ui.confirm = async () => true;
+  failed.branch.push = () => { throw new Error('Persistence failed'); };
+  await failed.commands['tasks-prune'].handler('', failed.ctx); failed.branch.push = push;
+  assert.deepEqual(await list(failed), saved); assert.match(failed.notices.at(-1)[0], /Persistence failed/);
+});
+
+function subagentProvider(s, options = {}) {
+  const requests = [], runs = new Map();
+  let hook;
+  s.tools.subagents_enable = { name: 'subagents_enable' };
+  s.events.on('subagents:rpc:v1:request', req => {
+    requests.push(req);
+    if (hook?.(req) === false) return;
+    let data;
+    if (req.method === 'ping') data = { session: { sessionId: options.sessionId ?? 'test-session' }, capabilities: { asyncSpawn: true, asyncStatusSnapshot: { version: 1 } } };
+    if (req.method === 'spawn') {
+      assert.equal(s.branch.at(-1).data.upsert[0].subagent.state, 'launching', 'recovery identity persisted before dispatch');
+      const id = `run-${requests.length}`;
+      runs.set(id, { id, state: 'running' });
+      runs.set(`rpc-spawn-${req.requestId}`, runs.get(id));
+      data = { details: { runId: id } };
+    }
+    if (req.method === 'status') {
+      const run = runs.get(req.params.id);
+      data = { details: run ? { runId: run.id } : {}, asyncSnapshot: { kind: 'pi-subagents.async-status-snapshot', version: 1, runs: run ? [run] : [] } };
+    }
+    s.events.emit(`subagents:rpc:v1:reply:${req.requestId}`, { version: 1, requestId: req.requestId, success: true, data });
+  });
+  return { requests, runs, hook: fn => { hook = fn; } };
+}
+const assign = (s, action = 'launch', extra = {}) => call(s, 'tasks_assign', { task_id: 1, action, ...(action === 'launch' || action === 'link' ? { agent: 'worker' } : {}), ...extra });
+
+test('subagent launch persists correlation, passes scoped brief, frees progress slot and blocks duplicate work', async () => {
+  const s = setup(); const provider = subagentProvider(s);
+  await add(s, 'Implement the feature', { acceptance: 'Tests pass' }); await call(s, 'tasks_progress', { task_id: 1 });
+  const assigned = (await assign(s)).details.task;
+  assert.equal(assigned.status, 'blocked'); assert.equal(assigned.subagent.state, 'assigned');
+  const launch = provider.requests.find(req => req.method === 'spawn');
+  assert.equal(launch.params.agent, 'worker'); assert.equal(launch.params.context, 'fresh');
+  assert.equal(launch.params.cwd, s.ctx.cwd);
+  assert.equal(JSON.parse(launch.params.task).acceptance, 'Tests pass');
+  assert.equal(launch.requestId, assigned.subagent.request_id);
+  await add(s, 'Independent work'); await call(s, 'tasks_progress', { task_id: 2 });
+  await assert.rejects(assign(s), /existing blockers/);
+  await assert.rejects(complete(s), /delegated/);
+  await assert.rejects(call(s, 'tasks_block', { task_id: 1, reason: 'Other' }), /delegated/);
+  await assert.rejects(call(s, 'tasks_review', { task_id: 1, reviewer: 'reviewer', artifact: 'PR', check_at: new Date().toISOString() }), /another blocker/);
+  assert.match(s.handlers.context({ messages: [] }, s.ctx).messages.at(-1).content, /tasks_assign\(action=launch/);
+  assert.match(taskListMarkdown((await list(s)).tasks), /assigned:.*worker.*run-/);
+  assert.equal(provider.requests.filter(req => req.method === 'spawn').length, 1);
+});
+
+test('link requires exact current-session active run and never launches or steers it', async () => {
+  const s = setup(); await add(s); const p = subagentProvider(s);
+  p.runs.set('existing', { id: 'existing', state: 'running' });
+  await assign(s, 'link', { run_id: 'existing' });
+  assert.equal((await list(s)).tasks[0].subagent.run_id, 'existing');
+  assert.equal(p.requests.some(req => ['spawn', 'steer'].includes(req.method)), false);
+  for (const run of [{ id: 'not-exact', state: 'running' }, { id: 'existing', state: 'complete' }, undefined]) {
+    const other = setup(); await add(other); const provider = subagentProvider(other);
+    if (run) provider.runs.set('existing', run);
+    await assert.rejects(assign(other, 'link', { run_id: 'existing' }), /Exact current-session active run unavailable/);
+    assert.equal((await list(other)).tasks[0].status, 'pending');
+  }
+  const foreign = setup(); await add(foreign); subagentProvider(foreign, { sessionId: 'other-session' });
+  await assert.rejects(assign(foreign), /current-session/);
+});
+
+test('terminal subagent states return pending for parent assessment; paused/partial remain blocked', async () => {
+  for (const state of ['complete', 'failed', 'stopped', 'rejected', 'paused', 'partial', 'running', 'queued']) {
+    const s = setup(); await add(s); const p = subagentProvider(s);
+    const linked = (await assign(s)).details.task.subagent;
+    p.runs.get(linked.run_id).state = state;
+    await assign(s, 'refresh');
+    const task = (await list(s)).tasks[0];
+    assert.equal(task.status, ['paused', 'partial', 'running', 'queued'].includes(state) ? 'blocked' : 'pending', state);
+    assert.equal(task.subagent.last_state, state); assert.equal(task.completedBy, undefined);
+    assert.equal(s.sent.length, 0, 'plugin owns completion wake');
+    if (state === 'complete') { await complete(s); assert.equal((await list(s)).tasks[0].status, 'complete'); }
+  }
+});
+
+test('completion hints must be reconciled against RPC; unrelated or stale hints cannot finish a task', async () => {
+  const s = setup(); await add(s); const p = subagentProvider(s);
+  const { run_id } = (await assign(s)).details.task.subagent;
+  s.events.emit('subagent:async-complete', { runId: 'other', status: 'complete' });
+  await s.handlers.agent_start({}, s.ctx);
+  assert.equal((await list(s)).tasks[0].status, 'blocked');
+  p.runs.get(run_id).state = 'complete';
+  s.events.emit('subagent:async-complete', { runId: run_id });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal((await list(s)).tasks[0].status, 'pending');
+  assert.equal(s.sent.length, 0);
+});
+
+test('restore retains assignment; missing provider/run fails closed; detach/unblock never stop the child', async () => {
+  const s = setup(); await add(s); subagentProvider(s); await assign(s);
+  const restored = setup(structuredClone(s.branch));
+  const p = subagentProvider(restored);
+  assert.equal((await list(restored)).tasks[0].status, 'blocked');
+  await assert.rejects(assign(restored, 'refresh'), /unavailable or omitted/);
+  assert.equal((await list(restored)).tasks[0].status, 'blocked');
+  await assign(restored, 'detach');
+  assert.equal((await list(restored)).tasks[0].subagent, undefined);
+  assert.equal(p.requests.some(req => req.method === 'stop'), false);
+  const again = setup(structuredClone(s.branch)); const p2 = subagentProvider(again);
+  await call(again, 'tasks_unblock', { task_id: 1 });
+  assert.equal((await list(again)).tasks[0].subagent, undefined);
+  assert.equal(p2.requests.length, 0);
+  const noPlugin = setup(); await add(noPlugin); input(noPlugin);
+  assert.doesNotMatch(noPlugin.handlers.context({ messages: [] }, noPlugin.ctx).messages.at(-1).content, /tasks_assign\(/);
+  await assert.rejects(assign(noPlugin), /reply unavailable/);
+  assert.equal((await list(noPlugin)).tasks[0].status, 'pending');
+});
+
+test('uncertain launch preserves alias and blocks retries; refresh recovers without a second spawn', async () => {
+  const s = setup(); await add(s); const p = subagentProvider(s);
+  p.hook(req => {
+    if (req.method !== 'spawn') return;
+    const run = { id: 'recovered', state: 'running' };
+    p.runs.set(`rpc-spawn-${req.requestId}`, run); p.runs.set(run.id, run);
+    s.events.emit(`subagents:rpc:v1:reply:${req.requestId}`, { version: 1, requestId: req.requestId, success: true, data: { details: {} } });
+    return false;
+  });
+  await assert.rejects(assign(s), /Missing launch identity/);
+  const task = (await list(s)).tasks[0]; assert.equal(task.status, 'blocked'); assert.equal(task.subagent.state, 'launching');
+  await assert.rejects(assign(s), /existing blockers/);
+  await assign(s, 'refresh');
+  assert.equal((await list(s)).tasks[0].subagent.run_id, 'recovered');
+  assert.equal(p.requests.filter(req => req.method === 'spawn').length, 1);
+});
+
+test('persistence failure, cancellation and session changes before dispatch never spawn', async () => {
+  for (const mode of ['save', 'cancel', 'session']) {
+    const s = setup(); await add(s); const p = subagentProvider(s); const controller = new AbortController();
+    p.hook(req => {
+      if (req.method !== 'ping') return;
+      if (mode === 'cancel') controller.abort();
+      if (mode === 'session') s.handlers.session_before_switch({}, s.ctx);
+      if (mode === 'save') s.branch.push = () => { throw new Error('append failed'); };
+    });
+    await assert.rejects(call(s, 'tasks_assign', { task_id: 1, action: 'launch', agent: 'worker' }, controller.signal));
+    assert.equal(p.requests.some(req => req.method === 'spawn'), false, mode);
+  }
+});
+
+test('a session change after dispatch cannot overwrite a new ledger', async () => {
+  const s = setup(); await add(s); const p = subagentProvider(s);
+  p.hook(req => { if (req.method === 'spawn') s.handlers.session_tree({}, { ...s.ctx, sessionManager: { ...s.ctx.sessionManager, getBranch: () => [] } }); });
+  await assert.rejects(assign(s), /Launch occurred but task\/session changed/);
+  assert.equal((await list(s)).tasks.length, 0);
+  assert.equal(p.requests.filter(req => req.method === 'spawn').length, 1);
+});
+
+test('invalid assignment input and corrupt saved links fail closed', async () => {
+  for (const args of [{ agent: ' ' }, { action: 'link' }, { action: 'link', run_id: ' ' }, { run_id: 'extra' }, { action: 'unknown' }]) {
+    const s = setup(); await add(s); const p = subagentProvider(s);
+    await assert.rejects(assign(s, args.action ?? 'launch', args));
+    assert.equal(p.requests.length, 0);
+  }
+  const s = setup(); await add(s); subagentProvider(s); await assign(s);
+  for (const change of [{ state: 'bogus' }, { session_id: '' }, { run_id: '' }, { request_id: 'bad' }, { last_state: 'unknown' }]) {
+    const branch = structuredClone(s.branch);
+    const task = branch.at(-1).data.upsert[0]; Object.assign(task.subagent, change);
+    await assert.rejects(list(setup(branch)), /unavailable/);
+  }
+});
+
+test('optional installed pi-subagents RPC contract: launch, exact link and terminal reconciliation without inference', {
+  skip: !process.env.PI_TASKS_SUBAGENTS_RPC_MODULE,
+}, async () => {
+  const { pathToFileURL } = require('node:url');
+  const aliases = JSON.parse(process.env.PI_TASKS_SUBAGENTS_PEER_ALIASES ?? '{}');
+  const hook = require('node:module').registerHooks({ resolve(specifier, ctx, next) {
+    const alias = aliases[specifier] ?? (specifier.startsWith('typebox/') && aliases.typebox ? path.join(path.dirname(aliases.typebox), specifier.slice(8), 'index.mjs') : undefined);
+    return alias ? { url: pathToFileURL(alias).href, shortCircuit: true } : next(specifier, ctx);
+  } });
+  let registerSubagentRpcBridge;
+  try { ({ registerSubagentRpcBridge } = await import(pathToFileURL(path.resolve(process.env.PI_TASKS_SUBAGENTS_RPC_MODULE)).href)); }
+  finally { hook.deregister(); }
+  const s = setup(); await add(s);
+  s.ctx.sessionManager.getSessionFile = () => '/offline/parent.jsonl';
+  const state = { currentSessionId: '/offline/parent.jsonl', foregroundControls: new Map(), asyncJobs: new Map() };
+  const calls = [];
+  const bridge = registerSubagentRpcBridge({ events: s.events, getContext: () => s.ctx, state,
+    execute: async (toolCallId, params) => {
+      calls.push({ toolCallId, params });
+      if (params.action === 'status') return { content: [], details: { mode: 'management', results: [] } };
+      const id = 'offline-run';
+      state.asyncJobs.set(id, { asyncId: id, sessionId: '/offline/parent.jsonl', status: 'running', mode: 'single', startedAt: Date.now(), agents: ['worker'] });
+      return { content: [], details: { mode: 'single', results: [], runId: id, asyncId: id } };
+    },
+  });
+  try {
+    await assign(s);
+    assert.equal((await list(s)).tasks[0].subagent.run_id, 'offline-run');
+    assert.ok(calls[0].toolCallId.startsWith('rpc-spawn-'));
+    assert.equal(calls[0].params.agent, 'worker');
+    assert.equal(calls[0].params.async, true);
+    await assign(s, 'detach');
+    await assign(s, 'link', { run_id: 'offline-run' });
+    state.asyncJobs.get('offline-run').status = 'complete';
+    await assign(s, 'refresh');
+    assert.equal((await list(s)).tasks[0].status, 'pending');
+    assert.equal((await list(s)).tasks[0].subagent.last_state, 'complete');
+    assert.equal(calls.filter(call => call.params.async === true).length, 1);
+  } finally { bridge.dispose(); }
+});
+
+test('lost spawn reply times out without cancelling work; refresh recovers its durable alias', async t => {
+  const s = setup(); await add(s); const p = subagentProvider(s);
+  let lost;
+  p.hook(req => {
+    if (req.method !== 'spawn') return;
+    lost = req;
+    p.runs.set(`rpc-spawn-${req.requestId}`, { id: 'lost-reply', state: 'complete' });
+    return false;
+  });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const pending = assert.rejects(assign(s), /reply unavailable/);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(lost);
+  t.mock.timers.tick(60_000); await pending;
+  t.mock.timers.reset();
+  assert.equal((await list(s)).tasks[0].status, 'blocked');
+  await assign(s, 'refresh');
+  const task = (await list(s)).tasks[0];
+  assert.equal(task.status, 'pending'); assert.equal(task.subagent.run_id, 'lost-reply');
+  assert.equal(p.requests.filter(req => req.method === 'spawn').length, 1);
+});
+
+test('post-launch append failure retains pre-launch recovery identity and cannot redispatch', async () => {
+  const s = setup(); await add(s); const p = subagentProvider(s);
+  const originalPush = s.branch.push;
+  p.hook(req => {
+    if (req.method === 'spawn') s.branch.push = () => { throw new Error('append after launch failed'); };
+  });
+  await assert.rejects(assign(s), /append after launch failed/);
+  s.branch.push = originalPush;
+  assert.equal((await list(s)).tasks[0].subagent.state, 'launching');
+  await assert.rejects(assign(s), /existing blockers/);
+  await assign(s, 'refresh');
+  assert.equal((await list(s)).tasks[0].subagent.state, 'assigned');
+  assert.equal(p.requests.filter(req => req.method === 'spawn').length, 1);
+});
+
+test('several delegated completions reconcile in independent one-task deltas without a reminder reset', async () => {
+  const s = setup(); const p = subagentProvider(s);
+  await add(s, 'A'); await add(s, 'B');
+  await assign(s); await call(s, 'tasks_assign', { task_id: 2, action: 'launch', agent: 'worker' });
+  assert.equal(settle(s), undefined, 'delegated-only ledger never prompts duplicate work');
+  for (const run of p.runs.values()) run.state = 'complete';
+  await s.handlers.agent_start({}, s.ctx);
+  assert.deepEqual((await list(s)).tasks.map(task => task.status), ['pending', 'pending']);
+  assert.ok(s.branch.filter(entry => entry.customType === 'tasks-delta-v2').every(entry => entry.data.upsert.length <= 1));
+  assert.equal(s.sent.length, 0);
+});
+
+test('user edits summary and criteria atomically without changing IDs/order or starting work', async () => {
+  const s = setup(); await add(s, 'First', { acceptance: 'Old criteria' }); await add(s, 'Second');
+  await call(s, 'tasks_progress', { task_id: 1 });
+  const before = await list(s); const deltas = s.branch.length;
+  s.inputs('  Updated summary  ', 'Updated criteria'); s.select(pickTask(1), 'Edit task');
+  await s.commands.tasks.handler('', s.ctx);
+  const after = await list(s);
+  assert.deepEqual(after.tasks.map(task => task.id), [1, 2]); assert.equal(after.nextId, before.nextId);
+  assert.equal(after.tasks[0].summary, 'Updated summary'); assert.equal(after.tasks[0].acceptance, 'Updated criteria');
+  assert.equal(after.tasks[0].status, 'progress'); assert.deepEqual(after.tasks[1], before.tasks[1]);
+  assert.equal(s.branch.length, deltas + 1, 'one atomic task delta'); assert.equal(s.sent.length, 0);
+  assert.deepEqual(s.editors.slice(-2).map(args => args[1]), ['First', 'Old criteria'], 'both editors are prefilled');
+  assert.match(s.notices.at(-1)[0], /ID and order unchanged/);
+  assert.equal((await list(setup(s.branch))).tasks[0].summary, 'Updated summary');
+  assert.equal(s.tools.tasks_edit, undefined, 'editing remains user-only');
+});
+
+test('user edit cancellation, invalid input and unchanged fields never partially save', async () => {
+  for (const values of [[undefined], [' '], ['x'.repeat(501)], ['New title', undefined], ['New title', ' '], ['New title', 'x'.repeat(1001)], ['Original', 'Criterion']]) {
+    const s = setup(); await add(s, 'Original', { acceptance: 'Criterion' });
+    const before = await list(s), length = s.branch.length;
+    s.inputs(...values); s.select(pickTask(1), 'Edit task'); await s.commands.tasks.handler('', s.ctx);
+    assert.deepEqual(await list(s), before); assert.equal(s.branch.length, length); assert.equal(s.sent.length, 0);
+  }
+});
+
+test('summary-only edits reopen completed tasks only with confirmation and preserve evidence', async () => {
+  const s = setup(); await add(s, 'Old summary', { acceptance: 'Same criteria' }); await complete(s);
+  const original = (await list(s)).tasks[0];
+  s.inputs('New summary', 'Same criteria'); s.confirms(false); s.select(pickTask(1), 'Edit task'); await s.commands.tasks.handler('', s.ctx);
+  assert.deepEqual((await list(s)).tasks[0], original);
+  s.inputs('New summary', 'Same criteria'); s.confirms(true); s.select(pickTask(1), 'Edit task'); await s.commands.tasks.handler('', s.ctx);
+  const task = (await list(s)).tasks[0];
+  assert.equal(task.summary, 'New summary'); assert.equal(task.status, 'pending'); assert.equal(task.acceptance, original.acceptance);
+  assert.equal(task.evidence, original.evidence); assert.equal(task.assessment, undefined); assert.equal(task.completedBy, undefined);
+  assert.equal(s.sent.length, 0);
+});
+
+test('task editing protects both fields from intervening task/session changes and append failures', async () => {
+  for (const boundary of ['summary', 'criteria', 'session', 'save']) {
+    const s = setup(); await add(s, 'Original', { acceptance: 'Criterion' });
+    const before = await list(s); let calls = 0;
+    s.ctx.ui.editor = async () => {
+      calls++;
+      if ((boundary === 'summary' && calls === 1) || (boundary === 'criteria' && calls === 2)) await call(s, 'tasks_block', { task_id: 1, reason: 'Changed during edit' });
+      if (boundary === 'session' && calls === 2) s.handlers.session_tree({}, { ...s.ctx, sessionManager: { ...s.ctx.sessionManager, getBranch: () => [] } });
+      return calls === 1 ? 'New summary' : 'New criteria';
+    };
+    const push = s.branch.push;
+    if (boundary === 'save') s.branch.push = () => { throw new Error('Save failed'); };
+    s.select(pickTask(1), 'Edit task');
+    if (boundary === 'save') await assert.rejects(s.commands.tasks.handler('', s.ctx), /Save failed/);
+    else await s.commands.tasks.handler('', s.ctx);
+    s.branch.push = push;
+    const tasks = (await list(s)).tasks;
+    if (boundary === 'session') assert.equal(tasks.length, 0);
+    else { assert.equal(tasks[0].summary, before.tasks[0].summary); assert.equal(tasks[0].acceptance, before.tasks[0].acceptance); }
+    assert.equal(s.sent.length, 0);
+  }
+});
+
+test('accepted task edit invalidates in-flight assessment but cancelled edit does not', async () => {
+  const s = setup(); await add(s); let resolve;
+  s.judge(() => new Promise(done => { resolve = done; })); const pending = complete(s);
+  s.inputs('Changed summary', undefined); s.select(pickTask(1), 'Edit task'); await s.commands.tasks.handler('', s.ctx);
+  assert.equal(s.requests[0][2].signal.aborted, false);
+  s.inputs('Changed summary', 'Changed criterion'); s.select(pickTask(1), 'Edit task'); await s.commands.tasks.handler('', s.ctx);
+  assert.equal(s.requests[0][2].signal.aborted, true);
+  resolve({ verdict: 'accepted', reason: 'Old result', missing: [] }); await pending;
+  assert.equal((await list(s)).tasks[0].status, 'pending'); assert.equal((await list(s)).tasks[0].summary, 'Changed summary');
+});
+
+test('editing task text preserves manual blockers and detaches stale review/job/subagent tracking without cancellation', async () => {
+  for (const kind of ['manual', 'review', 'job', 'subagent']) {
+    const s = setup(); await add(s);
+    if (kind === 'manual') await call(s, 'tasks_block', { task_id: 1, reason: 'Real prerequisite', waiting_on: 'owner' });
+    if (kind === 'review') await call(s, 'tasks_review', { task_id: 1, reviewer: 'owner', artifact: 'PR', check_at: new Date().toISOString() });
+    if (kind === 'job') {
+      s.events.on('background:lookup-v1', query => { query.available = true; query.job = { id: 'job-1', session_id: 'test-session', unit: 'pi-bg-00000000-0000-0000-0000-000000000000.service', status: 'running', finished_at: null }; });
+      await call(s, 'tasks_block', { task_id: 1, reason: 'Wait for job', background_job_id: 'job-1' });
+    }
+    const provider = kind === 'subagent' ? subagentProvider(s) : undefined;
+    if (provider) await assign(s);
+    s.inputs('Revised task', 'Revised criteria'); s.select(pickTask(1), 'Edit task'); await s.commands.tasks.handler('', s.ctx);
+    const task = (await list(s)).tasks[0];
+    assert.equal(task.status, kind === 'manual' ? 'blocked' : 'pending');
+    assert.equal(task.review, undefined); assert.equal(task.background_job, undefined); assert.equal(task.subagent, undefined);
+    if (kind === 'manual') { assert.equal(task.blocker, 'Real prerequisite'); assert.equal(task.waiting_on, 'owner'); }
+    assert.equal(provider?.requests.some(req => ['stop', 'steer'].includes(req.method)) ?? false, false);
+    assert.equal(s.sent.length, 0);
+  }
+});
+
+test('user edit respects open-task limit when reopening a completed task', async () => {
+  const tasks = Array.from({ length: 20 }, (_, i) => ({ id: i + 1, summary: `Task ${i}`, acceptance: 'Existing', status: 'pending' }));
+  tasks.push({ id: 21, summary: 'Completed', acceptance: 'Existing', status: 'complete', completedBy: 'user' });
+  const s = setup([{ type: 'custom', customType: 'tasks-state-v1', data: { version: 1, nextId: 22, paused: false, tasks } }]);
+  s.inputs('Changed summary', 'Existing'); s.select(pickTask(21), 'Edit task'); await s.commands.tasks.handler('', s.ctx);
+  assert.equal((await list(s)).tasks.at(-1).summary, 'Completed'); assert.equal((await list(s)).tasks.at(-1).status, 'complete');
+  assert.match(s.notices.at(-1)[0], /At most 20 open tasks/);
+});
+
+test('persisted new blockers ring once, not edits, restores, failed persistence or headless blockers', async () => {
+  await require('./bell-capture.cjs')(async count => {
+    const s = setup();
+    await call(s, 'tasks_add', { summary: 'Bell test' });
+    assert.equal(count(), 0);
+    await call(s, 'tasks_block', { task_id: 1, reason: 'Missing input' });
+    assert.equal(count(), 1);
+    await call(s, 'tasks_block', { task_id: 1, reason: 'Updated reason' });
+    s.handlers.session_tree({}, s.ctx);
+    assert.equal(count(), 1);
+    await call(s, 'tasks_unblock', { task_id: 1 });
+    await call(s, 'tasks_review', { task_id: 1, reviewer: 'reviewer', artifact: 'ready PR', check_at: '2030-01-01T00:00:00Z' });
+    assert.equal(count(), 2);
+    for (const mode of ['rpc', 'json', 'print']) {
+      s.ctx.mode = mode;
+      await call(s, 'tasks_unblock', { task_id: 1 });
+      await call(s, 'tasks_block', { task_id: 1, reason: mode });
+    }
+    assert.equal(count(), 2);
+    s.ctx.mode = 'tui';
+    await call(s, 'tasks_unblock', { task_id: 1 });
+    s.branch.push = () => { throw Error('persistence failed'); };
+    await assert.rejects(call(s, 'tasks_block', { task_id: 1, reason: 'not saved' }), /persistence failed/);
+    assert.equal(count(), 2);
+    s.handlers.session_shutdown({}, s.ctx);
+  });
 });

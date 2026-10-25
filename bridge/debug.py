@@ -52,7 +52,7 @@ async def debug_status(runtime: BridgeRuntime, key: SessionKey) -> str:
     mode = getattr(scope, "mode", None) if scope is not None else None
     mode_status = ""
     if scope is not None and mode is not None:
-        label = mode_label(mode) if mode else "unconfirmed — select a mode before continuing"
+        label = mode_label(mode)
         selection = getattr(runtime, "modes", {}).get(mode)
         model = f" · {selection.provider}/{selection.model}" if selection else ""
         pending = " (next wake)" if scope.client is None else ""

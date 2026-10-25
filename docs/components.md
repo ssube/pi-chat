@@ -4,6 +4,8 @@
 | --- | --- |
 | `extensions/short-context-models.ts` | Opt-in half-context aliases for user-selected local models; see [setup and limits](short-context-models.md) |
 | `extensions/pi-time.ts` | Clock formats and abortable waits with one adaptive countdown and an explicit expected wake time |
+| `extensions/attention-bell.ts` | TUI/TTY-only meaningful attention bells; see [events and tmux setup](attention-bells.md) |
+| `extensions/bridge-workload-metrics.ts` | RPC-only counts observer; see [metrics and coverage](workload-metrics.md) |
 | `extensions/tasks.ts` | Session task ledger, evidence judging, user menu, list sharing and advisory summary steering; see [tasks](tasks.md) |
 | `extensions/background-jobs.ts` | Stable, opt-in systemd jobs, status, cancellation and completion steering; see [runbook](background-jobs.md) |
 | `extensions/room-lease.ts` | Temporary interactive Matrix inbox, steering, edit coalescing, lease status and release |
@@ -42,3 +44,16 @@ The bridge supports an optional temporary image-description Pi session when `ima
 Bridge member discovery returns canonical mention targets and aliases through the existing history capability, including bounded pagination. Missing or incomplete membership is not proof of absence. Outgoing ambiguous or unknown mentions are refused with feedback; broadcast pings require an explicit enabled-room/channel allowlist.
 
 Matrix and Discord expose working/terminal turn indicators and retained progress summaries. The bridge's progress summarizer uses the configured provider/model in a temporary tool-free session with bounded recent public conversation/progress text. It excludes private identity files and tool arguments/results. Periodic summary inference can incur provider costs when the bridge is run; no paid inference is used by offline tests.
+
+Turn indicators are single-flight per physical Matrix room or Discord channel,
+with at most two concurrent emits per transport. Validated Matrix limiter replies
+persist a transport-wide deferral (bounded to 30 seconds on reload); unrelated
+rooms proceed only while that transport is not limited. Request acknowledgments
+retain their separate retry budget. Shutdown drains indicators for up to ten
+seconds before bounded adapter shutdown; retained intents survive replacement.
+
+Quoted Matrix/Discord reply context is preserved without treating authored quotes
+as reply fallbacks. A rejected provider sign-in produces an actionable generic
+notice without retaining its diagnostic text. An authoritative pass marker still
+suppresses a duplicate final after a chat-tool reply, including preserved tool
+narration; new direct requests retain their own reply opportunity.

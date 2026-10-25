@@ -7,7 +7,8 @@ from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
-_RESERVED = {"debug", "stop", "cancel", "recover", "mode"}
+_RESERVED = {"debug", "stop", "cancel", "recover", "mode",
+             "bridge_debug", "bridge_stop", "bridge_cancel", "bridge_recover"}
 _NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 
 
@@ -45,7 +46,7 @@ def mode_label(name: str) -> str:
 
 def mode_command(text: str, names: Collection[str]) -> tuple[str, str] | None:
     """Only a leading command controls mode; quoted/prose mentions never do."""
-    match = re.fullmatch(r"\s*!([a-z][a-z0-9_-]{0,31})(?:\s+([\s\S]*))?", text, re.IGNORECASE)
+    match = re.fullmatch(r"\s*[!/]([a-z][a-z0-9_-]{0,31})(?:\s+([\s\S]*))?", text, re.IGNORECASE)
     if match is None:
         return None
     name = match[1].lower()

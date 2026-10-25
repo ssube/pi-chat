@@ -18,11 +18,11 @@ Add an optional map to a private bridge profile using provider/model IDs already
 
 The names/models are examples, not supplied credentials or availability guarantees. Without `modes`, `fast` uses the profile's existing **provider and model**. This portable default differs from the upstream provider-specific fallback. `default_mode` defaults to `fast` and must name a configured entry. Names are lowercase, start with a letter, and contain up to 32 letters, digits, underscores or hyphens. `debug`, `stop`, `cancel`, `recover`, and `mode` are reserved. Each entry accepts exactly `provider` and `model`.
 
-On Matrix or Discord, send `!smart request text`, `!fast request text`, or another configured name. The selection happens before the attached request; the token is removed from the prompt. Bare `!smart` switches without inference. Sleeping mention-only rooms/channels require addressing the agent; ordinary admission rules still apply. Peer metadata, bots and webhook notifications cannot select modes. Quoted/prose tokens are not commands.
+On Matrix or Discord, send `!smart request text`, `/smart request text`, `!fast request text`, or another configured name. The selection happens before the attached request; the token is removed from the prompt. Bare `!smart` switches without inference. Sleeping mention-only rooms/channels require addressing the agent; ordinary admission rules still apply. Admitted peer agents and Discord bots can use mode commands under the same addressing and requester-ownership rules as humans; webhook notifications cannot select modes. Leading addresses/invitations to another recipient prevent execution here; incidental mentions in arguments or reply annotations do not. Quoted/prose tokens are not commands.
 
 Modes are scoped to the room/channel/thread, not the whole bridge. Live switches preserve the Pi process/session/epoch and use `set_model`; busy turns refuse switching without replaying or aborting work. Pending switches are bounded and remain interruptible by existing stop/cancel controls. Automatic in-session compaction preserves mode. Closing for sleep, explicit stop/recovery, or bridge restart resets it to the default. A selection made while already sleeping applies on the next wake.
 
-Auxiliary image, status and progress clients keep the profile's existing provider/model settings. Credentials and environment allowlists are unchanged. There is no automatic escalation or fallback. An unavailable model fails safely; an uncertain live switch requires a successful explicit selection or stop before new direct prompts. `!debug` shows recorded selection and available names without waking Pi. Switching providers may resend context, change context limits, and incur different inference charges. Existing provider, disclosure and spending authorization is required.
+Auxiliary image, status and progress clients keep the profile's existing provider/model settings. Credentials and environment allowlists are unchanged. There is no automatic escalation or provider fallback. Failed startup or model selection retires the uncertain client and resets to the configured default. The next ordinary request tries that default on a fresh client before prompting; it never replays the failed request. Epochs identify creation attempts, including failed starts. `!debug` shows recorded selection and available names without waking Pi. Switching providers may resend context, change context limits, and incur different inference charges. Existing provider, disclosure and spending authorization is required.
 
 ## Discord reconnect recovery
 
@@ -34,6 +34,18 @@ Matrix uses its existing sync/history behavior; Discord's gap reconstruction is 
 
 ## Profile reload (operator reference)
 
-`SIGHUP` re-reads `AGENT_BRIDGE_PROFILE`, then checkpoints idle conversations without interrupting active turns. Supported routing, model/mode, image, identity and child-environment settings apply to subsequent work. A resident turn keeps its process/selection until checkpoint; removed modes require an explicit selection before new work.
+`SIGHUP` re-reads `AGENT_BRIDGE_PROFILE`, then checkpoints idle conversations without interrupting active turns. Supported routing, model/mode, image, identity and child-environment settings apply to subsequent work. A resident turn keeps its process/selection until checkpoint. Removed modes recover to the configured default on the next request; replacing a prepared client preserves saved summaries and refreshes recent chat context.
 
 Already-open transport identities, credentials, homeserver/guild, working/state directories, Pi executable/agent directory, review runner configuration and enabling/disabling the review queue require a restart. One restart-required change rejects the entire reload; invalid profiles also keep the running configuration. The idle checkpoint still runs after a refused reload. A successful reload is not a service restart or new spending authorization.
+
+## Native text controls and ownership
+
+Both bang and slash-text forms work for `debug`, `stop`, `cancel` and `recover`.
+`/bridge_debug`, `/bridge_stop`, `/bridge_cancel` and `/bridge_recover` are text
+aliases for the corresponding Discord application controls. Debug/stop require
+addressing the agent (including an admitted peer invitation); bare mode/cancel/
+recover commands follow normal awake/wake-on-any admission. Active-turn protection
+and requester ownership apply equally to humans and peers. A mode-only switch
+does not take the previous requester's stop/cancel ownership. Native application
+interaction dispatch has no bot-specific gate, but actual bot-generated Discord
+application interactions have not been live-tested.

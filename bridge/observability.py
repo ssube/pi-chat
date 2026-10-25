@@ -60,7 +60,12 @@ def record_bridge_failure(outbox: Path, key: SessionKey, error: PiRpcError,
     kind = "provider" if is_provider else "session"
     error_class = type(error).__name__
     status = error.status if isinstance(error, PiProviderError) else None
+    auth_failure = error.auth if isinstance(error, PiProviderError) else None
     summary = f"{error_class} HTTP {status}" if status is not None else error_class
+    if auth_failure:
+        # The cause, not the provider's diagnostic text: a dead sign-in is
+        # actionable and groups separately from an ordinary provider error.
+        summary = f"{summary} (provider sign-in rejected)"
     # The scope is hashed by SessionKey. Raw room/thread IDs do not enter the
     # outbox or detail file. Request and Matrix event IDs are kept only in the
     # owner-private detail file for correlation.
@@ -73,6 +78,7 @@ def record_bridge_failure(outbox: Path, key: SessionKey, error: PiRpcError,
         "phase": phase,
         "error_class": error_class,
         "provider_http_status": status,
+        "provider_auth_failure": auth_failure,
         "idle_timeout_seconds": error.idle_seconds if isinstance(error, PiRpcTimeout) else None,
         "scope_hash": key.scope_hash,
         "session_epoch": epoch,
@@ -86,6 +92,8 @@ def record_bridge_failure(outbox: Path, key: SessionKey, error: PiRpcError,
     signature = f"{kind}:{phase}:{error_class}"
     if status is not None:
         signature += f":http-{status}"
+    if auth_failure:
+        signature += ":auth"
     entry = {
         "id": occurrence_id,
         "agent": key.agent,
