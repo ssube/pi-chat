@@ -1,0 +1,18 @@
+{
+  "agent": "example_agent",
+  "work_dir": "/workspace",
+  "state_dir": "/state/bridge",
+  "pi_executable": "/usr/local/bin/pi",
+  "pi_agent_dir": "/state/pi",
+  "provider": "configured-provider",
+  "model": "configured-model",
+  "pi_pass_env": [],
+  "pi_extra_args": ["--offline", "--no-extensions", "--no-skills", "--no-context-files"],
+  "matrix": {
+    "homeserver": "https://matrix.example.invalid",
+    "user_id": "@example_agent:example.invalid",
+    "token_env": "MATRIX_TOKEN",
+    "rooms": ["!conversation:example.invalid"],
+    "wake_on_any_room_ids": []
+  }
+}

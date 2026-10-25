@@ -64,3 +64,19 @@ Background jobs are included as a stable, opt-in systemd backend; read [the runb
 This refresh adds profile reloading, conversation modes and bounded Discord reconnect recovery, the session task ledger and advisory sharing, standalone session HTML export, and background-job capacity/history bounds. Portable profiles retain explicit configurable providers instead of an upstream provider default. Optional session export uses only synthetic fixtures; no real transcripts or generated exports are included.
 
 The task extension snapshot includes agent unblocking, an explicit colored progress state, and a one-task progress limit enforced by both tools and menu. Existing over-limit snapshots are preserved and can drain. This follow-up adds stale-reminder filtering, status-priority widget display, popup-scoped menu shortcuts, criteria editing and preview options. It also updates the timer countdown and background-job manager-less CI refusal coverage. Background-job runtime behavior and its safety/privacy limits are unchanged.
+
+## Approved public runtime variant — 2026-10-25
+
+The root `Dockerfile` and `runtime/` are a new minimal public implementation,
+informed by the reviewed runtime `v0.4.0` design, not an exact export of its
+image or service orchestration. Only public digest-pinned bases and package
+sources are used. Pi is pinned to the public repository's existing `0.99.1`
+SDK baseline, rather than silently upgrading the extension API. Python
+Playwright is included without browsers; Chroma and Redis remain excluded.
+
+Private browser-seed layers, roles, registry/deployment configuration, startup
+hooks, SSH server, sudo and owner workspaces are not imported. Supervisor owns
+the bridge and the bridge owns Pi RPC children. Generic examples require
+explicit runtime credentials and selected providers; no live service is
+installed or deployed, and no image is pushed to a registry by the test suite.
+The systemd background-job extension remains unsupported in this container.

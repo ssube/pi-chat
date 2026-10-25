@@ -1,0 +1,25 @@
+# Default-deny build context. Never send Git, private state or host configuration.
+**
+!Dockerfile
+!LICENSE
+!runtime/
+!runtime/**
+!bridge/
+!bridge/**
+!tools/
+!tools/**
+!skills/
+!skills/**
+!extensions/
+!extensions/**
+**/node_modules
+**/__pycache__
+**/.venv
+**/.env
+**/.env.*
+**/auth.json
+**/identity.json
+**/*.log
+**/*.sock
+**/*.sqlite3
+**/*.pyc

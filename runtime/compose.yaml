@@ -1,0 +1,33 @@
+services:
+  bridge:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: pi-chat-runtime:local
+    user: "${PI_CHAT_UID:-1000}:${PI_CHAT_GID:-1000}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,mode=1777
+    env_file:
+      - ${PI_CHAT_ENV_FILE:?set an absolute private environment-file path}
+    volumes:
+      - type: bind
+        source: ${PI_CHAT_PROFILE:?set an absolute private profile path}
+        target: /config/profile.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PI_CHAT_STATE:?set an absolute private state directory}
+        target: /state
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PI_CHAT_WORKSPACE:?set an absolute workspace directory}
+        target: /workspace
+        bind:
+          create_host_path: false
+    stop_grace_period: 60s
+    restart: "no"

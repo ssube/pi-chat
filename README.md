@@ -17,12 +17,15 @@ Read [attention, awareness, and continuity](docs/attention.md) for the mechanism
 | [`extensions/`](extensions/README.md) | Extension inventory and interactive/headless context guide: inbox, labels, shell suggestions, questions, web tools, clock, background jobs, capture and model aliases |
 | `tools/` | Canonical Matrix operations, messaging, history, reactions, activity/session clients, ledger and fix tooling |
 | [`skills/`](skills/README.md) | Agent-facing messaging, reviews and ledger guidance, plus portable environment diagnostics and tmux pane control |
+| [`runtime/`](runtime/README.md) | Public non-root Pi/bridge container, Supervisor, Python Playwright client and Compose setup |
 | `tests/` | Synthetic fixtures and offline behavior tests |
 | `examples/` | Placeholder configuration only |
 
 The bridge runs on Linux with Python 3.11+ and a compatible Pi executable. Extension tests use Node 24 and Bun. Pi must expose the extension hooks and RPC events described in the installation guide. No model, provider endpoint, contact, deployment, or credentials are configured for you.
 
 ## Latest features
+
+- Optional [Pi/bridge runtime container](runtime/README.md), managed by Supervisor, with the Python Playwright client but no browser or database services.
 
 - Optional [environment-doctor and tmux skills](skills/README.md) for local diagnostics and controlled pane interaction.
 - Task file/URL evidence and opt-in recent-context judging, linked questions/reviews, optional subagent/job tracking, editing and confirmed pruning.
@@ -59,6 +62,10 @@ python tools/audit_export.py
 Skill tests use Python's standard library. Install tmux to exercise the isolated-server
 pane tests; without it those live cases skip. The existing top-level unittest
 discovery also runs both bundled skill suites; CI uses its runner's tmux package.
+
+Runtime image build/lifecycle tests require Linux Docker; they run through top-level
+unittest discovery when Docker is available, and are required on CI. They use a
+synthetic transport and offline Pi providers, never a real model/account.
 
 Background-job tests additionally require a systemd user manager and skip without one; see the [stable backend prerequisites and limits](docs/background-jobs.md).
 
