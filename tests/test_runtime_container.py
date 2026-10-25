@@ -194,6 +194,13 @@ class DockerRuntimeTests(unittest.TestCase):
                     "--mount", f"type=bind,src={root / 'work'},dst=/workspace",
                     "--mount", f"type=bind,src={profile_path},dst=/config/profile.json,readonly",
                     "--mount", f"type=bind,src={ROOT / 'tests'},dst=/fixtures,readonly"]
+            environment = root / "runtime.env"
+            environment.write_text("MATRIX_TOKEN=synthetic-test-only\n")
+            environment.chmod(0o600)
+            with patch.dict(os.environ, {"PI_CHAT_UID": str(os.getuid()), "PI_CHAT_GID": str(os.getgid()),
+                                         "PI_CHAT_PROFILE": str(profile_path), "PI_CHAT_ENV_FILE": str(environment),
+                                         "PI_CHAT_STATE": str(root / "state"), "PI_CHAT_WORKSPACE": str(root / "work")}):
+                self.docker("compose", "-f", str(ROOT / "runtime/compose.yaml"), "config", "--quiet")
             # Fail before starting Supervisor for an overly readable profile.
             profile_path.chmod(0o644)
             refused = self.docker("run", "--rm", *args, self.image, check=False)
@@ -212,6 +219,11 @@ class DockerRuntimeTests(unittest.TestCase):
             self.docker("exec", "-e", "BRIDGE_TEST_PI_CLI=/opt/pi-runtime/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
                         name, "python", "-m", "unittest", "discover", "-s", "/fixtures/bridge",
                         "-p", "test_bridge_real_pi.py", timeout=120)
+            deadline = time.monotonic() + 40
+            while self.docker("inspect", "--format", "{{.State.Health.Status}}", name).stdout.strip() != "healthy":
+                if time.monotonic() >= deadline:
+                    self.fail("Docker did not observe a healthy bridge")
+                time.sleep(2)
             # Pi is alive under bridge ownership, not an independent Supervisor program.
             result = self.docker("exec", name, "python", "-c",
                                  "from pathlib import Path; "
