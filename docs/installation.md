@@ -50,3 +50,29 @@ For counts-only bridge observability, explicitly load
 `extensions/bridge-workload-metrics.ts` in bridge/RPC Pi's private extension
 configuration; see [source coverage and Prometheus setup](workload-metrics.md).
 Neither component is installed or enabled by merging this repository.
+
+## Portable support skills
+
+Load only the skills you want; adding their source does not install them:
+
+```sh
+pi --skill ./skills/environment-doctor --skill ./skills/tmux
+```
+
+Both use Python 3.10+ and its standard library; the repository's bridge still
+requires Python 3.11+. They are verified on Linux, not Windows. Doctor's bounded
+subprocess handling requires POSIX process groups/selectors; tmux requires an
+existing tmux binary and access to the intended socket. Other POSIX systems have
+not been tested.
+
+[Environment doctor](../skills/environment-doctor/SKILL.md) inventories trusted
+local tools, Python modules and skill discovery. Its optional cron adapter needs
+a separately supplied helper (not bundled); it never installs one. Service checks
+require explicit harmless readiness URLs. Exit 0 can include unknown/missing
+coverage, and output can contain private local paths and names: review it before
+sharing. It is not a sandbox for hostile executables or imported packages.
+
+[Tmux](../skills/tmux/SKILL.md) lists/reads panes and inserts one literal line,
+with Enter by default. Read first, target an exact pane ID, and retain the same
+server selector. Sending is not proof of execution or completion. The advanced
+agent-pane reference is manual guidance, not an automatic state classifier.

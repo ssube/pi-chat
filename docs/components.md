@@ -24,6 +24,8 @@ Topic labels require `PI_TOPIC_PROVIDER` and `PI_TOPIC_MODEL`. Without both, the
 
 | Tool | Usage |
 | --- | --- |
+| Environment inventory | `python skills/environment-doctor/scripts/doctor.py --help`; see [skill and limits](../skills/environment-doctor/SKILL.md) |
+| Tmux panes | `python skills/tmux/scripts/tmux_control.py --help`; see [skill and guards](../skills/tmux/SKILL.md) |
 | Canonical Matrix operations | `python tools/matrix.py --help`; see [setup](matrix.md) |
 | Member discovery | `python -m bridge.members_cli --help` inside a scoped bridge session |
 | Standalone sender | `python tools/message_agent.py --help` |
