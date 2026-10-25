@@ -224,11 +224,33 @@ class DockerRuntimeTests(unittest.TestCase):
                 if time.monotonic() >= deadline:
                     self.fail("Docker did not observe a healthy bridge")
                 time.sleep(2)
-            # Pi is alive under bridge ownership, not an independent Supervisor program.
-            result = self.docker("exec", name, "python", "-c",
-                                 "from pathlib import Path; "
-                                 "cmds=[p.read_bytes() for p in Path('/proc').glob('[0-9]*/cmdline') if p.exists()]; "
-                                 "assert any(b'--mode\\x00rpc\\x00' in c for c in cmds)")
+            # Pi rewrites its process title, so inspect ancestry, not argv text.
+            bridge_pid = self.docker("exec", name, "supervisorctl", "-c",
+                                     "/opt/pi-chat/runtime/supervisord.conf", "pid", "bridge").stdout.strip()
+            self.docker("exec", name, "python", "-c", """
+import sys
+from pathlib import Path
+bridge = int(sys.argv[1])
+def parent(pid):
+    try:
+        status = (Path('/proc') / str(pid) / 'status').read_text()
+        return int(next(line.split()[1] for line in status.splitlines() if line.startswith('PPid:')))
+    except (OSError, StopIteration):
+        return 0
+owned = []
+for process in Path('/proc').glob('[0-9]*'):
+    try:
+        if (process / 'exe').resolve(strict=True) != Path('/usr/local/bin/node'):
+            continue
+    except OSError:
+        continue
+    ancestor = parent(int(process.name))
+    while ancestor not in (0, bridge):
+        ancestor = parent(ancestor)
+    if ancestor == bridge:
+        owned.append(int(process.name))
+assert owned, 'No live Pi process owned by the supervised bridge'
+""", bridge_pid)
             self.docker("stop", "--time", "60", name, timeout=75)
             status = json.loads(self.docker("inspect", name).stdout)[0]["State"]
             self.assertFalse(status["Running"])
