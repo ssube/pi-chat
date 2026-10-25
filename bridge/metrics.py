@@ -11,6 +11,8 @@ from typing import Any
 from bridge.runtime.session import BridgeRuntime
 from bridge.telemetry import Telemetry
 from bridge.metric_labels import label_value
+from bridge.runtime.state import _STATUSES
+from bridge.workload import SOURCES, TASK_STATES, SUBAGENT_FIELDS
 
 
 log = logging.getLogger("agent_bridge.metrics")
@@ -58,7 +60,78 @@ def render_metrics(agent: str, summary: dict[str, object], timestamp: float,
         "# TYPE agent_bridge_last_push_timestamp_seconds gauge",
         f"agent_bridge_last_push_timestamp_seconds{{agent=\"{agent_label}\"}} {timestamp!r}",
     ]
+    # Session lifecycle is bridge-owned and independent of the Pi observer.
+    breakdown = summary.get("state_breakdown", {}) if not disconnected else {}
+    breakdown = breakdown if isinstance(breakdown, dict) else {}
+    states = sorted(_STATUSES | {"compacting", "unknown"})
+    session_counts = dict.fromkeys(states, 0)
+    for state, value in breakdown.items():
+        if type(value) is int and value >= 0:
+            session_counts[state if state in session_counts else "unknown"] += value
+    lines += ["# HELP agent_bridge_sessions Loaded bridge conversation scopes by mutually exclusive lifecycle state.",
+              "# TYPE agent_bridge_sessions gauge"]
+    lines += [f'agent_bridge_sessions{{agent="{agent_label}",state="{state}"}} {session_counts[state]}' for state in states]
+    lines += render_workload(agent_label, summary.get("workload"), disconnected=disconnected)
     return "\n".join(lines) + "\n"
+
+
+def render_workload(agent_label: str, workload: object, *, disconnected: bool) -> list[str]:
+    """Omit unavailable totals rather than presenting partial observations as zero."""
+    data = workload if isinstance(workload, dict) and not disconnected else {}
+    coverage = data.get("coverage", {})
+    counts = data.get("counts", {})
+    lines = ["# HELP agent_bridge_workload_resident_sessions Resident bridge-owned Pi sessions; excludes standalone and archived sessions.",
+             "# TYPE agent_bridge_workload_resident_sessions gauge",
+             f'agent_bridge_workload_resident_sessions{{agent="{agent_label}"}} {_count(data.get("resident_sessions"))}',
+             "# HELP agent_bridge_workload_coverage Exclusive source coverage: absent=no frame, stale=older than TTL, unavailable=source cannot report, available=fresh valid counts.",
+             "# TYPE agent_bridge_workload_coverage gauge"]
+    lines += ["# HELP agent_bridge_workload_sources_covered Resident sessions with a fresh available source snapshot.",
+              "# TYPE agent_bridge_workload_sources_covered gauge",
+              "# HELP agent_bridge_workload_sources_resident Resident sessions requiring source coverage.",
+              "# TYPE agent_bridge_workload_sources_resident gauge",
+              "# HELP agent_bridge_workload_coverage_complete Complete fresh coverage for a source; zero on disconnect or absent bridge observation.",
+              "# TYPE agent_bridge_workload_coverage_complete gauge"]
+    for source in SOURCES:
+        observed = coverage.get(source, {})
+        covered = _count(observed.get("available"))
+        resident = _count(data.get("resident_sessions"))
+        complete = int(bool(data) and covered == resident)
+        lines += [f'agent_bridge_workload_sources_covered{{agent="{agent_label}",source="{source}"}} {covered}',
+                  f'agent_bridge_workload_sources_resident{{agent="{agent_label}",source="{source}"}} {resident}',
+                  f'agent_bridge_workload_coverage_complete{{agent="{agent_label}",source="{source}"}} {complete}']
+        for status in ("available", "absent", "unavailable", "stale"):
+            lines.append(f'agent_bridge_workload_coverage{{agent="{agent_label}",source="{source}",status="{status}"}} {_count(observed.get(status))}')
+    lines += ["# HELP agent_bridge_workload_oldest_age_seconds Oldest resident counts-frame receipt age; not a source event timestamp.",
+              "# TYPE agent_bridge_workload_oldest_age_seconds gauge"]
+    age = data.get("oldest_age_seconds")
+    if isinstance(age, (int, float)):
+        lines.append(f'agent_bridge_workload_oldest_age_seconds{{agent="{agent_label}"}} {age}')
+    lines += ["# HELP agent_bridge_tasks Tasks by effective state across all resident bridge-owned Pi sessions; omitted without complete fresh coverage.",
+              "# TYPE agent_bridge_tasks gauge"]
+    tasks = counts.get("tasks")
+    if isinstance(tasks, dict):
+        lines += [f'agent_bridge_tasks{{agent="{agent_label}",state="{state}"}} {_count(tasks.get(state))}' for state in TASK_STATES]
+    subagents = counts.get("subagents")
+    descriptions = {
+        "active": "Native delegated work outstanding, including pending entries and workflow controllers; NOT running processes or capacity utilization.",
+        "capacity_used": "Native top-level async slots used across resident Pi sessions; excludes foreground and nested capacity.",
+        "capacity_limit": "Native top-level async slot limits summed across resident Pi sessions; NOT total child concurrency.",
+    }
+    for field in SUBAGENT_FIELDS:
+        name = f"agent_bridge_subagents_{field}"
+        lines += [f"# HELP {name} {descriptions[field]} Omitted without complete fresh coverage.", f"# TYPE {name} gauge"]
+        if isinstance(subagents, dict):
+            lines.append(f'{name}{{agent="{agent_label}"}} {_count(subagents.get(field))}')
+    return lines
+
+
+def compose_metrics(agent: str, summary: dict[str, object], timestamp: float,
+                    telemetry: object = None, *, disconnected: bool = False) -> str:
+    """One complete group composer for periodic and final replacement PUTs."""
+    body = render_metrics(agent, summary, timestamp, disconnected=disconnected)
+    if isinstance(telemetry, Telemetry):
+        body += telemetry.render(agent, disconnected=disconnected)
+    return body
 
 
 class MetricsService:
@@ -90,10 +163,7 @@ class MetricsService:
 
     async def refresh(self) -> None:
         summary = await self.runtime.session_summary()
-        body = render_metrics(self.agent, summary, self.now())
-        telemetry = getattr(self.runtime, "telemetry", None)
-        if isinstance(telemetry, Telemetry):
-            body += telemetry.render(self.agent)
+        body = compose_metrics(self.agent, summary, self.now(), getattr(self.runtime, "telemetry", None))
         await self._push(body)
 
     async def shutdown(self) -> None:
@@ -109,10 +179,7 @@ class MetricsService:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         try:
-            body = render_metrics(self.agent, {}, self.now(), disconnected=True)
-            telemetry = getattr(self.runtime, "telemetry", None)
-            if isinstance(telemetry, Telemetry):
-                body += telemetry.render(self.agent, disconnected=True)
+            body = compose_metrics(self.agent, {}, self.now(), getattr(self.runtime, "telemetry", None), disconnected=True)
             await self._push(body)
         except Exception:
             log.warning("Could not push final disconnected metrics for %s",

@@ -13,6 +13,7 @@ from bridge.adapters.matrix import (MATRIX_ACK_ATTEMPTS, MATRIX_ACK_RETRY_BUDGET
 from bridge.config import MatrixSettings
 from bridge.runtime.session import BridgeRuntime, Incoming, StopRequested
 from bridge.runtime.state import SessionKey
+from bridge.turn_status import Deferred, Indicator
 from test_bridge_awareness import FakePi
 
 
@@ -99,6 +100,44 @@ class MatrixDeliveryRetryTests(unittest.IsolatedAsyncioTestCase):
                         await adapter._request(method, "/test", data={"body": "once"})
                     sleep.assert_not_awaited()
                 self.assertEqual(len(calls), 1)
+
+    async def test_turn_status_defers_only_validated_limiter_before_retry_sleep(self):
+        target = {"event_id": "$first", "type": "m.room.message", "sender": "@human:example.test",
+                  "content": {"msgtype": "m.text", "body": "hello"}}
+        for stage in ("GET", "PUT"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
+                limited = Response(429, {"errcode": "M_LIMIT_EXCEEDED", "retry_after_ms": 5000})
+                responses = ([Response(200, target)] if stage == "PUT" else []) + [limited]
+                calls = []
+
+                def request(method, url, **kwargs):
+                    calls.append((method, url))
+                    return responses.pop(0)
+
+                adapter = self.adapter(directory, request)
+                key = SessionKey("agent_one", "matrix", "!room:example.test:main")
+                record = Indicator(key, "$first", 1)
+                with patch("bridge.adapters.matrix.asyncio.sleep", new_callable=AsyncMock) as sleep:
+                    result = await adapter.turn_status(record, "running")
+                    sleep.assert_not_awaited()
+                self.assertEqual(result, Deferred("matrix", 5.0))
+                self.assertTrue(limited.closed)
+                self.assertEqual(len(calls), 1 if stage == "GET" else 2)
+
+        with tempfile.TemporaryDirectory() as directory:
+            calls = []
+
+            def unavailable(*args, **kwargs):
+                calls.append(args)
+                return Response(429, {"errcode": "M_UNKNOWN", "error": "Server is unavailable"})
+
+            adapter = self.adapter(directory, unavailable)
+            record = Indicator(SessionKey("agent_one", "matrix", "!room:example.test:main"), "$first", 1)
+            with patch("bridge.adapters.matrix.asyncio.sleep", new_callable=AsyncMock) as sleep:
+                with self.assertRaisesRegex(RuntimeError, "HTTP 429"):
+                    await adapter.turn_status(record, "running")
+                self.assertEqual(sleep.await_count, MATRIX_MAX_ATTEMPTS - 1)
+            self.assertEqual(len(calls), MATRIX_MAX_ATTEMPTS)
 
     async def test_server_failure_retry_budget_and_delay_are_bounded(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -24,7 +24,7 @@ from bridge.modes import ModeSwitchError, mode_command
 from bridge.activity import Activity, Presence
 from bridge.filtering import SILENT_KINDS, metadata_rejection
 from bridge.telemetry import Telemetry
-from bridge.turn_status import Indicator, TURN_EMOJI, TurnStatus
+from bridge.turn_status import Deferred, Indicator, MAX_TRANSPORT_RETRY_SECONDS, TURN_EMOJI, TurnStatus
 from bridge.progress import sealed_progress
 from bridge.history_service import HistoryPage, HistoryMessage
 from bridge.mentions import (BROADCAST_REJECTION, Member, Roster, find_mentions, has_broadcast_ping,
@@ -62,7 +62,7 @@ MATRIX_ACK_ATTEMPTS = 8
 # validated limiter 429 may use the extra attempts; a 5xx backend keeps the
 # default budget.
 MATRIX_ACK_RETRY_BUDGET_SECONDS = 60.0
-MATRIX_MAX_RETRY_SECONDS = 30.0
+MATRIX_MAX_RETRY_SECONDS = MAX_TRANSPORT_RETRY_SECONDS
 # A cancel or emergency stop queues on the scope lock the acknowledgement holds
 # across its retries, so the acknowledgement's backoff wait is polled at this
 # interval: the stop takes the lock instead of waiting out a 30s server hint.
@@ -74,6 +74,9 @@ MATRIX_STOP_POLL_SECONDS = 0.25
 ROSTER_TTL_SECONDS = 60.0
 
 
+class _IndicatorLimiterDeferred(Exception):
+    def __init__(self, retry_after: float) -> None:
+        self.retry_after = retry_after
 
 
 def _now() -> float:
@@ -190,6 +193,34 @@ def matrix_scope(room_id: str, event: dict[str, Any]) -> str:
     return f"{room_id}:main"
 
 
+def _strip_reply_fallback(body: str) -> str:
+    """Remove Matrix's plaintext quote, not the newly authored message."""
+    if not re.match(r"^> <@[^\s>]+>(?:[ \t]|$)", body):
+        return body
+    parts = re.split(r"\r?\n\r?\n", body, maxsplit=1)
+    if len(parts) == 2:
+        return parts[1]
+    lines = re.split(r"\r?\n", body, maxsplit=1)
+    return lines[1] if len(lines) == 2 else body
+
+
+def format_reply_context(room_id: str, event: dict[str, Any], text: str,
+                         reply: dict[str, str] | None) -> str:
+    """Match the interactive room-lease envelope; quotes remain room data."""
+    relation = event.get("content", {}).get("m.relates_to", {})
+    target = relation.get("m.in_reply_to", {}) if isinstance(relation, dict) else {}
+    parent_id = target.get("event_id") if isinstance(target, dict) else None
+    if not isinstance(parent_id, str) or not parent_id.startswith("$"):
+        return text
+    if (reply and reply.get("event_id") == parent_id and
+            isinstance(reply.get("sender"), str) and isinstance(reply.get("body"), str)):
+        quote = (f"In reply to Matrix · room {room_id} · sender {reply['sender']} · event {parent_id}:\n" +
+                 "\n".join(f"> {line}" for line in re.split(r"\r?\n", reply["body"][:1600])))
+    else:
+        quote = f"In reply to Matrix · room {room_id} · event {parent_id} (original unavailable)."
+    return f"{quote}\n\nMessage:\n{_strip_reply_fallback(text)}"
+
+
 def explicit_ping(content: dict[str, Any], user_id: str) -> bool:
     """Ignore the automatic mention added by a reply unless the new text pings us."""
     body = content.get("body")
@@ -198,8 +229,8 @@ def explicit_ping(content: dict[str, Any], user_id: str) -> bool:
     relates = content.get("m.relates_to")
     parent = relates.get("m.in_reply_to") if isinstance(relates, dict) else None
     is_reply = isinstance(parent, dict) and isinstance(parent.get("event_id"), str)
-    if is_reply and body.startswith("> "):
-        body = body.split("\n\n", 1)[1] if "\n\n" in body else ""
+    if is_reply:
+        body = _strip_reply_fallback(body)
     if user_id in body:
         return True
     mentions = content.get("m.mentions")
@@ -241,8 +272,14 @@ def addressed_to(event: dict[str, Any], user_id: str, aliases: tuple[str, ...] =
 # them. The same forms exist on Discord (mention prefix) and as Discord slash
 # commands: one command surface across transports.
 BRIDGE_COMMANDS = {
+    "/bridge_debug": "debug",
+    "/bridge_stop": "stop",
+    "/bridge_cancel": "cancel",
+    "/bridge_recover": "recover",
     "!debug": "debug",
+    "/debug": "debug",
     "!stop": "stop",
+    "/stop": "stop",
     "cancel": "cancel",
     "/cancel": "cancel",
     "!cancel": "cancel",
@@ -267,7 +304,7 @@ def addressed_command_body(content: dict[str, Any], user_id: str,
         # m.mentions.user_ids, so the address never reaches the text. Honour the
         # token then, but only when it is the whole message: ordinary prose that
         # merely mentions the agent stays ordinary text.
-        if body.lstrip().startswith("!") or body.strip().lower() in BRIDGE_COMMANDS:
+        if body.lstrip().startswith(("!", "/")) or body.strip().lower() in BRIDGE_COMMANDS:
             return body.strip()
         # Matrix clients may render a structured mention as "Agent_one: !debug"
         # instead of embedding the full ID in the plain-text body. Match the
@@ -476,7 +513,8 @@ class MatrixAdapter:
                        params: dict | None = None, timeout: int = 40,
                        attempts: int = MATRIX_MAX_ATTEMPTS,
                        budget: float | None = None,
-                       stop: Callable[[], bool] | None = None) -> Any:
+                       stop: Callable[[], bool] | None = None,
+                       defer_on_limit: bool = False) -> Any:
         """Send one request, retrying transient failures.
 
         ``attempts`` raises the attempt ceiling for the acknowledgement PUT.
@@ -516,15 +554,17 @@ class MatrixAdapter:
                 if response.status < 400:
                     return await response.json()
                 transient = response.status == 429 or 500 <= response.status < 600
-                if budget is not None and response.status == 429:
-                    # The 429 body is what says whether this is a limiter breach,
-                    # so it is read before the ceiling is chosen, not after.
+                if response.status == 429 and (budget is not None or defer_on_limit):
+                    # The body distinguishes the homeserver limiter from an
+                    # unavailable front door before choosing retry or deferral.
                     payload = await _json_or_none(response)
                     body_read = True
                 else:
                     # Every other response has its body read only if it is going to
                     # be retried or logged.
                     body_read = False
+                if defer_on_limit and response.status == 429 and _is_limiter_429(payload, response.headers):
+                    raise _IndicatorLimiterDeferred(_retry_delay(payload, response.headers, attempt))
                 # A budgeted request spends its deeper attempt budget on a
                 # validated limiter signal only: a bare 429 (the front door
                 # answering while the backend is down) and a 5xx backend that
@@ -686,7 +726,7 @@ class MatrixAdapter:
         await self.runtime.record_activity(key)
 
     async def _add_reaction(self, key: SessionKey, message_id: str, emoji: str,
-                            *, namespace: str = "") -> dict[str, Any]:
+                            *, namespace: str = "", defer_on_limit: bool = False) -> dict[str, Any]:
         """React only to an ordinary event in the active configured scope."""
         if key.transport != "matrix" or key.agent != self.agent or not message_id.startswith("$"):
             raise ReactionRejected("matrix_target")
@@ -696,7 +736,8 @@ class MatrixAdapter:
             raise ReactionRejected("matrix_room")
         room = urllib.parse.quote(room_id, safe="")
         event = urllib.parse.quote(message_id, safe="")
-        target = await self._request("GET", f"/_matrix/client/v3/rooms/{room}/event/{event}")
+        target = await self._request("GET", f"/_matrix/client/v3/rooms/{room}/event/{event}",
+                                     defer_on_limit=defer_on_limit)
         if (not isinstance(target, dict) or target.get("event_id") != message_id or
                 target.get("room_id", room_id) != room_id or
                 not _context_event(target) or not _in_scope(target, thread_root)):
@@ -708,10 +749,17 @@ class MatrixAdapter:
         return await self._request(
             "PUT", f"/_matrix/client/v3/rooms/{room}/send/m.reaction/bridge-{transaction}",
             data={"m.relates_to": {"rel_type": "m.annotation",
-                                   "event_id": message_id, "key": emoji}})
+                                   "event_id": message_id, "key": emoji}},
+            defer_on_limit=defer_on_limit)
 
-    async def turn_status(self, record: Indicator, status: TurnStatus) -> str | None:
+    async def turn_status(self, record: Indicator, status: TurnStatus) -> str | None | Deferred:
         """Apply a durable intent without touching Pi reaction/activity accounting."""
+        try:
+            return await self._turn_status(record, status)
+        except _IndicatorLimiterDeferred as limited:
+            return Deferred("matrix", limited.retry_after)
+
+    async def _turn_status(self, record: Indicator, status: TurnStatus) -> str | None:
         key, request_id = record.key, record.request_id
         room_id = key.scope.split(":thread:", 1)[0].removesuffix(":main")
         if (key.agent != self.agent or key.transport != "matrix" or
@@ -722,7 +770,8 @@ class MatrixAdapter:
         if status == "running" or (running_id is None and record.pending_attempted):
             # Same phase transaction recovers a lost acknowledgement after a
             # kill between the server accepting the reaction and local fsync.
-            data = await self._add_reaction(key, request_id, TURN_EMOJI["running"], namespace=namespace)
+            data = await self._add_reaction(key, request_id, TURN_EMOJI["running"], namespace=namespace,
+                                            defer_on_limit=True)
             running_id = data["event_id"]
             if not isinstance(running_id, str) or not running_id.startswith("$"):
                 raise ValueError("invalid turn reaction receipt")
@@ -730,7 +779,8 @@ class MatrixAdapter:
         if status == "running":
             return running_id
         if status != "clear":
-            terminal = await self._add_reaction(key, request_id, TURN_EMOJI[status], namespace=namespace)
+            terminal = await self._add_reaction(key, request_id, TURN_EMOJI[status], namespace=namespace,
+                                                defer_on_limit=True)
             if not isinstance(terminal.get("event_id"), str) or not terminal["event_id"].startswith("$"):
                 raise ValueError("invalid terminal reaction receipt")
         if running_id is not None:
@@ -739,7 +789,7 @@ class MatrixAdapter:
             transaction = hashlib.sha256(running_id.encode()).hexdigest()[:32]
             await self._request(
                 "PUT", f"/_matrix/client/v3/rooms/{room}/redact/{event}/turn-{transaction}",
-                data={"reason": "Bridge turn ended"})
+                data={"reason": "Bridge turn ended"}, defer_on_limit=True)
         return None
 
     async def _image(self, content: dict[str, Any]) -> RpcImage | None:
@@ -772,7 +822,8 @@ class MatrixAdapter:
         quoted = urllib.parse.quote(event_id, safe="")
         import aiohttp
         try:
-            original = await self._request("GET", f"/_matrix/client/v3/rooms/{room}/event/{quoted}")
+            original = await self._request("GET", f"/_matrix/client/v3/rooms/{room}/event/{quoted}",
+                                           timeout=5, attempts=1)
         except (aiohttp.ClientError, json.JSONDecodeError, OSError, RuntimeError, TimeoutError):
             return {"event_id": event_id}  # Reference known; text unavailable.
         if (not isinstance(original, dict) or original.get("event_id") != event_id or
@@ -788,9 +839,8 @@ class MatrixAdapter:
         # Matrix's plaintext reply fallback already quotes an earlier post.
         # Strip it rather than quoting a quote (or walking the reply chain).
         nested = content.get("m.relates_to", {})
-        if (isinstance(nested, dict) and "m.in_reply_to" in nested and
-                body.startswith("> ") and "\n\n" in body):
-            body = body.split("\n\n", 1)[1]
+        if isinstance(nested, dict) and "m.in_reply_to" in nested:
+            body = _strip_reply_fallback(body)
         return {"event_id": event_id, "sender": original["sender"],
                 "body": body[:1600]}
 
@@ -811,6 +861,23 @@ class MatrixAdapter:
         ping = explicit_ping(event["content"], self.settings.user_id)
         return await self.room_leases.forward(room_id, event, attachment, reply_context, ping)
 
+    async def _note_own_message(self, room_id: str, event: dict[str, Any]) -> None:
+        """Tell the runtime the agent spoke for itself in this conversation.
+
+        Exclude bridge output. A remaining
+        own text message is best-effort evidence of a chat-tool reply; sync
+        delivery may still arrive too late to affect this turn's final.
+        """
+        content = event.get("content")
+        if not isinstance(content, dict):
+            return
+        if BRIDGE_META in content:
+            return
+        if not isinstance(content.get("body"), str) or not content["body"].strip():
+            return
+        await self.runtime.record_self_message(
+            SessionKey(self.agent, "matrix", matrix_scope(room_id, event)))
+
     async def _handle_event(self, room_id: str, event: dict[str, Any]) -> None:
         scope = matrix_scope(room_id, event)
         async with self.telemetry.queued(self._input_locks.setdefault(scope, asyncio.Lock()), "matrix",
@@ -818,8 +885,10 @@ class MatrixAdapter:
             await self._deliver_event(room_id, event)
 
     async def _deliver_event(self, room_id: str, event: dict[str, Any]) -> None:
-        if (event.get("type") != "m.room.message" or
-                event.get("sender") == self.settings.user_id):
+        if event.get("type") != "m.room.message":
+            return
+        if event.get("sender") == self.settings.user_id:
+            await self._note_own_message(room_id, event)
             return
         event_id = event.get("event_id")
         if not isinstance(event_id, str) or event_id in self._seen:
@@ -860,6 +929,7 @@ class MatrixAdapter:
         if await self._forward_interactive(room_id, event):
             self._remember(event_id)
             return
+        intentional = False
         if isinstance(meta, dict):
             hop = meta.get("hop")
             invitations = meta.get("invitations", [])
@@ -885,9 +955,14 @@ class MatrixAdapter:
             self._remember(event_id)
             return
         text = str(content.get("body", ""))
+        command_targets = set(leading_agent_mentions(text))
+        if isinstance(meta, dict) and isinstance(meta.get("invitations"), list):
+            command_targets.update(target for target in meta["invitations"] if isinstance(target, str))
+        command_here = not command_targets or self.settings.user_id in command_targets or addressed
         command = (bridge_command(content, self.settings.user_id,
-                                   self.settings.display_name)
-                   if not isinstance(meta, dict) else None)
+                                  self.settings.display_name) if command_here else None)
+        if command is None and command_here and intentional and content.get("msgtype") == "m.text":
+            command = BRIDGE_COMMANDS.get(text.strip().lower())
         # Debug and stop run before admission: they never touch Pi and cannot
         # wake a sleeping session. Cancel and recover wait for admission below,
         # matching the long-standing bare-token behaviour in waking rooms.
@@ -907,7 +982,7 @@ class MatrixAdapter:
                 self._requesters.pop((key, event_id), None)
                 self._remember(event_id)
             return
-        can_wake = addressed or room_id in self.settings.waking_rooms
+        can_wake = addressed or intentional or room_id in self.settings.waking_rooms
         async def compaction_notice() -> None:
             await self.output(key, "compacting", "Compacting, one moment...", event_id)
 
@@ -928,7 +1003,7 @@ class MatrixAdapter:
             self._scope_hops[key] = 0
         text = str(content.get("body", ""))
         sender = str(event.get("sender", ""))
-        if command is None and not isinstance(meta, dict):
+        if command is None and command_here:
             # A bare session token with the address rendered only as the full
             # ID elsewhere in the body (or with no mention at all) still
             # reaches the command path after admission.
@@ -952,7 +1027,7 @@ class MatrixAdapter:
             self._remember(event_id)
             return
         selected_mode = None
-        if (not isinstance(meta, dict) and content.get("msgtype") == "m.text"
+        if (command_here and content.get("msgtype") == "m.text"
                 and sender != self.settings.hookshot_user_id
                 and "uk.half-shot.hookshot.webhook_data" not in content):
             body = addressed_command_body(content, self.settings.user_id, self.settings.display_name)
@@ -973,7 +1048,12 @@ class MatrixAdapter:
                         self._requesters.pop((key, event_id), None)
                         self._remember(event_id)
                     return
-        if not awake_after_admission:
+        reply_context = await self._reply_context(room_id, event)
+        text = format_reply_context(room_id, event, text, reply_context)
+        needs_context = getattr(self.runtime, "needs_context", None)
+        refresh_context = (await needs_context(key) if needs_context is not None
+                           else not awake_after_admission)
+        if refresh_context:
             thread_root = (key.scope.split(":thread:", 1)[1]
                            if ":thread:" in key.scope else None)
             last_id, summary_saved_ms = await self.runtime.last_wake(key)
@@ -1002,7 +1082,6 @@ class MatrixAdapter:
                 async with self.room_leases.lock:
                     if self.room_leases.active(room_id):
                         attachment = images[0].to_json() if images else None
-                        reply_context = await self._reply_context(room_id, event)
                         ping = explicit_ping(content, self.settings.user_id)
                         if await self.room_leases.forward_locked(room_id, event, attachment, reply_context, ping):
                             self._requesters.pop((key, event_id), None)

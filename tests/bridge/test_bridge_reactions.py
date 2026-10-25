@@ -401,5 +401,138 @@ class PassMarkerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(any("[[bridge:pass]]" in text for _, text, _ in outputs))
 
 
+class ToolSentReplyTests(unittest.IsolatedAsyncioTestCase):
+    """A turn that already spoke through a tool narrates rather than replies."""
+
+    class Pi:
+        active = False
+
+        def __init__(self):
+            self.result = "Sent to the room.\n\n- read the note\n- chose a reply\n\n[[bridge:pass]]"
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def prompt(self, prompt, on_event, images=None, *, on_accepted=None):
+            self.active = True
+            self.on_event = on_event
+            if on_accepted:
+                await on_accepted()
+            self.started.set()
+            await self.release.wait()
+            self.active = False
+            return PiRunResult(self.result)
+
+        async def steer(self, prompt, images=None):
+            pass
+
+        async def compact(self):
+            return "summary"
+
+        async def stop(self):
+            pass
+
+    async def test_narration_beside_a_pass_marker_is_not_posted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pi = self.Pi()
+            outputs = []
+
+            async def output(key, kind, text, request_id):
+                outputs.append((kind, text, request_id))
+
+            runtime = BridgeRuntime(Path(directory), lambda key, path: pi, output)
+            key = SessionKey("agent_one", "matrix", "!room:example.test:main")
+            await runtime.submit(key, Incoming("Operator", "$one", "How did it go?"))
+            await pi.started.wait()
+            await runtime.record_self_message(key)
+            pi.release.set()
+            await runtime.wait_idle(key)
+            self.assertIn(("cleanup", "", "$one"), outputs)
+            self.assertFalse(any(kind == "final" for kind, _, _ in outputs))
+            self.assertFalse(any("read the note" in text for _, text, _ in outputs))
+
+    async def test_the_next_turn_still_posts_text_beside_a_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pi = self.Pi()
+            outputs = []
+
+            async def output(key, kind, text, request_id):
+                outputs.append((kind, text, request_id))
+
+            runtime = BridgeRuntime(Path(directory), lambda key, path: pi, output)
+            key = SessionKey("agent_one", "matrix", "!room:example.test:main")
+            await runtime.submit(key, Incoming("Operator", "$one", "How did it go?"))
+            await pi.started.wait()
+            await runtime.record_self_message(key)
+            pi.release.set()
+            await runtime.wait_idle(key)
+
+            pi.started.clear()
+            pi.release.clear()
+            pi.result = "Still on for tonight.\n\n[[bridge:pass]]"
+            await runtime.submit(key, Incoming("Operator", "$two", "Anything else?"))
+            await pi.started.wait()
+            pi.release.set()
+            await runtime.wait_idle(key)
+            self.assertIn(("final", "Still on for tonight.", "$two"), outputs)
+
+    async def test_tool_narration_is_not_revived_after_ambient_steer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pi = self.Pi()
+            outputs = []
+            async def output(key, kind, text, request):
+                outputs.append((kind, text, request))
+            runtime = BridgeRuntime(Path(directory), lambda key, path: pi, output)
+            self.addAsyncCleanup(runtime.close)
+            key = SessionKey("agent_one", "matrix", "!room:example.test:main")
+            await runtime.submit(key, Incoming("Operator", "$direct", "Reply"))
+            await pi.started.wait()
+            await runtime.record_self_message(key)
+            await pi.on_event({"type": "message_end", "message": {
+                "role": "assistant", "content": [{"type": "text", "text": "Sent to room; private narration"}]}})
+            self.assertEqual(await runtime.submit(key, Incoming("peer", "$ambient", "Update", optional=True)), "steered")
+            pi.result = "[[bridge:pass]]"
+            pi.release.set()
+            await runtime.wait_idle(key)
+            self.assertFalse(any(kind == "final" for kind, _, _ in outputs))
+            self.assertIn(("cleanup", "", "$direct"), outputs)
+
+    async def test_new_direct_ping_does_not_inherit_previous_tool_answer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pi = self.Pi()
+            outputs = []
+            async def output(key, kind, text, request):
+                outputs.append((kind, text, request))
+            runtime = BridgeRuntime(Path(directory), lambda key, path: pi, output)
+            self.addAsyncCleanup(runtime.close)
+            key = SessionKey("agent_one", "matrix", "!room:example.test:main")
+            await runtime.submit(key, Incoming("peer", "$ambient", "Update", optional=True))
+            await pi.started.wait()
+            await runtime.record_self_message(key)
+            self.assertEqual(await runtime.submit(key, Incoming("Operator", "$direct", "New question")), "steered")
+            pi.result = "Answer to the new question.\n\n[[bridge:pass]]"
+            pi.release.set()
+            await runtime.wait_idle(key)
+            self.assertTrue(any(kind == "final" and text == "Answer to the new question."
+                                for kind, text, _ in outputs))
+
+    async def test_an_idle_scope_ignores_a_self_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pi = self.Pi()
+            outputs = []
+
+            async def output(key, kind, text, request_id):
+                outputs.append((kind, text, request_id))
+
+            runtime = BridgeRuntime(Path(directory), lambda key, path: pi, output)
+            key = SessionKey("agent_one", "matrix", "!room:example.test:main")
+            await runtime.record_self_message(key)
+            await runtime.submit(key, Incoming("Operator", "$one", "How did it go?"))
+            await pi.started.wait()
+            pi.release.set()
+            await runtime.wait_idle(key)
+            self.assertIn(("final", "Sent to the room.\n\n- read the note\n- chose a reply", "$one"),
+                          outputs)
+
+
 if __name__ == "__main__":
     unittest.main()

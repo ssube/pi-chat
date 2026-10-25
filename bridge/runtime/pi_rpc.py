@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, NotRequired, TypeAlias, TypedDict, cast
 
+from bridge.workload import WorkloadSnapshot
+
 log = logging.getLogger("agent_bridge.pi_rpc")
 
 JsonScalar: TypeAlias = None | bool | int | float | str
@@ -130,11 +132,36 @@ class PiRpcProtocolError(PiRpcError):
     """Pi emitted malformed or unexpected RPC output."""
 
 
+AUTH_FAILURE_MARKERS = (
+    "oauth refresh failed",
+    "invalid_grant",
+    "reconnect chatgpt",
+)
+_PROVIDER_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+
+
+def is_auth_failure(detail: object) -> bool:
+    """Recognise a rejected provider sign-in without keeping its diagnostics.
+
+    Pi reports a dead OAuth credential as a provider error. Only a marker is
+    read from that text; the provider's own message is never retained, logged
+    or posted, because it may contain private account detail.
+    """
+    if not isinstance(detail, str):
+        return False
+    lowered = detail.casefold()
+    return any(marker in lowered for marker in AUTH_FAILURE_MARKERS)
+
+
 class PiProviderError(PiRpcError):
     """The model provider ended a turn with an error instead of a reply."""
 
-    def __init__(self, status: int | None) -> None:
+    def __init__(self, status: int | None, *, provider: str = "", auth: bool = False) -> None:
         self.status = status
+        # Only a configuration identifier crosses this boundary; anything else
+        # the provider message carried stays out of attributes and chat.
+        self.provider = provider if _PROVIDER_ID.fullmatch(provider) else ""
+        self.auth = auth
         detail = f"HTTP {status}" if status is not None else "an error"
         super().__init__(f"Model provider returned {detail}")
 
@@ -290,6 +317,7 @@ class PiRpcClient:
         self._request_number = 0
         self._pending_responses: dict[str, asyncio.Future[RpcResponse]] = {}
         self._active_run: _ActiveRun | None = None
+        self.workload_snapshot = WorkloadSnapshot()
 
     @property
     def running(self) -> bool:
@@ -308,6 +336,7 @@ class PiRpcClient:
         process = self._process
         if process is not None and process.returncode is None:
             return
+        self.workload_snapshot.clear()
         self._stderr_tail.clear()
         self._stderr_lines = 0
         self._stderr_bytes = 0
@@ -336,6 +365,7 @@ class PiRpcClient:
             await self._stop()
 
     async def _stop(self) -> None:
+        self.workload_snapshot.clear()
         process = self._process
         self._process = None
         if process is not None and process.returncode is None:
@@ -369,6 +399,7 @@ class PiRpcClient:
                 await stderr_task
             except asyncio.CancelledError:
                 pass
+        self.workload_snapshot.clear()  # The drained reader cannot repopulate it now.
         self._fail_pending(PiRpcError("Pi RPC process stopped"))
 
     async def prompt(
@@ -714,6 +745,16 @@ class PiRpcClient:
                     if pending is not None and not pending.done():
                         pending.set_result(reply)
                     continue
+                # Observations arrive while idle too, and must never become turn
+                # activity, prompt progress, or transcript content.
+                try:
+                    if self.workload_snapshot.consume(event):
+                        continue
+                except Exception:
+                    # Observer failures are never protocol failures. Do not log
+                    # the frame, fail pending RPCs, or restart an active process.
+                    self.workload_snapshot.clear()
+                    continue
                 active = self._active_run
                 if active is None:
                     log.debug("Ignored Pi event without active prompt: %s", event.get("type"))
@@ -741,7 +782,11 @@ class PiRpcClient:
                         if message.get("stopReason") == "error":
                             error_detail = message.get("errorMessage")
                             match = re.match(r"^(\d{3})(?::|\s|$)", error_detail) if isinstance(error_detail, str) else None
-                            active.provider_error = PiProviderError(int(match.group(1)) if match else None)
+                            provider = message.get("provider")
+                            active.provider_error = PiProviderError(
+                                int(match.group(1)) if match else None,
+                                provider=provider if isinstance(provider, str) else "",
+                                auth=is_auth_failure(error_detail))
                         active.complete_text = assistant_text_from_message(event)
                         active.has_complete_message = True
                 elif (event.get("type") == "agent_settled" or

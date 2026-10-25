@@ -64,6 +64,7 @@ test('Pi SDK: real settlement boundary continues early stops, injects task conte
     assert.equal(requests.length, 4);
     // Invoke the actual slash-command path in headless mode: it must not send inference.
     await session.prompt('/tasks'); assert.equal(requests.length, 4);
+    await session.prompt('/tasks-prune'); assert.equal(requests.length, 4, 'headless prune refuses confirmation without inference');
     await session.prompt('/tasks-send'); await session.waitForIdle();
     const listMessage = manager.getBranch().find(entry => entry.type === 'custom_message' && entry.customType === 'tasks-list');
     assert.ok(listMessage); assert.match(listMessage.content, /- \[ \] #1 Finish the example/);
@@ -88,14 +89,30 @@ test('Pi SDK: real settlement boundary continues early stops, injects task conte
     assert.equal(requests.length, beforeBlock + 2, 'tool call and final answer only; blocked-only work never auto-continues');
     assert.doesNotMatch(JSON.stringify(requests.at(-1)), /Task reminder|Task menu updated pending work|Work on pending/);
     assert.match(JSON.stringify(requests.at(-1)), /No actionable tasks/);
-    assert.equal(manager.getBranch().filter(entry => entry.type === 'custom' && entry.customType === 'tasks-state-v1').at(-1).data.tasks[0].status, 'blocked');
+    const latestTaskDelta = () => manager.getBranch().filter(entry => entry.type === 'custom' &&
+      entry.customType === 'tasks-delta-v2' && entry.data.upsert.some(task => task.id === 1)).at(-1)?.data.upsert[0];
+    assert.equal(latestTaskDelta().status, 'blocked');
     nextTool = { type: 'toolCall', id: 'unblock-tool', name: 'tasks_unblock', arguments: { task_id: 1 } };
     await session.prompt('The prerequisite is resolved; unblock the task.');
-    const resumed = manager.getBranch().filter(entry => entry.type === 'custom' && entry.customType === 'tasks-state-v1').at(-1).data.tasks[0];
+    const resumed = latestTaskDelta();
     assert.equal(resumed.status, 'pending'); assert.equal(resumed.blocker, undefined);
     nextTool = { type: 'toolCall', id: 'progress-tool', name: 'tasks_progress', arguments: { task_id: 1 } };
     await session.prompt('Start working on the task.');
-    assert.equal(manager.getBranch().filter(entry => entry.type === 'custom' && entry.customType === 'tasks-state-v1').at(-1).data.tasks[0].status, 'progress');
+    assert.equal(latestTaskDelta().status, 'progress');
+    runtime.complete = async (_model, context) => {
+      asideRequests.push(context);
+      return { role: 'assistant', content: [{ type: 'text', text: JSON.stringify({ verdict: 'accepted', reason: 'Verified output', missing: [] }) }],
+        stopReason: 'stop' };
+    };
+    nextTool = { type: 'toolCall', id: 'complete-tool', name: 'tasks_complete', arguments: { task_id: 1, evidence: 'Verified output', context_messages: 10 } };
+    await session.prompt('Complete the task using recent session evidence.');
+    assert.equal(latestTaskDelta().status, 'complete');
+    const completionContext = asideRequests.at(-1);
+    assert.equal(completionContext.tools, undefined);
+    const recent = JSON.parse(completionContext.messages[0].content).recent_messages;
+    assert.equal(recent.length, 10);
+    assert.ok(recent.some(message => message.role === 'toolResult' && /tasks_progress/.test(message.text)));
+    assert.ok(recent.some(message => message.role === 'assistant' && /"type":"toolCall"/.test(message.text)));
     assert.deepEqual(errors, []);
   } finally { session.dispose(); }
 });

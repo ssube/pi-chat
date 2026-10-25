@@ -8,7 +8,7 @@ import os
 import secrets
 import signal
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from .adapters.discord import DiscordAdapter
 from .adapters.matrix import MatrixAdapter
@@ -26,10 +26,12 @@ from .room_lease import RoomLeases
 from .runtime.session import BridgeRuntime, PROGRESS_EDIT_INTERVAL
 from .runtime.state import SessionKey
 from .sessions_service import SessionsRequest, SessionsService
-from .turn_status import Indicator, TurnIndicators, TurnStatus
+from .turn_status import Deferred, Indicator, TurnIndicators, TurnStatus
 
 
 log = logging.getLogger("agent_bridge")
+INDICATOR_DRAIN_SECONDS = 10.0  # Below the observed 30s pod/Supervisor stop grace.
+ADAPTER_STOP_SECONDS = 5.0
 
 
 async def run(profile: Profile, profile_path: Path) -> None:
@@ -37,6 +39,7 @@ async def run(profile: Profile, profile_path: Path) -> None:
     history_tokens: dict[SessionKey, str] = {}
     reaction_tokens: dict[SessionKey, str] = {}
     activity_tokens: dict[SessionKey, str] = {}
+    emit_slots = {"matrix": asyncio.Semaphore(2), "discord": asyncio.Semaphore(2)}
 
     async def output(key: SessionKey, kind: str, text: str, request_id: str) -> bool | None:
         adapter = adapters.get(key.transport)
@@ -44,11 +47,21 @@ async def run(profile: Profile, profile_path: Path) -> None:
             raise RuntimeError(f"No {key.transport} adapter for {profile.agent}")
         return await adapter.output(key, kind, text, request_id)
 
-    async def emit_indicator(record: Indicator, status: TurnStatus) -> str | None:
-        adapter = adapters.get(record.key.transport)
-        if adapter is None:
+    async def emit_indicator(record: Indicator, status: TurnStatus) -> str | None | Deferred:
+        transport = record.key.transport
+        adapter = adapters.get(transport)
+        if adapter is None or transport not in emit_slots:
             raise RuntimeError("indicator transport unavailable")
-        return await adapter.turn_status(record, status)
+        kind = cast(Literal["matrix", "discord"], transport)
+        remaining = indicators.transport_not_before.get(transport, 0) - indicators.now()
+        if remaining > 0:
+            return Deferred(kind, remaining)
+        # Do not occupy a permit while waiting for a transport-wide limiter gate.
+        async with emit_slots[transport]:
+            remaining = indicators.transport_not_before.get(transport, 0) - indicators.now()
+            if remaining > 0:
+                return Deferred(kind, remaining)
+            return await adapter.turn_status(record, status)
 
     indicators = TurnIndicators(profile.state_dir / "turn-indicators.json", profile.agent,
                                 emit_indicator, interval=PROGRESS_EDIT_INTERVAL)
@@ -247,6 +260,8 @@ async def run(profile: Profile, profile_path: Path) -> None:
     finally:
         stopping.set()
         health_socket.ready = False
+        indicators.stop_scheduling()
+        await indicators.drain(timeout=INDICATOR_DRAIN_SECONDS)
         indicators.close()
         await sessions_service.close()
         await reaction_service.close()
@@ -257,8 +272,13 @@ async def run(profile: Profile, profile_path: Path) -> None:
         await activity_service.shutdown()
         if metrics_service is not None:
             await metrics_service.shutdown()
-        await asyncio.gather(*(adapter.stop() for adapter in adapters.values()),
-                             return_exceptions=True)
+        async def stop_adapter(adapter: MatrixAdapter | DiscordAdapter) -> None:
+            try:
+                await asyncio.wait_for(adapter.stop(), timeout=ADAPTER_STOP_SECONDS)
+            except Exception:
+                log.exception("Bridge adapter stop failed or exceeded its bounded shutdown budget")
+
+        await asyncio.gather(*(stop_adapter(adapter) for adapter in adapters.values()))
         for task in tasks:
             if not task.done():
                 task.cancel()

@@ -59,6 +59,7 @@ class BridgeFailureWriterTests(unittest.TestCase):
             self.assertEqual(entry["origin"], "bridge_discord")
             self.assertEqual(entry["signature"], "provider:prompt:PiProviderError:http-500")
             self.assertEqual(detail["provider_http_status"], 500)
+            self.assertFalse(detail["provider_auth_failure"])
             self.assertEqual(detail["request_id"], "req-123")
             self.assertEqual(detail["matrix_event_id"], "$event:example.test")
             self.assertNotIn("request_id", entry)
@@ -70,6 +71,23 @@ class BridgeFailureWriterTests(unittest.TestCase):
             for path in (entry_path, detail_path):
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
                 self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
+
+    def test_rejected_sign_in_is_grouped_as_an_auth_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = SessionKey("agent_two", "matrix", "private-room")
+            occurrence = record_bridge_failure(
+                root / "outbox", key,
+                PiProviderError(None, provider="openai", auth=True),
+                epoch=5, phase="prompt")
+            entry = json.loads((root / "outbox" / f"{occurrence}.json").read_text())
+            detail = json.loads(Path(entry["detail_ref"]).read_text())
+            self.assertEqual(entry["signature"], "provider:prompt:PiProviderError:auth")
+            self.assertTrue(detail["provider_auth_failure"])
+            self.assertIsNone(detail["provider_http_status"])
+            # The provider's own diagnostic text never reaches the record.
+            self.assertNotIn("invalid_grant", entry["redacted_summary"])
+            self.assertNotIn("invalid_grant", json.dumps(detail))
 
     def test_untrusted_rpc_error_text_is_not_written(self):
         with tempfile.TemporaryDirectory() as directory:

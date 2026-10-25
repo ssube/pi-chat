@@ -13,8 +13,8 @@ from bridge.adapters.matrix import addressed_command_body
 from bridge.config import Profile
 from bridge.debug import debug_status
 from bridge.modes import ModelSelection, ModeSwitchError, mode_command, mode_label, read_modes
-from bridge.runtime.pi_rpc import PiProviderError, PiRpcError, PiRunResult
-from bridge.runtime.session import BridgeRuntime, Incoming
+from bridge.runtime.pi_rpc import PiProviderError, PiRpcError, PiRunResult, RpcImage
+from bridge.runtime.session import BridgeRuntime, Incoming, StopRequested
 from bridge.runtime.state import SessionKey, read_checkpoint
 from test_bridge_commands import (AGENT_ID, ROOM, discord_adapter, discord_message,
                                   discord_runtime, matrix_adapter, matrix_event, matrix_runtime)
@@ -37,7 +37,8 @@ class ModeConfigTests(unittest.TestCase):
 
     def test_invalid_maps_names_selections_and_defaults(self):
         for value in ([], {}, {"stop": {}}, {"debug": {}}, {"cancel": {}}, {"recover": {}},
-                      {"mode": {}}, {"UPPER": {}}, {"with space": {}}, {"a" * 33: {}},
+                      {"mode": {}}, {"bridge_debug": {}}, {"bridge_stop": {}},
+                      {"bridge_cancel": {}}, {"bridge_recover": {}}, {"UPPER": {}}, {"with space": {}}, {"a" * 33: {}},
                       {"smart": "model"}, {"smart": {"model": "model"}},
                       {"smart": {"provider": "p", "modle": "m"}},
                       {"smart": {"provider": "p", "model": "m", "extra": True}},
@@ -51,9 +52,10 @@ class ModeConfigTests(unittest.TestCase):
 
     def test_prefix_parser_only_matches_leading_configured_modes(self):
         for name in MODES:
-            self.assertEqual(mode_command(f"!{name.upper()} Keep My CASE\nSecond line", MODES),
-                             (name, "Keep My CASE\nSecond line"))
-            self.assertEqual(mode_command(f"!{name}   ", MODES), (name, ""))
+            for prefix in ("!", "/"):
+                self.assertEqual(mode_command(f"{prefix}{name.upper()} Keep My CASE\nSecond line", MODES),
+                                 (name, "Keep My CASE\nSecond line"))
+                self.assertEqual(mode_command(f"{prefix}{name}   ", MODES), (name, ""))
         for text in ("quoted !smart", "> !smart", "`!smart`", "!smarter hello", "!stop", "!other hi"):
             self.assertIsNone(mode_command(text, MODES))
 
@@ -260,25 +262,243 @@ class ModeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private", str(failure.exception))
         self.assertFalse(self.clients[0].prompts)
         self.assertTrue(self.clients[0].stopped)
-        self.assertEqual(self.runtime._scopes[self.key].mode, "")
+        self.assertEqual(self.runtime._scopes[self.key].mode, "fast")
 
-    async def test_failed_live_switch_blocks_inference_and_compaction_until_explicit_selection(self):
+    async def test_failed_live_switch_restores_default_on_next_plain_request(self):
         await self.submit()
         client = self.clients[0]
         client.fail_switch = True
         with self.assertRaisesRegex(ModeSwitchError, "could not confirm"):
             await self.runtime.change_mode(self.key, "smart")
-        self.assertIn("unconfirmed", await debug_status(self.runtime, self.key))
-        with self.assertRaisesRegex(ModeSwitchError, "not confirmed"):
-            await self.submit("must not run", request="$blocked")
-        self.assertEqual(await self.runtime.sweep_idle(force=True), 1)
         self.assertTrue(client.stopped)
-        self.assertEqual(self.runtime._scopes[self.key].mode, "")
-        self.assertEqual(len(client.prompts), 1)
-        await self.runtime.change_mode(self.key, "fast")
-        await self.submit("safe again", request="$safe")
+        self.assertIsNone(self.runtime._scopes[self.key].client)
+        self.assertEqual(self.runtime._scopes[self.key].mode, "fast")
+        await self.submit("next ordinary request", request="$next")
         self.assertEqual(len(self.clients), 2)
+        self.assertEqual(self.clients[1].selections, [("test", "flash")])
         self.assertEqual(len(self.clients[1].prompts), 1)
+
+    async def test_failed_start_restores_default_without_explicit_selection(self):
+        self.first_switch_fails = True
+        with self.assertRaisesRegex(ModeSwitchError, "could not start"):
+            await self.submit(mode="smart")
+        self.assertEqual(self.runtime._scopes[self.key].mode, "fast")
+        await self.submit("ordinary retry", request="$retry")
+        self.assertEqual(self.clients[1].selections, [("test", "flash")])
+        self.assertEqual(len(self.clients[1].prompts), 1)
+
+    async def test_timed_out_start_restores_default_on_next_request(self):
+        original = self.runtime.client_factory
+        def factory(key, path):
+            client = original(key, path)
+            if len(self.clients) == 1:
+                async def stalled(provider, model):
+                    await asyncio.Event().wait()
+                client.set_model = stalled
+            return client
+        self.runtime.client_factory = factory
+        with patch("bridge.runtime.session.MODE_SWITCH_TIMEOUT_SECONDS", .01):
+            with self.assertRaises(ModeSwitchError):
+                await self.submit(mode="smart")
+        self.assertTrue(self.clients[0].stopped)
+        self.assertEqual(self.runtime._scopes[self.key].mode, "fast")
+        await self.submit("ordinary retry", request="$retry")
+        self.assertEqual(self.clients[1].selections, [("test", "flash")])
+
+    async def test_process_start_oserror_discards_client_and_revalidates_next_request(self):
+        original = self.runtime.client_factory
+        def factory(key, path):
+            client = original(key, path)
+            if len(self.clients) == 1:
+                async def unavailable(provider, model):
+                    raise OSError("private executable path")
+                client.set_model = unavailable
+            return client
+        self.runtime.client_factory = factory
+        with self.assertRaisesRegex(ModeSwitchError, "could not start"):
+            await self.submit(mode="smart")
+        self.assertTrue(self.clients[0].stopped)
+        self.assertIsNone(self.runtime._scopes[self.key].client)
+        await self.submit("retry", request="$retry")
+        self.assertEqual(self.clients[1].selections, [("test", "flash")])
+
+    async def test_failed_switch_uses_configured_default_not_hardcoded_fast(self):
+        self.runtime.default_mode = "research"
+        await self.submit(mode="smart")
+        self.clients[0].fail_switch = True
+        with self.assertRaises(ModeSwitchError):
+            await self.runtime.change_mode(self.key, "fast")
+        self.assertEqual(self.runtime._scopes[self.key].mode, "research")
+        await self.submit("ordinary retry", request="$retry")
+        self.assertEqual(self.clients[1].selections, [("other-provider", "research-model")])
+
+    async def test_reload_removing_sleeping_selection_uses_default_before_client_creation(self):
+        await self.runtime.change_mode(self.key, "smart")
+        self.runtime.modes = {"fast": MODES["fast"]}
+        await self.submit("after reload")
+        self.assertEqual(self.runtime._scopes[self.key].mode, "fast")
+        self.assertEqual(self.clients[0].selections, [("test", "flash")])
+
+    async def test_reload_removing_idle_selection_discards_old_client_and_uses_default(self):
+        await self.submit(mode="smart")
+        old = self.clients[0]
+        self.runtime.modes = {"fast": MODES["fast"]}
+        await self.submit("after reload", request="$reload")
+        self.assertTrue(old.stopped)
+        self.assertEqual(self.runtime._scopes[self.key].mode, "fast")
+        self.assertEqual(self.clients[1].selections, [("test", "flash")])
+
+    async def test_reload_does_not_interrupt_active_turn_before_default_reset(self):
+        await self.submit(mode="smart")
+        old = self.clients[0]
+        old.release.clear()
+        await self.runtime.submit(self.key, Incoming("operator", "$active", "work"))
+        await asyncio.sleep(0)
+        self.runtime.modes = {"fast": MODES["fast"]}
+        pending = asyncio.create_task(self.runtime.submit(self.key, Incoming("operator", "$next", "next")))
+        await asyncio.sleep(0)
+        self.assertFalse(old.stopped)
+        old.release.set()
+        await asyncio.wait_for(pending, 1)
+        await self.runtime.wait_idle(self.key)
+        self.assertTrue(old.stopped)
+        self.assertEqual(self.clients[1].selections, [("test", "flash")])
+
+    async def test_bare_peer_mode_change_does_not_take_turn_ownership(self):
+        await self.submit()
+        await self.runtime.change_mode(self.key, "smart", "@peer-agent:example.test")
+        self.assertEqual(self.runtime._scopes[self.key].checkpoint.requester, "operator")
+        self.assertFalse(await self.runtime.stop_session(self.key, "@peer-agent:example.test"))
+        self.assertTrue(await self.runtime.stop_session(self.key, "operator"))
+
+    async def test_reload_during_captioning_preserves_summary_for_actual_new_epoch(self):
+        await self.submit(mode="smart")
+        scope = self.runtime._scopes[self.key]
+        scope.checkpoint.summary = "previous saved context"
+        async def caption(key, images):
+            self.runtime.modes = {"fast": MODES["fast"]}
+            return "image caption"
+        self.runtime.image_captioner = caption
+        await self.runtime.submit(self.key, Incoming("operator", "$image", "inspect", (RpcImage("image/png", "QQ=="),)))
+        await self.runtime.wait_idle(self.key)
+        self.assertEqual(len(self.clients), 2)
+        self.assertEqual(self.clients[1].selections, [("test", "flash")])
+        self.assertIn("previous saved context", self.clients[1].prompts[0])
+
+    async def test_unavailable_default_reports_default_error_without_retry_invitation(self):
+        self.first_switch_fails = True
+        with self.assertRaisesRegex(ModeSwitchError, "configured default itself is unavailable") as result:
+            await self.submit()
+        self.assertNotIn("next request will use it", str(result.exception))
+        self.assertEqual(len(self.clients), 1)
+        self.assertTrue(self.clients[0].stopped)
+        self.assertIsNone(self.runtime._scopes[self.key].client)
+        self.assertEqual(self.runtime._scopes[self.key].mode, "fast")
+
+    async def test_failed_switch_to_default_identifies_unavailable_default(self):
+        await self.submit(mode="smart")
+        self.clients[0].fail_switch = True
+        with self.assertRaisesRegex(ModeSwitchError, "configured default itself is unavailable"):
+            await self.runtime.change_mode(self.key, "fast")
+        self.assertIsNone(self.runtime._scopes[self.key].client)
+
+    async def test_duplicate_after_reload_does_not_retire_client_or_change_mode(self):
+        await self.submit(mode="smart")
+        old = self.clients[0]
+        scope = self.runtime._scopes[self.key]
+        epoch = scope.checkpoint.epoch
+        self.runtime.modes = {"fast": MODES["fast"]}
+        result = await self.runtime.submit(self.key, Incoming("operator", "$request", "request"))
+        self.assertEqual(result, "duplicate")
+        self.assertIs(scope.client, old)
+        self.assertFalse(old.stopped)
+        self.assertEqual(scope.mode, "smart")
+        self.assertEqual(scope.checkpoint.epoch, epoch)
+
+    async def test_queued_stop_exception_retires_unconfirmed_selection(self):
+        await self.submit()
+        with patch.object(self.runtime, "_apply_model", side_effect=StopRequested("queued stop")):
+            with self.assertRaises(StopRequested):
+                await self.runtime.change_mode(self.key, "smart")
+        self.assertIsNone(self.runtime._scopes[self.key].client)
+        self.assertEqual(self.runtime._scopes[self.key].mode, "fast")
+
+    async def test_matrix_reload_replacement_fetches_recent_posts_without_summary(self):
+        self.key = SessionKey("agent_one", "matrix", ROOM + ":main")
+        await self.submit(mode="smart")
+        self.runtime.modes = {"fast": MODES["fast"]}
+        adapter = matrix_adapter(self.directory.name, self.runtime)
+        adapter._history.return_value = "previous room context"
+        await adapter._handle_event(ROOM, matrix_event("continue", event_id="$next", mentions=[AGENT_ID]))
+        await self.runtime.wait_idle(self.key)
+        adapter._history.assert_awaited_once()
+        self.assertIn("previous room context", self.clients[1].prompts[0])
+
+    async def test_discord_bot_reload_replacement_fetches_recent_posts_without_summary(self):
+        self.key = SessionKey("agent_two", "discord", "2")
+        await self.submit(mode="smart")
+        self.runtime.modes = {"fast": MODES["fast"]}
+        adapter = discord_adapter(self.runtime)
+        adapter._context = AsyncMock(return_value="previous channel context")
+        adapter._reply_context = AsyncMock(return_value="")
+        adapter._images = AsyncMock(return_value=())
+        await adapter._on_message(discord_message("<@9> continue", bot=True))
+        await self.runtime.wait_idle(self.key)
+        adapter._context.assert_awaited_once()
+        self.assertIn("previous channel context", self.clients[1].prompts[0])
+
+    async def test_previous_requester_cannot_abort_new_mode_bearing_turn(self):
+        await self.submit()
+        old = self.clients[0]
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original = old.set_model
+        async def delayed_switch(provider, model):
+            entered.set()
+            await release.wait()
+            await original(provider, model)
+        old.set_model = delayed_switch
+        new_turn = asyncio.create_task(self.runtime.submit(
+            self.key, Incoming("peer", "$peer", "peer work", mode="smart")))
+        await asyncio.wait_for(entered.wait(), 1)
+        stop = asyncio.create_task(self.runtime.stop_session(self.key, "operator"))
+        await asyncio.sleep(0)
+        release.set()
+        stopped, result = await asyncio.gather(stop, new_turn, return_exceptions=True)
+        self.assertFalse(stopped)
+        self.assertNotIsInstance(result, BaseException)
+        await self.runtime.wait_idle(self.key)
+        self.assertFalse(old.stopped)
+        self.assertIn("peer work", old.prompts[-1])
+        self.assertEqual(self.runtime._scopes[self.key].checkpoint.requester, "peer")
+
+    async def assert_retry_mode_failure_reported(self, failure):
+        self.first_prompt_fails = True
+        original = self.runtime.client_factory
+        def factory(key, path):
+            client = original(key, path)
+            if len(self.clients) == 2:
+                client.set_model = AsyncMock(side_effect=failure)
+            return client
+        self.runtime.client_factory = factory
+        await self.submit(mode="smart")
+        scope = self.runtime._scopes[self.key]
+        self.assertEqual(scope.checkpoint.status, "error")
+        self.assertEqual(scope.mode, "fast")
+        self.assertIsNone(scope.client)
+        self.assertTrue(any(kind == "error" and "configured default" in text
+                            for kind, text in self.posts))
+        self.assertEqual(self.clients[1].prompts, [])
+        await self.submit("new request", request="$after-retry-failure")
+        self.assertEqual(self.clients[2].selections, [("test", "flash")])
+        self.assertEqual(len(self.clients[2].prompts), 1)
+        self.assertIn("new request", self.clients[2].prompts[0])
+
+    async def test_provider_retry_rpc_mode_failure_reports_error_and_recovers_default(self):
+        await self.assert_retry_mode_failure_reported(PiRpcError("private diagnostic"))
+
+    async def test_provider_retry_os_mode_failure_reports_error_and_recovers_default(self):
+        await self.assert_retry_mode_failure_reported(OSError("private startup failure"))
 
     async def test_other_scopes_and_restart_do_not_inherit_selected_mode(self):
         await self.submit(mode="smart")
@@ -347,29 +567,38 @@ class ModeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         with patch("bridge.runtime.session.MODE_SWITCH_TIMEOUT_SECONDS", .01):
             with self.assertRaisesRegex(ModeSwitchError, "could not confirm"):
                 await asyncio.wait_for(self.runtime.change_mode(self.key, "smart", "operator"), .2)
-        self.assertEqual(self.runtime._scopes[self.key].mode, "")
+        self.assertEqual(self.runtime._scopes[self.key].mode, "fast")
 
-    async def test_unconfirmed_mode_ignores_ambient_inputs_without_error_spam(self):
-        await self.submit()
-        self.clients[0].fail_switch = True
-        with self.assertRaises(ModeSwitchError):
-            await self.runtime.change_mode(self.key, "smart")
-        self.posts.clear()
-        result = await self.runtime.submit(self.key, Incoming("peer", "$ambient", "chatter", optional=True))
-        self.assertEqual(result, "mode_unconfirmed")
-        self.assertEqual(self.posts, [("cleanup_request", "")])
+    async def test_admitted_peer_can_select_mode_without_reaction_requirement(self):
+        await self.runtime.submit(self.key, Incoming("peer", "$peer", "work", mode="smart", ack_required=False))
+        await self.runtime.wait_idle(self.key)
+        self.assertEqual(self.runtime._scopes[self.key].mode, "smart")
+        self.assertEqual(self.clients[0].selections, [("openai-codex", "gpt-smart")])
 
-    async def test_optional_and_peer_inputs_cannot_request_mode_changes(self):
-        for incoming in (Incoming("peer", "$peer", "text", mode="smart", ack_required=False),
-                         Incoming("operator", "$ambient", "text", mode="smart", optional=True)):
-            with self.assertRaisesRegex(ModeSwitchError, "direct user command"):
-                await self.runtime.submit(self.key, incoming)
+    async def test_ambient_input_cannot_smuggle_mode_selection(self):
+        with self.assertRaisesRegex(ModeSwitchError, "explicit mode command"):
+            await self.runtime.submit(self.key, Incoming("peer", "$ambient", "text", mode="smart", optional=True))
         self.assertFalse(self.clients)
+
+    async def test_timed_out_live_switch_discards_uncertain_client_and_next_request_recovers(self):
+        await self.submit()
+        client = self.clients[0]
+        async def stalled(provider, model):
+            await asyncio.Event().wait()
+        client.set_model = stalled
+        with patch("bridge.runtime.session.MODE_SWITCH_TIMEOUT_SECONDS", .01):
+            with self.assertRaises(ModeSwitchError):
+                await self.runtime.change_mode(self.key, "smart")
+        self.assertTrue(client.stopped)
+        self.assertEqual(self.runtime._scopes[self.key].mode, "fast")
+        await self.submit("retry", request="$retry")
+        self.assertEqual(self.clients[1].selections, [("test", "flash")])
+
 
 
 class ModeAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_matrix_prefixes_strip_address_and_token_preserving_request_case(self):
-        bodies = ["!smart Keep CASE", f"{AGENT_ID} !fast Keep CASE", "Agent_one: !research Keep CASE",
+        bodies = ["/smart Keep CASE", "/fast Keep CASE", "!smart Keep CASE", f"{AGENT_ID} !fast Keep CASE", "Agent_one: !research Keep CASE",
                   f"[{AGENT_ID}](https://matrix.to/#/{AGENT_ID}) !smart Keep CASE"]
         for body in bodies:
             with self.subTest(body=body), tempfile.TemporaryDirectory() as directory:
@@ -418,16 +647,73 @@ class ModeAdapterTests(unittest.IsolatedAsyncioTestCase):
             runtime.change_mode.assert_awaited_once()
             runtime.submit.assert_not_awaited()
 
-    async def test_bot_messages_cannot_select_a_mode(self):
+    async def test_admitted_discord_bot_can_select_prefixed_and_bare_modes(self):
         runtime = discord_runtime()
         runtime.modes = MODES
-        runtime.change_mode = AsyncMock()
+        runtime.change_mode = AsyncMock(return_value="smart")
         adapter = discord_adapter(runtime)
-        message = discord_message("<@9> !smart text", bot=True)
-        await adapter._on_message(message)
-        runtime.change_mode.assert_not_awaited()
-        if runtime.submit.await_args:
-            self.assertIsNone(runtime.submit.await_args.args[1].mode)
+        await adapter._on_message(discord_message("<@9> !smart text", bot=True))
+        self.assertEqual(runtime.submit.await_args.args[1].mode, "smart")
+        self.assertFalse(runtime.submit.await_args.args[1].ack_required)
+        runtime.submit.reset_mock()
+        bare = discord_message("<@9> !fast", bot=True)
+        bare.id = 11
+        await adapter._on_message(bare)
+        runtime.change_mode.assert_awaited_once()
+        runtime.submit.assert_not_awaited()
+
+    async def test_admitted_matrix_peer_metadata_can_select_prefixed_and_bare_modes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = matrix_runtime()
+            runtime.modes = MODES
+            runtime.change_mode = AsyncMock(return_value="smart")
+            adapter = matrix_adapter(directory, runtime)
+            for index, body in enumerate(("!smart work", "!fast")):
+                event = matrix_event(body, event_id=f"$peer{index}", mentions=[AGENT_ID])
+                event["sender"] = "@peer-agent:example.test"
+                event["content"]["org.example.pi_bridge"] = {"kind":"final", "hop":1, "invitations":[AGENT_ID]}
+                await adapter._handle_event(ROOM, event)
+            incoming = runtime.submit.await_args.args[1]
+            self.assertEqual(incoming.mode, "smart")
+            self.assertFalse(incoming.ack_required)
+            runtime.change_mode.assert_awaited_once()
+
+    async def test_explicit_other_recipient_is_not_a_mode_command_for_humans_or_peers(self):
+        for peer in (False, True):
+            with self.subTest(peer=peer), tempfile.TemporaryDirectory() as directory:
+                runtime = matrix_runtime()
+                runtime.is_awake.return_value = True
+                runtime.modes = MODES
+                runtime.change_mode = AsyncMock()
+                adapter = matrix_adapter(directory, runtime)
+                event = matrix_event("@other:example.test !smart work", mentions=["@other:example.test"])
+                if peer:
+                    event["sender"] = "@peer-agent:example.test"
+                    event["content"]["org.example.pi_bridge"] = {"kind":"final", "hop":1, "invitations":["@other:example.test"]}
+                await adapter._handle_event(ROOM, event)
+                runtime.change_mode.assert_not_awaited()
+                self.assertIsNone(runtime.submit.await_args.args[1].mode)
+
+    async def test_incidental_mentions_do_not_suppress_mode_commands(self):
+        for peer in (False, True):
+            with self.subTest(peer=peer), tempfile.TemporaryDirectory() as directory:
+                runtime = matrix_runtime()
+                runtime.is_awake.return_value = True
+                runtime.modes = MODES
+                adapter = matrix_adapter(directory, runtime)
+                event = matrix_event("!smart Summarize @other:example.test note", mentions=["@other:example.test"])
+                if peer:
+                    event["sender"] = "@peer-agent:example.test"
+                    event["content"]["org.example.pi_bridge"] = {"kind":"final", "hop":1, "invitations":[]}
+                await adapter._handle_event(ROOM, event)
+                self.assertEqual(runtime.submit.await_args.args[1].mode, "smart")
+            runtime = discord_runtime()
+            runtime.modes = MODES
+            adapter = discord_adapter(runtime, wake_on_any_channel_ids=(2,))
+            message = discord_message("!smart Summarize <@42> note", mentioned=False, bot=peer)
+            message.mentions = [SimpleNamespace(id=42)]
+            await adapter._on_message(message)
+            self.assertEqual(runtime.submit.await_args.args[1].mode, "smart")
 
     async def test_discord_mode_notice_is_nonterminal_and_keeps_request_for_ack(self):
         runtime = discord_runtime(record_activity=AsyncMock())

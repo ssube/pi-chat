@@ -1,3 +1,4 @@
+import { attentionBell } from "./lib/attention-bell.js";
 // Stable systemd user-service backend. Opt-in; no direct-process fallback.
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -41,6 +42,7 @@ const unitProperties = [
 const parseProperties = (text: string) => Object.fromEntries(text.trim().split("\n").filter(line => line.includes("="))
 	.map(line => { const split = line.indexOf("="); return [line.slice(0, split), line.slice(split + 1)]; }));
 type Status = "running" | "deadline_exceeded" | "stopping" | "succeeded" | "failed" | "timed_out" | "cancelled" | "detached" | "unknown";
+type SubmissionState = "prepared" | "confirmed" | "uncertain" | "rejected";
 type Job = {
 	id: string; session_id: string; label: string; command: string; cwd: string;
 	unit: string; directory: string; started_at: string; finished_at: string | null;
@@ -48,18 +50,23 @@ type Job = {
 	exit_code: number | null; signal: string | null; error: string | null;
 	log_path: string; metadata_path: string; completion_path: string;
 	deadline_exceeded: boolean; systemd_result: string | null;
+	submission_state?: SubmissionState;
 	slice: string; progress_interval_seconds: number | null; last_progress_at: string | null;
 	systemd: Record<string, string>; systemd_observed_at: string | null; systemd_final?: Record<string, string>;
 	progress_snapshot?: { output_bytes: number; output_modified_at: string; latest_line: string };
 };
-// Observation files may update results, never submission identity or safety policy.
+// Observation files may update results and submission classification, never unit identity or safety policy.
 const observationFields = [
-	"status", "finished_at", "exit_code", "signal", "error", "deadline_exceeded", "systemd_result",
+	"status", "finished_at", "exit_code", "signal", "error", "deadline_exceeded", "systemd_result", "submission_state",
 	"systemd_exit_kind", "systemd_exit_status", "hook_recorded_at", "systemd_final",
 	"systemd", "systemd_observed_at", "last_progress_at", "progress_snapshot",
 ];
 const mergeObservation = (job: Job, data: Record<string, unknown>) =>
 	Object.assign(job, Object.fromEntries(observationFields.filter(key => Object.hasOwn(data, key)).map(key => [key, data[key]])));
+const unitDescription = (job: Pick<Job, "id" | "label">) => `Pi ${job.id}: ${job.label.replace(/[\x00-\x1f\x7f]/g, " ")}`;
+export const exactUnitMatches = (job: Pick<Job, "id" | "label" | "slice" | "submission_state" | "systemd">) =>
+	job.submission_state !== "rejected" && job.systemd.LoadState === "loaded" &&
+	job.systemd.Slice === job.slice && job.systemd.Description === unitDescription(job);
 const active = (job: Job) => ["running", "deadline_exceeded", "stopping", "unknown"].includes(job.status);
 const atomic = (path: string, data: unknown) => {
 	writeFileSync(`${path}.new`, JSON.stringify(data, null, 2), { mode: 0o600 });
@@ -183,6 +190,22 @@ export default function (pi: ExtensionAPI) {
 	let shuttingDown = false;
 	let nextId = 1;
 	let launching = 0;
+	let ready = false;
+	let sessionId: string | undefined;
+	// Optional peer API: bounded metadata only, never command/output or filesystem access.
+	const changed = () => {
+		if (ready && !shuttingDown) pi.events.emit("background:changed-v1", { version: 1, session_id: sessionId });
+	};
+	pi.events.on("background:lookup-v1", payload => {
+		if (!ready || shuttingDown || !ctx || sessionId !== ctx.sessionManager.getSessionId() ||
+			!payload || typeof payload !== "object") return;
+		const query = payload as { version?: unknown; session_id?: unknown; job_id?: unknown; available?: boolean; job?: object };
+		if (query.version !== 1 || query.session_id !== sessionId || typeof query.job_id !== "string") return;
+		query.available = true;
+		const job = jobs.get(query.job_id);
+		if (job?.session_id === sessionId) query.job = { id: job.id, session_id: job.session_id, unit: job.unit,
+			status: job.status, finished_at: job.finished_at };
+	});
 	const persist = (job: Job) => atomic(job.metadata_path, summary(job));
 	const showCount = () => {
 		if (ctx?.mode === "tui") {
@@ -206,6 +229,7 @@ export default function (pi: ExtensionAPI) {
 		sendSnapshot(job, event);
 		// A queue-acceptance marker, not a claim of exactly-once model delivery.
 		atomic(marker, { queued_at: new Date().toISOString() });
+		if (ctx) attentionBell(ctx);
 	};
 	const refresh = async (job: Job, send = true) => {
 		if (existsSync(job.completion_path)) {
@@ -217,8 +241,11 @@ export default function (pi: ExtensionAPI) {
 					job.status = "stopping"; retry(job, 250); return;
 				}
 				mergeObservation(job, JSON.parse(readFileSync(job.completion_path, "utf8")));
+				job.submission_state = "confirmed"; // The private completion hook proves that this unit ran.
 				persist(job);
 			}
+			// Resolve dependent task state before the existing completion wake is queued.
+			changed();
 			if (send) notify(job, "completed");
 			release(job);
 		} else if (active(job) && job.unsafe_to_terminate && Date.now() - Date.parse(job.started_at) >= job.timeout_seconds * 1000) {
@@ -245,8 +272,24 @@ export default function (pi: ExtensionAPI) {
 		const query = await systemctl(["--timestamp=us", "show", job.unit, `--property=${unitProperties.join(",")}`]);
 		job.systemd = parseProperties(query.stdout);
 		job.systemd_observed_at = new Date().toISOString();
-		if (job.systemd.LoadState === "not-found" && !existsSync(job.completion_path)) {
-			job.status = "unknown"; job.error = "Unit absent without a completion record; inspect retained artifacts.";
+		if (job.systemd.LoadState === "loaded") {
+			if (!exactUnitMatches(job)) {
+				job.status = "unknown"; job.error = "Exact unit identity could not be confirmed; no automatic action.";
+			} else {
+				const recoveringSubmission = job.submission_state === "uncertain" || job.submission_state === "prepared";
+				if (recoveringSubmission) job.submission_state = "confirmed";
+				if (["activating", "active"].includes(job.systemd.ActiveState)) {
+					// A live unit resolves an uncertain launch, not an unconfirmed stop.
+					if (job.status === "unknown" && recoveringSubmission) { job.status = "running"; job.error = null; }
+				} else if (!existsSync(job.completion_path)) {
+					job.status = "unknown"; job.error = "Matching unit is not live and has no completion record; outcome unknown.";
+				}
+			}
+		} else if (job.systemd.LoadState === "not-found" && !existsSync(job.completion_path)) {
+			job.status = "unknown";
+			job.error = job.submission_state === "rejected" ?
+				"Submission rejected before systemd-run started; private environment snapshot retained for authorized recovery." :
+				"Exact unit absent without a completion record; outcome unknown and private environment snapshot retained.";
 		}
 	};
 	// Event-source boundary: a future D-Bus adapter can feed the same dispatcher.
@@ -318,8 +361,8 @@ export default function (pi: ExtensionAPI) {
 		if (!active(job)) return;
 		if (job.unsafe_to_terminate) throw new Error("Job is unsafe to terminate; no stop requested.");
 		await readUnit(job);
-		if (job.systemd.LoadState !== "loaded" || job.systemd.Slice !== sessionSlice(job.session_id)) {
-			throw new Error("Cannot confirm this unit belongs to the current session slice; no stop requested.");
+		if (job.slice !== sessionSlice(job.session_id) || !exactUnitMatches(job)) {
+			throw new Error("Cannot confirm exact unit identity in the current session slice; no stop requested.");
 		}
 		writeFileSync(join(job.directory, "cancel-requested"), "", { mode: 0o600 });
 		job.status = "stopping"; persist(job); showCount();
@@ -338,6 +381,7 @@ export default function (pi: ExtensionAPI) {
 		});
 	};
 	pi.on("session_start", async (_event, context) => {
+		ready = false; sessionId = context.sessionManager.getSessionId();
 		ctx = context; jobs = new Map(); sources.clear(); nextId = 1; shuttingDown = false;
 		const pruned = new Set<string>();
 		for (const entry of context.sessionManager.getBranch()) {
@@ -375,13 +419,14 @@ export default function (pi: ExtensionAPI) {
 				if (context.hasUI) context.ui.notify(`Cannot restore a background job: ${String(error)}`, "warning");
 			}
 		}
+		ready = true;
 		for (const job of jobs.values()) attach(job);
 		// Slow recovery sweep for dropped fs events, watcher errors, or missing hooks.
 		observer = setInterval(() => { void observe(); }, 60_000);
-		await observe();
+		await observe(); changed();
 	});
 	pi.on("session_shutdown", async () => {
-		shuttingDown = true;
+		shuttingDown = true; ready = false;
 		if (observer) clearInterval(observer);
 		for (const job of jobs.values()) release(job);
 		await Promise.all([...sources.values()].map(source => source.inFlight));
@@ -405,7 +450,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "background_start", label: "Start background job",
-		description: "Systemd backend: launch an authorized /bin/bash command as a transient user oneshot service without blocking the conversation. Required timeout_seconds maps to TimeoutStartSec; unsafe_to_terminate uses infinity and forbids extension-initiated stops. systemd owns cgroup termination. ExecStopPost persists exit results independently of Pi and unit collection; completion steers structured combined output. Requires Linux, a working user manager, systemd-run, systemctl and a Node-compatible runtime. Logs and results are private disk files; the inherited environment is temporarily stored owner-only and removed by the hook. No direct-process fallback. File events drive completion with slow reconciliation as backup; progress_interval defaults to off and never steers automatically. Session services share pi-jobs-<sessionHash>.slice. Active-job limit and completed-history retention are configurable (defaults: 5 active, newest 100 completed, 24 hours). Pruning preserves disk artifacts. Grants no new permissions or spending authority.",
+		description: "Systemd backend: launch an authorized /bin/bash command as a transient user oneshot service without blocking the conversation. Required timeout_seconds maps to TimeoutStartSec; unsafe_to_terminate uses infinity and forbids extension-initiated stops. systemd owns cgroup termination. ExecStopPost persists exit results independently of Pi and unit collection; completion steers structured combined output. Requires Linux, a working user manager, systemd-run, systemctl and a Node-compatible runtime. Logs and results are private disk files; the inherited environment is stored owner-only and removed by the hook on normal completion, but may remain after uncertain submission. No automatic artifact cleanup or direct-process fallback. File events drive completion with slow reconciliation as backup; progress_interval defaults to off and never steers automatically. Session services share pi-jobs-<sessionHash>.slice. Active-job limit and completed-history retention are configurable (defaults: 5 active, newest 100 completed, 24 hours). Pruning preserves disk artifacts. Grants no new permissions or spending authority.",
 		parameters: Type.Object({ command: Type.String({ minLength: 1, maxLength: 4096 }),
 			label: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
 			timeout_seconds: Type.Number({ minimum: 0.001, maximum: 2_147_483 }), unsafe_to_terminate: Type.Optional(Type.Boolean()),
@@ -434,6 +479,7 @@ export default function (pi: ExtensionAPI) {
 					unsafe_to_terminate: params.unsafe_to_terminate ?? false, status: "running", exit_code: null, signal: null, error: null,
 					log_path: join(directory, "output.log"), metadata_path: join(directory, "metadata.json"),
 					completion_path: join(directory, "completion.json"), deadline_exceeded: false, systemd_result: null,
+					submission_state: "prepared",
 					slice: sessionSlice(context.sessionManager.getSessionId()), systemd: {}, systemd_observed_at: null, last_progress_at: null,
 					progress_interval_seconds: progressIntervals[params.progress_interval ?? "off"],
 				};
@@ -451,7 +497,7 @@ export default function (pi: ExtensionAPI) {
 				try {
 					await control("systemd-run", ["--user", "--quiet", "--no-block", "--collect", `--unit=${job.unit}`,
 						"--property=Type=oneshot", "--property=RemainAfterExit=no", "--property=Restart=no",
-						`--property=Slice=${job.slice}`, `--property=Description=Pi ${job.id}: ${job.label.replace(/[\x00-\x1f\x7f]/g, " ")}`,
+						`--property=Slice=${job.slice}`, `--property=Description=${unitDescription(job)}`,
 						"--property=CPUAccounting=yes", "--property=MemoryAccounting=yes",
 						`--property=TimeoutStartSec=${job.unsafe_to_terminate ? "infinity" : `${params.timeout_seconds}s`}`,
 						"--property=TimeoutStopSec=1s", "--property=KillMode=control-group", "--property=StandardInput=null",
@@ -460,11 +506,18 @@ export default function (pi: ExtensionAPI) {
 						`--property=StandardOutput=append:${literal(job.log_path)}`, "--property=StandardError=inherit",
 						`--property=ExecStopPost=:${execArgument(process.execPath)} ${execArgument(join(directory, "completion.cjs"))} ${execArgument(directory)}`,
 						"/bin/bash", literal(join(directory, "command.sh"))], controlOptions());
+					job.submission_state = "confirmed";
 				} catch (error) {
-					// A control-client error can follow unit creation. Never retry creation or
-					// infer that the command did not run; keep its unit identity and artifacts.
-					job.status = "unknown"; job.error = `Submission not confirmed: ${String(error)}`; persist(job);
+					// Only a local spawn failure proves rejection. A nonzero client exit can
+					// follow unit creation; retain identity/artifacts and never resubmit.
+					const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+					job.submission_state = code === "ENOENT" || code === "EACCES" ? "rejected" : "uncertain";
+					job.status = "unknown";
+					job.error = job.submission_state === "rejected" ?
+						"Submission rejected before systemd-run started; private environment snapshot retained for authorized recovery." :
+						"Submission not confirmed; inspect exact unit and completion record before authorized recovery.";
 				}
+				persist(job);
 				await refresh(job); showCount();
 				return result(snapshot(job));
 			} finally { if (reserved) launching--; }

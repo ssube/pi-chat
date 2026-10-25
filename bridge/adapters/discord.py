@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import json
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -14,7 +15,7 @@ from bridge.config import DiscordSettings
 from bridge.activity import Activity, Presence
 from bridge.filtering import DISCORD_META_PREFIX, discord_metadata, metadata_rejection
 from bridge.telemetry import Telemetry
-from bridge.turn_status import Indicator, TURN_EMOJI, TurnStatus
+from bridge.turn_status import Deferred, Indicator, MAX_TRANSPORT_RETRY_SECONDS, TURN_EMOJI, TurnStatus
 from bridge.progress import sealed_progress
 from bridge.history_service import HistoryPage
 from bridge.mentions import (BROADCAST_REJECTION, Member, Roster, find_mentions, has_broadcast_ping,
@@ -39,7 +40,14 @@ def _snowflake_at(moment: datetime) -> int:
 # requester types (`cancel`, `recover`), the chat-client slash spellings, and
 # the bang spelling of the diagnostic commands. These run after admission,
 # like their Matrix forms; `!debug` and `!stop` stay pre-admission.
+DISCORD_EARLY_COMMANDS = {
+    "!debug": "debug", "/debug": "debug", "/bridge_debug": "debug",
+    "!stop": "stop", "/stop": "stop", "/bridge_stop": "stop",
+}
+
 DISCORD_SESSION_COMMANDS = {
+    "/bridge_cancel": "cancel",
+    "/bridge_recover": "recover",
     "cancel": "cancel",
     "/cancel": "cancel",
     "!cancel": "cancel",
@@ -163,6 +171,44 @@ class DiscordAdapter:
             header.append("[earlier messages may be omitted; count unknown]")
         return "\n".join([*header, *selected])
 
+    async def _reply_context(self, message: Any) -> str:
+        """Quote one same-channel parent, even when the conversation is awake."""
+        reference = getattr(message, "reference", None)
+        parent_id = getattr(reference, "message_id", None)
+        if type(parent_id) is not int or parent_id <= 0:
+            return ""
+        kind = getattr(reference, "type", None)
+        if kind is not None and getattr(kind, "value", kind) != 0:
+            return ""  # Forwarded snapshots are not replies.
+        channel_id = getattr(reference, "channel_id", message.channel.id)
+        header = f"In reply to Discord · channel {channel_id} · message {parent_id}"
+        unavailable = f"{header} (original unavailable)."
+        if (channel_id != message.channel.id or
+                getattr(reference, "guild_id", None) not in (None, message.guild.id)):
+            return unavailable
+        parent = getattr(reference, "resolved", None)
+        if parent is None:
+            parent = getattr(reference, "cached_message", None)
+        if parent is None:
+            try:
+                parent = await asyncio.wait_for(message.channel.fetch_message(parent_id), timeout=5)
+            except Exception:
+                log.warning("Discord reply parent unavailable id=%s", parent_id)
+                return unavailable
+        author = getattr(parent, "author", None)
+        author_id = getattr(author, "id", None)
+        display_name = getattr(author, "display_name", None)
+        body = getattr(parent, "content", None)
+        if (getattr(parent, "id", None) != parent_id or
+                getattr(getattr(parent, "channel", None), "id", None) != message.channel.id or
+                getattr(getattr(parent, "guild", None), "id", None) != message.guild.id or
+                type(author_id) is not int or not isinstance(display_name, str) or not isinstance(body, str)):
+            return unavailable
+        name = " ".join(display_name.splitlines())[:80]
+        quote = "\n".join(f"> {line}" for line in (body[:1600] or "[Message has no text content]").splitlines())
+        return (f"In reply to Discord · channel {channel_id} · sender {name} ({author_id}) · "
+                f"message {parent_id}:\n{quote}")
+
     async def _images(self, message: Any) -> tuple[RpcImage, ...]:
         images = []
         for attachment in message.attachments[:4]:
@@ -189,9 +235,17 @@ class DiscordAdapter:
                 # cannot be inspected; a control never advances the gap cursor.
                 control = (message.content.replace(f"<@{self.client.user.id}>", "")
                            .replace(f"<@!{self.client.user.id}>", "").strip().lower())
-                if message.author.bot or control not in {"recover", "/recover", "!recover",
-                                                             "!debug", "!stop"}:
-                    return
+                if control not in DISCORD_SESSION_COMMANDS:
+                    if control not in DISCORD_EARLY_COMMANDS:
+                        return
+                    metadata = discord_metadata(message)
+                    invitations = metadata.get("invitations", []) if metadata else []
+                    addressed = (self.client.user in message.mentions or
+                                 f"<@{self.client.user.id}>" in message.content or
+                                 f"<@!{self.client.user.id}>" in message.content or
+                                 isinstance(invitations, list) and str(self.client.user.id) in invitations)
+                    if not addressed:
+                        return
         scope = str(message.channel.id)
         key = SessionKey(self.agent, "discord", scope)
         async with self.telemetry.queued(self._input_locks.setdefault(scope, asyncio.Lock()), "discord",
@@ -211,12 +265,29 @@ class DiscordAdapter:
             if message.author.id != self.client.user.id:
                 if await self._deliver_message(message) is False:
                     return  # A failed submit is not an inspected/admitted message.
+            else:
+                await self._note_own_message(key, message)
             record_observed = getattr(self.runtime, "record_discord_observed", None)
             if not blocked and record_observed is not None:
                 await record_observed(key, str(message.id))
             self._seen[message.id] = None
             if len(self._seen) > 10_000:
                 self._seen.pop(next(iter(self._seen)))
+
+    async def _note_own_message(self, key: SessionKey, message: Any) -> None:
+        """Tell the runtime the agent spoke for itself in this channel.
+
+        Bridge writes carry footer metadata and bridge control notices answer a
+        specific message, so a plain message from our own user is the agent
+        answering through a chat tool during its turn. That turn then narrates
+        rather than replies, and a pass marker beside any returned text stays
+        authoritative.
+        """
+        if discord_metadata(message) is not None or message.reference is not None:
+            return
+        if not isinstance(message.content, str) or not message.content.strip():
+            return
+        await self.runtime.record_self_message(key)
 
     async def _deliver_message(self, message: Any) -> bool:
         key = SessionKey(self.agent, "discord", str(message.channel.id))
@@ -232,7 +303,7 @@ class DiscordAdapter:
         roster = self._roster(message.channel, message.guild, self.client.user)
         self_id = f"<@{self.client.user.id}>"
         plan = roster.plan(message.content)
-        mentioned = self.client.user in message.mentions or self_id in plan.user_ids
+        mentioned = self.client.user in message.mentions or self_id in plan.user_ids or intentional
         command_body = (message.content.replace(f"<@{self.client.user.id}>", "")
                         .replace(f"<@!{self.client.user.id}>", "").strip())
         leading = next((mention for mention, target in plan.known
@@ -240,8 +311,13 @@ class DiscordAdapter:
         if leading is not None:
             command_body = message.content[leading.end:].lstrip(" :,\n\t")
         command = command_body.lower()
-        if mentioned and not message.author.bot and command in {"!debug", "!stop"}:
-            if command == "!debug":
+        leading_target = re.match(r"^\s*<@!?(\d+)>", message.content)
+        command_targets = {leading_target[1]} if leading_target else set()
+        if isinstance(invitations, list):
+            command_targets.update(str(user) for user in invitations)
+        command_here = not command_targets or str(self.client.user.id) in command_targets or mentioned
+        if mentioned and command_here and command in DISCORD_EARLY_COMMANDS:
+            if DISCORD_EARLY_COMMANDS[command] == "debug":
                 reply = await debug_status(self.runtime, key)
             else:
                 stopped = await self.runtime.stop_session(key, str(message.author.id))
@@ -256,23 +332,22 @@ class DiscordAdapter:
         if not await self.runtime.admit(key, mentioned or self._wake_on_any(message.channel),
                                         on_wait=compaction_notice):
             return True
-        if not message.author.bot:
-            session_command = DISCORD_SESSION_COMMANDS.get(
-                command if mentioned else message.content.strip().lower())
-            if session_command == "cancel":
-                cancelled = await self.runtime.cancel(key, str(message.author.id))
-                await message.reply(
-                    "Cancellation requested." if cancelled else
-                    "No active request from you here.", mention_author=False)
-                return True
-            if session_command == "recover":
-                recovered = await self.runtime.recover(key, str(message.author.id))
-                await message.reply(
-                    "Recovered. The next reply starts from the last saved summary; "
-                    "recent unsaved context may be missing." if recovered else
-                    "No failed checkpoint belonging to you in this channel.",
-                    mention_author=False)
-                return True
+        session_command = (DISCORD_SESSION_COMMANDS.get(
+            command if mentioned else message.content.strip().lower()) if command_here else None)
+        if session_command == "cancel":
+            cancelled = await self.runtime.cancel(key, str(message.author.id))
+            await message.reply(
+                "Cancellation requested." if cancelled else
+                "No active request from you here.", mention_author=False)
+            return True
+        if session_command == "recover":
+            recovered = await self.runtime.recover(key, str(message.author.id))
+            await message.reply(
+                "Recovered. The next reply starts from the last saved summary; "
+                "recent unsaved context may be missing." if recovered else
+                "No failed checkpoint belonging to you in this channel.",
+                mention_author=False)
+            return True
         awake = await self.runtime.is_awake(key)
         if meta:
             hop = meta.get("hop", 0)
@@ -281,24 +356,28 @@ class DiscordAdapter:
             self._scope_hops[key] = 0
         text = message.content
         selected_mode = None
-        if not message.author.bot:
-            mode_body = (message.content[leading.end:].lstrip(" :,\n\t")
-                         if leading is not None else message.content)
-            selection = mode_command(mode_body,
-                                     getattr(self.runtime, "modes", {}))
-            if selection is not None:
-                selected_mode, text = selection
-                if not text:
-                    try:
-                        notice = await self.runtime.change_mode(key, selected_mode, str(message.author.id))
-                    except StopRequested:
-                        return True  # The queued stop/cancel owns its acknowledgment.
-                    except ModeSwitchError as error:
-                        notice = str(error)
-                    await message.reply(notice, mention_author=False,
-                                        embed=self._metadata_embed("mode"))
-                    return True
-        if not awake:
+        mode_body = (message.content[leading.end:].lstrip(" :,\n\t")
+                     if leading is not None else message.content)
+        selection = (mode_command(mode_body,
+                                  getattr(self.runtime, "modes", {})) if command_here else None)
+        if selection is not None:
+            selected_mode, text = selection
+            if not text:
+                try:
+                    notice = await self.runtime.change_mode(key, selected_mode, str(message.author.id))
+                except StopRequested:
+                    return True  # The queued stop/cancel owns its acknowledgment.
+                except ModeSwitchError as error:
+                    notice = str(error)
+                await message.reply(notice, mention_author=False,
+                                    embed=self._metadata_embed("mode"))
+                return True
+        reply_context = await self._reply_context(message)
+        if reply_context:
+            text = f"{reply_context}\n\nMessage:\n{text}"
+        needs_context = getattr(self.runtime, "needs_context", None)
+        refresh_context = await needs_context(key) if needs_context is not None else not awake
+        if refresh_context:
             context = await self._context(message)
             if context:
                 text = f"Recent channel posts (read before replying):\n{context}\n\nCurrent request:\n{text}"
@@ -410,8 +489,15 @@ class DiscordAdapter:
             except Exception:
                 log.warning("Could not seal Discord progress status")
 
-    async def turn_status(self, record: Indicator, status: TurnStatus) -> str | None:
+    async def turn_status(self, record: Indicator, status: TurnStatus) -> str | None | Deferred:
         """Own reactions only; Discord has no atomic replace-reaction endpoint."""
+        import discord
+        try:
+            return await self._turn_status(record, status)
+        except discord.RateLimited as limited:
+            return Deferred("discord", limited.retry_after)
+
+    async def _turn_status(self, record: Indicator, status: TurnStatus) -> str | None:
         key, request_id = record.key, record.request_id
         if (key.transport != "discord" or key.agent != self.agent or
                 not key.scope.isdecimal() or not request_id.isdecimal()):
@@ -919,7 +1005,7 @@ class DiscordAdapter:
 
         intents = discord.Intents.default()
         intents.message_content = True
-        client = discord.Client(intents=intents)
+        client = discord.Client(intents=intents, max_ratelimit_timeout=MAX_TRANSPORT_RETRY_SECONDS)
         tree = discord.app_commands.CommandTree(client)
         self.client = client
 
