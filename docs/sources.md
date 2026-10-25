@@ -13,7 +13,8 @@ The approved additions are task upgrades, attention bells (including a minimal
 tmux example), workload metrics and chat-control/indicator improvements, with
 their existing-component fixes, regression tests and documentation.
 
-**Announcement-feed policy and the environment-doctor skill are excluded.** The
+**Announcement-feed policy remains excluded.** The later approved support-skill
+addition includes environment-doctor and tmux, described below. The
 bridge code delta ends at signed `v0.8.5`
 (`37e37e9073895ac62a19f80cea4bf66b101cfdd0`); all subsequent changes through
 `v0.9.0` concern the excluded feed feature. Existing exported Matrix skills have
@@ -25,6 +26,23 @@ remain excluded. Profiles keep configurable providers; fixtures use synthetic
 names. No live settings, transcripts, logs, credentials or generated exports are
 included. Public ledger SQL migrations and checksums are unchanged. Components
 remain opt-in; this refresh does not install or restart services.
+
+## Approved support skills — 2026-10-25
+
+`skills/environment-doctor/` and `skills/tmux/` are exported from the same verified
+skills `v0.15.0` commit above, including their bundled helpers and tests. Morrow's
+original authorship is retained; these public copies are released under this
+repository's MIT license. No proprietary third-party skill is imported.
+
+Public adaptations document Linux/POSIX limits, optional external cron-helper
+requirements, report privacy and non-health-verdict exit semantics. Test fixtures
+isolate Git identity/configuration and tmux server environments; doctor Python
+files are formatted to the public lint rules. The tmux agent-pane
+reference uses a Bash selector array to preserve socket paths with spaces and
+remains explicitly proposed/manual guidance, not an automated control
+implementation. Neither skill requires bridge credentials or a model provider.
+Doctor version/import probes still execute trusted local programs/modules; it is
+not an execution sandbox. No skill is installed by this export.
 
 ## Previous source baseline
 

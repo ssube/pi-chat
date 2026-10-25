@@ -16,7 +16,7 @@ Read [attention, awareness, and continuity](docs/attention.md) for the mechanism
 | `bridge/` | Matrix/Discord adapters, Pi RPC lifecycle, room leases, socket services, review queue |
 | [`extensions/`](extensions/README.md) | Extension inventory and interactive/headless context guide: inbox, labels, shell suggestions, questions, web tools, clock, background jobs, capture and model aliases |
 | `tools/` | Canonical Matrix operations, messaging, history, reactions, activity/session clients, ledger and fix tooling |
-| `skills/` | Agent-facing guidance for messaging, reading, awareness, reviews, and ledger use |
+| [`skills/`](skills/README.md) | Agent-facing messaging, reviews and ledger guidance, plus portable environment diagnostics and tmux pane control |
 | `tests/` | Synthetic fixtures and offline behavior tests |
 | `examples/` | Placeholder configuration only |
 
@@ -24,6 +24,7 @@ The bridge runs on Linux with Python 3.11+ and a compatible Pi executable. Exten
 
 ## Latest features
 
+- Optional [environment-doctor and tmux skills](skills/README.md) for local diagnostics and controlled pane interaction.
 - Task file/URL evidence and opt-in recent-context judging, linked questions/reviews, optional subagent/job tracking, editing and confirmed pruning.
 - TUI attention bells with a [minimal tmux snippet](docs/attention-bells.md).
 - Counts-only bridge [task/subagent workload metrics](docs/workload-metrics.md), with explicit coverage and freshness.
@@ -44,14 +45,20 @@ python -m pip install -r requirements.txt -r requirements-dev.txt -r requirement
 npm ci --prefix extensions --ignore-scripts
 python -m unittest discover -s tests/bridge -q
 python -m unittest discover -s tests -p 'test_*.py' -q
+python -m unittest discover -s skills/environment-doctor/tests -q
+python -m unittest discover -s skills/tmux/tests -q
 python -m unittest discover -s extensions/web-search -p 'test_*.py' -q
 node --test tests/*.test.cjs extensions/web-search/*.test.mjs extensions/observability/pi-capture/test/*.test.mjs extensions/observability/pi-topic/test/*.test.mjs
 bun test tests/room-lease.test.ts
-python -m ruff check --select E4,E7,E9,F bridge tools tests
+python -m ruff check --select E4,E7,E9,F bridge tools tests skills
 python -m mypy --follow-imports=silent --ignore-missing-imports bridge
 node extensions/observability/pi-topic/test/extension-smoke.mjs
 python tools/audit_export.py
 ```
+
+Skill tests use Python's standard library. Install tmux to exercise the isolated-server
+pane tests; without it those live cases skip. The existing top-level unittest
+discovery also runs both bundled skill suites; CI uses its runner's tmux package.
 
 Background-job tests additionally require a systemd user manager and skip without one; see the [stable backend prerequisites and limits](docs/background-jobs.md).
 
