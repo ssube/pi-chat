@@ -2,6 +2,16 @@
 
 Use Linux, Python 3.11+, Node 24, and a Pi installation exposing `ExtensionAPI`, `ctx.mode`, `ctx.isIdle()`, `sendUserMessage`, and the RPC `agent_settled` event. Imports currently target `@earendil-works/pi-coding-agent`, `@earendil-works/pi-ai`, and `@earendil-works/pi-tui`; install a compatible Pi distribution rather than renaming imports blindly. Topic labels additionally use `modelRegistry.streamSimple`. No particular provider or model is required.
 
+## Container option
+
+The [public runtime](../runtime/README.md) pre-installs Pi and the bridge, with
+Supervisor managing their lifecycle. Its Compose example runs non-root with
+private persistent state, no published ports and a read-only root filesystem.
+Python Playwright is installed as a client only; browsers, Chroma, Redis, SSH
+server, sudo and systemd are absent. The systemd background-job extension is
+unsupported in this container. Follow that guide instead of the host virtualenv
+steps below if using Docker.
+
 ## Bridge
 
 From the repository root, create a virtual environment and install `requirements.txt`. Copy `examples/profile.json` to an owner-only location outside this checkout, replace its placeholders, and set mode `0600`. Use absolute local paths in a real profile. Set the Matrix/Discord token variables named by the profile in the launch environment.
