@@ -19,8 +19,16 @@ function setup(branch = [], events = createBus(), onSend) {
   const ctx = {
     mode: 'tui', sessionManager: { getBranch: () => branch },
     ui: {
-      setWidget: (key, value) => widgets.push(value),
-      select: async (title) => { selectTitles.push(title); return selections.shift(); },
+      setWidget: (key, value) => {
+        if (!value) { widgets.push(undefined); return; }
+        let component;
+        const capture = () => widgets.push(component.render(2000).map(row => row.slice(1)));
+        component = value({ terminal: { rows: 60 }, requestRender: capture }, {}); capture();
+      },
+      custom: async factory => {
+        const view = factory({ terminal: { rows: 24 }, requestRender() {} }, {}, {}, () => {});
+        selectTitles.push(view.body || view.title); return selections.shift();
+      },
       editor: async () => answer,
       confirm: async () => confirmed,
       notify: (...args) => notices.push(args),
@@ -161,7 +169,11 @@ test('real shared bus derives question state, suppresses reminders, and preserve
   const handlers = {}, tools = {}, flags = {}, taskWidgets = [], taskSent = [];
   const ctx = { mode: 'tui', sessionManager: { getBranch: () => branch },
     hasPendingMessages: () => false, isIdle: () => true,
-    ui: { notify() {}, setWidget: (_key, value) => taskWidgets.push(value), theme: { fg: (_color, value) => value } } };
+    ui: { notify() {}, setWidget: (_key, value) => {
+      if (!value) { taskWidgets.push(undefined); return; }
+      let component; const capture = () => taskWidgets.push(component.render(2000).map(row => row.slice(1)));
+      component = value({ terminal: { rows: 60 }, requestRender: capture }, {}); capture();
+    }, theme: { fg: (_color, value) => value } } };
   tasksExtension({
     events, on: (name, handler) => { handlers[name] = handler; },
     registerFlag: (name, options) => { flags[name] = options; },
@@ -268,4 +280,26 @@ test('only accepted new questions ring; rejection, clearing, restoration and hea
     }
     assert.equal(count(), 1);
   });
+});
+
+
+test('non-terminal question menu explains why it cannot open', async () => {
+  const s = setup(); s.ctx.mode = 'rpc';
+  await s.commands.questions.handler('', s.ctx);
+  assert.deepEqual(s.notices.at(-1), ['/questions requires the interactive terminal UI.', 'warning']);
+  assert.equal(s.selectTitles.length, 0);
+});
+
+test('question list and full-context actions cannot bypass the shared cap', async () => {
+  const s = setup();
+  for (let i = 0; i < 20; i++) await call(s, { action: 'add', question: 'Long question '.repeat(60), context: 'Detail '.repeat(250) });
+  s.ctx.ui.select = async () => { throw Error('Unbounded menu bypass'); };
+  let frame = 0;
+  s.ctx.ui.custom = async factory => {
+    const view = factory({ terminal: { rows: 8 }, requestRender() {} }, {}, {}, () => {});
+    for (const width of [20, 40, 80]) assert.ok(view.render(width).length <= 4);
+    frame++;
+    return frame === 1 ? view.choices[0] : frame === 2 ? 'Back' : undefined;
+  };
+  await s.commands.questions.handler('', s.ctx); assert.equal(frame, 3);
 });

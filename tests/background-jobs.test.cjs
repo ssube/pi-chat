@@ -25,7 +25,11 @@ function setup(t, mode = 'tui', env = {}) {
   let confirmed = true;
   const ctx = { mode, cwd: process.cwd(), sessionManager: { getSessionId: () => 'test-session', getBranch: () => branch },
     ui: { setStatus: (...args) => statuses.push(args), setWidget() {}, notify() {}, confirm: async () => confirmed,
-      select: async (title, choices) => { titles.push(title); choicesShown.push(choices); const choice = selections.shift(); return typeof choice === 'number' ? choices[choice] : choice; } } };
+      custom: async factory => {
+        const view = factory({ terminal: { rows: 24 }, requestRender() {} }, {}, {}, () => {});
+        titles.push(view.body || view.title); choicesShown.push(view.choices);
+        const choice = selections.shift(); return typeof choice === 'number' ? view.choices[choice] : choice;
+      } } };
   const listeners = new Map();
   const events = {
     on: (name, fn) => { const list = listeners.get(name) ?? []; list.push(fn); listeners.set(name, list); },
@@ -805,4 +809,51 @@ test('completion rings once, while progress, queries, restored notified jobs and
     await until(() => s.sent.length === 2);
     assert.equal(count(), 1);
   });
+});
+
+test('background footer stays hidden when idle and clears after completion', async t => {
+  const s = setup(t); await s.ready;
+  assert.ok(s.statuses.every(([key, value]) => key !== 'background-jobs' || value === undefined));
+  const job = await s.start('sleep 0.1');
+  assert.ok(s.statuses.some(([key, value]) => key === 'background-jobs' && /1 background/.test(value ?? '')));
+  await ended(s, job.id);
+  assert.deepEqual(s.statuses.at(-1), ['background-jobs', undefined]);
+});
+
+
+nodeTest('RPC job menu emits a protocol-visible notice without requiring systemd', async () => {
+  const commands = {}; const notices = [];
+  extension({ events: { on() {}, emit() {} }, on() {}, registerTool() {}, registerCommand: (name, command) => commands[name] = command });
+  await commands.jobs.handler('', { mode: 'rpc', ui: { notify: (...args) => notices.push(args) } });
+  assert.deepEqual(notices, [['/jobs requires the interactive terminal UI.', 'warning']]);
+});
+
+test('job list and log-detail actions cannot bypass the shared cap', async t => {
+  const s = setup(t); await s.ready;
+  const job = await s.start('printf "%s" "a long log line"', { label: 'Long job label '.repeat(7) }); await ended(s, job.id);
+  s.ctx.ui.select = async () => { throw Error('Unbounded menu bypass'); };
+  let frame = 0;
+  s.ctx.ui.custom = async factory => {
+    const view = factory({ terminal: { rows: 8 }, requestRender() {} }, {}, {}, () => {});
+    for (const width of [20, 40, 80]) assert.ok(view.render(width).length <= 4);
+    frame++; return frame === 1 ? view.choices[0] : frame === 2 ? 'Back' : undefined;
+  };
+  await s.commands.jobs.handler('', s.ctx); assert.equal(frame, 3);
+});
+
+test('actual jobs menu retains status colors and shows human CPU/memory labels without coloring tool data', async t => {
+  const { stripVTControlCharacters } = require('node:util');
+  const s = setup(t); await s.ready;
+  s.ctx.ui.theme = { fg: (role, text) => `\x1b[${role === 'error' ? 31 : 36}m${text}\x1b[0m` };
+  const job = await s.start('exit 7'); const observed = await ended(s, job.id);
+  assert.equal(observed.status, 'failed');
+  const render = [], custom = s.ctx.ui.custom;
+  s.ctx.ui.custom = factory => custom((...args) => {
+    const view = factory(...args); render.push(...view.render(160)); return view;
+  });
+  s.selections.push(0, 'Back', undefined); await s.commands.jobs.handler('', s.ctx);
+  assert.ok(render.join('\n').includes('\x1b[31mfailed\x1b[0m'));
+  const text = stripVTControlCharacters(render.join('\n'));
+  assert.match(text, /CPU time:/); assert.match(text, /memory:/);
+  assert.doesNotMatch(text, /CPU ns:|memory bytes:|\[31m/);
 });

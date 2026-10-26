@@ -1,3 +1,6 @@
+import { jobStatusText, humanBytes, humanCpuTime } from "./lib/job-display.js";
+import { boundedMenu, MENU_CLOSE } from "./lib/bounded-menu.js";
+import { stableWidget } from "./lib/stable-widget.js";
 import { attentionBell } from "./lib/attention-bell.js";
 // Stable systemd user-service backend. Opt-in; no direct-process fallback.
 import { execFile } from "node:child_process";
@@ -207,13 +210,15 @@ export default function (pi: ExtensionAPI) {
 			status: job.status, finished_at: job.finished_at };
 	});
 	const persist = (job: Job) => atomic(job.metadata_path, summary(job));
+	const mountProgress = stableWidget("background-job-progress", "/jobs");
 	const showCount = () => {
 		if (ctx?.mode === "tui") {
-			ctx.ui.setStatus("background-jobs", `${[...jobs.values()].filter(active).length} background jobs · /jobs`);
+			const count = [...jobs.values()].filter(active).length;
+			ctx.ui.setStatus("background-jobs", count ? `${count} background jobs · /jobs` : undefined);
 			const rows = [...jobs.values()].filter(job => active(job) && job.progress_snapshot).slice(0, 5).map(job =>
-				`${job.id} · ${job.systemd.ActiveState ?? job.status} · ${Math.floor(summary(job).elapsed_ms / 1000)}s · ` +
+				`${job.id} · ${jobStatusText(job.status, ctx!.ui.theme, job.systemd.ActiveState ?? job.status)} · ${Math.floor(summary(job).elapsed_ms / 1000)}s · ` +
 				job.progress_snapshot!.latest_line.replace(/[\x00-\x1f\x7f]/g, " "));
-			ctx.ui.setWidget("background-job-progress", rows.length ? rows : undefined);
+			mountProgress(ctx, rows.length ? () => rows : undefined);
 		}
 	};
 	const sendSnapshot = (job: Job, event: "completed" | "log_tail_requested") => {
@@ -438,13 +443,13 @@ export default function (pi: ExtensionAPI) {
 		}));
 		if (ctx?.mode === "tui") {
 			ctx.ui.setStatus("background-jobs", undefined);
-			ctx.ui.setWidget("background-job-progress", undefined);
+			mountProgress(ctx);
 		}
 	});
 	const get = async (id: string) => {
 		const job = jobs.get(id);
 		if (!job) throw new Error(`Unknown background job: ${id}`);
-		await refresh(job);
+		await refresh(job); showCount();
 		return job;
 	};
 
@@ -561,26 +566,27 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("jobs", {
 		description: "View background jobs, elapsed time, status and output; cancel safe jobs",
 		handler: async (_args, context) => {
-			if (context.mode !== "tui") return;
+			if (context.mode !== "tui") { context.ui.notify("/jobs requires the interactive terminal UI.", "warning"); return; }
 			while (!shuttingDown) {
 				await observe(); const all = [...jobs.values()];
 				if (!all.length) { context.ui.notify("No background jobs in this session.", "info"); return; }
-				const choices = all.map(job => `${job.id} · ${job.status} · ${Math.floor(summary(job).elapsed_ms / 1000)}s · ${job.label.replace(/[\x00-\x1f\x7f]/g, " ")}`);
-				const selected = await context.ui.select("Background jobs (select to view; reopen to refresh)", choices);
-				if (selected === undefined || shuttingDown) return;
+				const choices = all.map(job => `${job.id} · ${jobStatusText(job.status, context.ui.theme)} · ${Math.floor(summary(job).elapsed_ms / 1000)}s · ${job.label.replace(/[\x00-\x1f\x7f]/g, " ")}`);
+				const selected = await boundedMenu(context, "Background jobs (reopen to refresh)", choices);
+				if (selected === undefined || selected === MENU_CLOSE || shuttingDown) return;
 				const job = all[choices.indexOf(selected)]; if (!job) return;
 				const recent = tail(job, 10, 2048);
-				const title = `${job.id} · ${job.status} · ${Math.floor(summary(job).elapsed_ms / 1000)}s\n` +
+				const title = `${job.id} · ${jobStatusText(job.status, context.ui.theme)} · ${Math.floor(summary(job).elapsed_ms / 1000)}s\n` +
 					`Unit: ${job.unit}\nSlice: ${job.slice}\nCommand: ${JSON.stringify(job.command.slice(0, 200))}\n` +
 					`Unit snapshot: ${job.systemd.ActiveState ?? "unqueried"}/${job.systemd.SubState ?? "?"} · PID: ${job.systemd.MainPID ?? "?"}\n` +
-					`CPU ns: ${job.systemd.CPUUsageNSec ?? job.systemd_final?.CPUUsageNSec ?? "unavailable"} · memory bytes: ${job.systemd.MemoryCurrent ?? job.systemd_final?.MemoryCurrent ?? "unavailable"}\n` +
+					`CPU time: ${humanCpuTime(job.systemd.CPUUsageNSec ?? job.systemd_final?.CPUUsageNSec)} · memory: ${humanBytes(job.systemd.MemoryCurrent ?? job.systemd_final?.MemoryCurrent)}\n` +
 					`Progress: ${job.progress_interval_seconds ? `${job.progress_interval_seconds}s` : "off"} · last sample: ${job.last_progress_at ?? "none"}\n` +
 					`Log bytes: ${recent.output_bytes} · last output: ${recent.output_modified_at}\n` +
 					`Exit: ${job.exit_code} · signal: ${job.signal} · unsafe: ${job.unsafe_to_terminate}\n` +
 					`Full combined stdout/stderr: ${job.log_path}\n` +
 					`${recent.truncated ? "Tail (truncated)" : "Output"}:\n${recent.output.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "")}`;
-				const action = await context.ui.select(title, ["Back", "Send log tail as steering", ...(active(job) && !job.unsafe_to_terminate ? ["Cancel job"] : [])]);
-				if (action === undefined || shuttingDown) return;
+				const action = await boundedMenu(context, `${job.id} · ${jobStatusText(job.status, context.ui.theme)}`, ["Back", "Send log tail as steering", ...(active(job) && !job.unsafe_to_terminate ? ["Cancel job"] : [])], title, { shortcuts: { s: "Send log tail as steering", ...(active(job) && !job.unsafe_to_terminate ? { c: "Cancel job" } : {}) } });
+				if (action === MENU_CLOSE || shuttingDown) return;
+				if (action === undefined) continue;
 				if (action === "Send log tail as steering") {
 					await refresh(job);
 					sendSnapshot(job, "log_tail_requested");

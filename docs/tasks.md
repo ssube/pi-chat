@@ -166,7 +166,7 @@ only while that popup has focus, not to typing in the main editor:
 | Key | Action |
 | --- | --- |
 | `p` | Move the selected incomplete task to the front of the ledger and post one visible steering request to work on it next at a safe boundary. Starts an idle agent; does not mark progress, unblock a task, expand authority or change a persistent reminder pause. |
-| `c` | For the in-progress task only: return its marker to pending, suspend automatic reminders, and steer a stop request. Does not wake an idle agent, claim completion, or terminate an already-running tool/external job. Escape remains the agent interruption control. |
+| `c` | For the in-progress task only: confirm **Request stop…**, then return its marker to pending, suspend automatic reminders, and steer a stop request. Does not wake an idle agent, claim completion, or terminate an already-running tool/external job. Escape remains the agent interruption control. |
 | `x` | Confirm deletion of a selected task that is **not** in progress. In-progress tasks cannot be deleted; cancel/return them to pending first. |
 | `n` | Open Add task directly. |
 | `q` / Escape | Close the menu without starting work. |
@@ -248,3 +248,38 @@ ordinary local unit runs skip the contract only when that variable is absent.
 A configured but unavailable SDK fails rather than skipping.
 
 It loads only this extension with isolated configuration and an in-memory session, replaces the model stream with fake responses, and checks **actual Pi settlement continuation**, model-visible task context, tool registration, direct-stop behavior, and `/tasks` dispatch without provider inference. It also exercises real slash-command steering and a model-issued `tasks_summary` call: both post visible summaries, wake/deliver to the main agent, and leave completion state unchanged. The pinned CI invocation does not skip this test. Real-model judge quality and interactive visual rendering still need a separately authorized live trial; unit/SDK tests do not establish them.
+
+### Stop requests are not execution termination
+
+The in-progress action is **Request stop…** (shortcut `c`). Confirmation explains
+that running tools and external jobs may continue, and points to Escape and
+`/jobs` for their separate controls. After confirmation the ledger displays
+**[stop requested]**, persists `stop_requested: true`, returns the task to pending
+and suspends automatic reminders for the whole ledger. This marker records the request, not an
+acknowledgment that execution has stopped. User prioritization, marking the task
+in progress, resuming it or overriding completion clears the marker. After an
+explicit user restart instruction, the normal `tasks_progress(task_id)` path also
+clears it so authorized progress remains actionable. Passive context retains the
+stop-request interpretation even when all actionable work is stopped. It does not
+authorize the agent to resume stopped work without a user instruction.
+
+
+### Menu navigation and detail hierarchy
+
+The list remembers the task selected while inspecting or editing it. Escape
+returns from a task inspector to the list; Escape at the list closes it, and
+`q` closes either level. The inspector leads with summary, acceptance, blocker
+and waiting owner. Choose **View diagnostics (read-only)** for review metadata,
+evidence, subagent tracking, assessment and completion ownership; edits to that
+viewer are discarded. Full criteria/evidence views remain available.
+
+
+### Compact global actions
+
+The root task list ends with **Add task**, **More actions…** and **Close**.
+**More actions…** contains only clearing completed tasks and pausing/resuming
+reminders. Sending and AI help live on the selected task: **Send this task to
+session** sends that task only; **Ask AI about this task… (extra model call)**
+summarizes that task with recent conversation, with explicit model-call labeling. Escape or Back returns to the root; `q` closes.
+Existing direct `/tasks-add`, `/tasks-prune`, `/tasks-send` and `/tasks-summary`
+commands remain available. Removal/override confirmations are unchanged.

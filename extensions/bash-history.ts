@@ -1,3 +1,4 @@
+import { boundedMenu, MENU_CLOSE } from "./lib/bounded-menu.js";
 import { createLocalBashOperations, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -96,14 +97,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("shell-suggestions", {
 		description: "Review model-proposed shell commands and insert one into the editor (does not execute)",
 		handler: async (_args, ctx) => {
-			if (ctx.mode !== "tui") return;
+			if (ctx.mode !== "tui") { ctx.ui.notify("/shell-suggestions requires the interactive terminal UI.", "warning"); return; }
 			if (!proposals.length) {
 				ctx.ui.notify("No shell command suggestions yet.", "info");
 				return;
 			}
 			const choices = proposals.map((item, index) => `${index + 1}. ${item.command} — ${item.reason}`);
-			const selected = await ctx.ui.select("Shell suggestions (no command runs here)", choices);
-			if (selected === undefined) return;
+			const selected = await boundedMenu(ctx, "Shell suggestions (no command runs here)", choices, "", { shortcuts: { i: "@selected" }, shortcutLabels: { i: "review/insert selected command" } });
+			if (selected === undefined || selected === MENU_CLOSE) return;
 			const proposal = proposals[choices.indexOf(selected)];
 			if (!proposal) return;
 			if (ctx.ui.getEditorText() && !(await ctx.ui.confirm("Replace current draft?", "This will replace your unsent editor text."))) return;

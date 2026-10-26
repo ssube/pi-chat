@@ -1,6 +1,22 @@
 # Source provenance
 
-## Tagged refresh — 2026-10-25
+## TUI/task/job refresh — 2026-10-26
+
+The existing public task, question, shell and background-job extensions and their
+implementation helpers/tests are refreshed from verified signed skills tag
+`v0.16.1`, peeled commit `59af0b4011dab6931b29d24a0e22f894cfab848b`.
+This selective port includes bounded/themed menus, preserved ANSI status colors,
+consistent navigation and local action keys, stable widgets, task-scoped actions,
+request-stop semantics, and colored/human-readable job status/resources.
+
+The public Pi SDK baseline remains `0.99.1`; no runtime image or provider defaults
+are changed. Fixtures keep generic reviewer names/references. The bridge baseline
+and all previous exclusions remain unchanged: no announcement-feed policy,
+private routing, profiles, deployment orchestration, credentials, logs or generated
+exports. Owner-local prompt-suggestion and model-approval helpers are not added.
+Components stay opt-in; publishing does not install or restart a service.
+
+## Previous tagged refresh — 2026-10-25
 
 | Component source | Verified tag | Peeled commit |
 | --- | --- | --- |
