@@ -1,5 +1,37 @@
 # Source provenance
 
+## Extension parity refresh — 2026-10-26
+
+The native-SelectList fix is ported from verified signed skills tag `v0.16.2`,
+peeled commit `391c8b3cd0c6a5317b2da6b78ce5b127cd3b1009` (signature checked
+against the repository-pinned release certificate). `tasks.ts` and
+`lib/bounded-menu.ts` match that source byte-for-byte. Tests cover real Pi
+SelectList behavior, wraparound, configured bindings, styles, resize and mouse
+navigation; synthetic public task fixtures remain intact.
+
+The attention-lease formatter also includes the authored-quote fix from bridge
+commit `77f014f9c62404f4794d2cf6c74ab54db7c20eca`: only an MXID-marked reply
+fallback is stripped. Its implementation matches current bridge main's extension;
+no other bridge/server changes are imported.
+
+Two previously owner-local helpers are now selectively ported with offline tests:
+`model-control.ts` (explicit local approval or delegated judge) and
+`next-prompt/` (bounded conversation-to-editor drafting). Model control resolves
+the adjacent public menu helper, not an owner installation. Prompt drafting has
+no hardcoded provider/model: both require explicit environment configuration.
+Neither is installed/enabled by this refresh. See [session assistants](session-assistants.md).
+
+The remaining shared extension, web and observability implementations were
+compared with current private sources. Existing differences are retained public
+adaptations, not missing fixes: configurable providers and room-label paths,
+generic fixtures, and omission of deployment-specific plan injection, calibration,
+shadow services and schema assumptions. Public short-context aliases already
+include stricter validation and provider-boundary ID translation than the local
+variant; its owner-specific model list is not copied. No runtime subagent config,
+real identities, credentials, transcripts, logs or generated exports are included.
+The previous bridge, runtime, ledger migration and unrelated-skill boundaries
+remain unchanged. All components remain opt-in.
+
 ## TUI/task/job refresh — 2026-10-26
 
 The existing public task, question, shell and background-job extensions and their

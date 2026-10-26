@@ -7,6 +7,8 @@ Load only the entrypoints you need, not this entire directory. Dependencies are 
 | Entrypoint | Useful context | Purpose and limitations |
 | --- | --- | --- |
 | [`pi-time.ts`](pi-time.ts) | **Both** | `clock` and abortable `sleep_until`; headless callers receive tool progress/results, while the TUI can display a countdown status. |
+| [`model-control.ts`](model-control.ts) | **Interactive-first; partial headless** | Current/list work headlessly; session-only selection requires a local Approve/Deny/Send to judge menu. Favorites only; judging is an explicit extra model call. See [approval and privacy limits](../docs/session-assistants.md). |
+| [`next-prompt/index.ts`](next-prompt/index.ts) | **Interactive only** | `/suggest-next` drafts into an empty editor without submitting. Requires explicit `PI_SUGGEST_PROVIDER`/`PI_SUGGEST_MODEL`; sends bounded conversation prose only when invoked. See [setup and limits](../docs/session-assistants.md). |
 | [`short-context-models.ts`](short-context-models.ts) | **Both** | Adds half-context aliases for explicitly selected existing models. TUI users can choose them in the model picker; headless callers can select the registered aliases through their normal model-selection mechanism. Missing local config is a no-op. No inference on load; using an alias still uses the original provider/pricing. See [setup and limits](../docs/short-context-models.md). |
 | [`attention-bell.ts`](attention-bell.ts) | **Interactive only** | BEL at full settlement and successful compaction; task/question/job events use the same TUI/TTY-only helper. See [events and minimal tmux config](../docs/attention-bells.md). |
 | [`bridge-workload-metrics.ts`](bridge-workload-metrics.ts) | **RPC only** | Counts-only task/native-subagent observations over Pi status frames; no tools, inference or transcript reads. Missing sources stay unavailable. See [metrics and coverage](../docs/workload-metrics.md). |
@@ -36,7 +38,9 @@ Extension state, model selections, auth files, telemetry and real transcripts be
 ## Bounded TUI menus and status display
 
 `/tasks`, `/questions`, `/jobs` and `/shell-suggestions` share bounded menus.
-Configured Pi navigation/confirm/cancel/page bindings win over local mnemonics;
+Pi's native `SelectList` owns selection, wraparound navigation and pointer handling;
+the shared shell budgets title, details and footer rows. Configured Pi
+navigation/confirm/cancel/page bindings win over local mnemonics;
 Escape returns one level, `q` closes and `?` shows actual keys. Long details
 scroll independently from actions. Task menus preserve ANSI status colors and
 theme highlighting; encoded key events and list mouse navigation are supported.

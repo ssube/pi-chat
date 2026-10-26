@@ -1328,7 +1328,8 @@ test('real menu component navigates with arrows, selects with Enter and scopes s
   const component = taskMenuComponent('Tasks', choices, 1, { fg: (_color, value) => value }, value => results.push(value), () => redraws++);
   assert.equal(component.list.getSelectedItem().value, 'Two');
   component.handleInput('\x1b[B'); assert.equal(component.list.getSelectedItem().value, 'Three');
-  component.handleInput('\x1b[B'); assert.equal(component.list.getSelectedItem().value, 'Three');
+  component.handleInput('\x1b[B'); assert.equal(component.list.getSelectedItem().value, 'One');
+  component.handleInput('\x1b[A'); assert.equal(component.list.getSelectedItem().value, 'Three');
   component.handleInput('\x1b[A'); assert.equal(component.list.getSelectedItem().value, 'Two');
   component.handleInput('\x1b[B');
   component.handleInput('p'); assert.deepEqual(results.at(-1), { value: 'Three', key: 'p' });

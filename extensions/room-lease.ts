@@ -25,11 +25,11 @@ export function formatMatrixMessage(room: string, event: MatrixEvent, reply?: Re
   const relation = content["m.relates_to"];
   let body = content.body as string;
   // Do not present Matrix's plaintext reply fallback twice.
-  if (relation?.["m.in_reply_to"] && body.startsWith("> ")) {
+  if (relation?.["m.in_reply_to"] && /^> <@[^\s>]+>(?:[ \t]|$)/.test(body)) {
     const split = body.search(/\r?\n\r?\n/);
     const firstBreak = body.search(/\r?\n/);
     body = split >= 0 ? body.slice(split).replace(/^\r?\n\r?\n/, "")
-      : firstBreak >= 0 ? body.slice(firstBreak).replace(/^\r?\n/, "") : "";
+      : firstBreak >= 0 ? body.slice(firstBreak).replace(/^\r?\n/, "") : body;
   }
   const thread = relation?.rel_type === "m.thread" ? ` · thread ${relation.event_id}` : "";
   const source = `Matrix · room ${room}${thread} · sender ${event.sender} · event ${event.event_id}`;

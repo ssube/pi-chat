@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { closeSync, constants, fstatSync, openSync, readSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { Type } from "typebox";
-import { getKeybindings, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const entryType = "tasks-state-v1";
@@ -245,15 +245,14 @@ export function readEvidenceFile(cwd: string, requested: string): string {
 type MenuSelection = { value?: string; key?: "c" | "x" | "p" | "n" | "q" | "e" | "a" | "s" | "m" };
 
 export function taskMenuComponent(title: string, choices: string[], selectedIndex: number,
-	theme: ExtensionContext["ui"]["theme"], done: (selection: MenuSelection) => void, redraw: () => void, terminalRows: number | (() => number) = 24,
-	keys = getKeybindings()) {
+	theme: ExtensionContext["ui"]["theme"], done: (selection: MenuSelection) => void, redraw: () => void, terminalRows: number | (() => number) = 24) {
 	const [heading, ...details] = title.split("\n");
 	const shortcuts = Object.fromEntries(["c", "x", "p", "n", "e", "a", "s", "m"].map(key => [key, `__task_key:${key}`]));
 	const view = boundedMenuComponent(heading, choices, details.join("\n"), () => typeof terminalRows === "function" ? terminalRows() : terminalRows, value => {
 		if (value === MENU_CLOSE) done({ key: "q" });
 		else if (value?.startsWith("__task_key:")) done({ value: view.list.getSelectedItem()?.value, key: value.slice(11) as MenuSelection["key"] });
 		else done({ value });
-	}, redraw, { theme, keys: typeof keys?.matches === "function" ? keys : getKeybindings(), selectedIndex, shortcuts, shortcutLabels: {
+	}, redraw, { theme, selectedIndex, shortcuts, shortcutLabels: {
 		c: "request stop (in-progress only)", x: "remove (non-progress only)", p: "prioritize selected task",
 		n: "new task", e: "edit selected task", a: "ask AI about selected task (extra call)", s: "send selected task", m: "list actions",
 	} });
@@ -968,8 +967,8 @@ export default function (pi: ExtensionAPI, readUrl: UrlReader = defaultUrlReader
 						[...all.map(task => `#${task.id} ${statusLabel(task, ctx)} ${line(task.summary)}`), "Add task", "More actions…", "Close"];
 					const remembered = all.findIndex(task => task.id === focusedTask);
 					const progressing = remembered >= 0 ? remembered : menuFocus === "progress" ? all.findIndex(task => task.status === "progress") : -1;
-					const selection: MenuSelection = addNext ? { value: "Add task" } : await ctx.ui.custom<MenuSelection>((tui, theme, keys, done) => taskMenuComponent(
-						moreOpen ? "List actions · reminder settings and completed-task cleanup" : "Tasks · select a task to inspect or change", choices, moreOpen ? 0 : progressing >= 0 ? progressing : all.length, theme, done, () => tui.requestRender(), () => tui.terminal.rows, keys));
+					const selection: MenuSelection = addNext ? { value: "Add task" } : await ctx.ui.custom<MenuSelection>((tui, theme, _keys, done) => taskMenuComponent(
+						moreOpen ? "List actions · reminder settings and completed-task cleanup" : "Tasks · select a task to inspect or change", choices, moreOpen ? 0 : progressing >= 0 ? progressing : all.length, theme, done, () => tui.requestRender(), () => tui.terminal.rows));
 					addNext = false;
 					const choice = selection.key === "n" ? "Add task" : selection.value;
 					if (!current() || selection.key === "q" || choice === "Close") return;
@@ -1006,10 +1005,10 @@ Evidence: ${selected.evidence ?? "none"}
 ` +
 						`Assessment: ${selected.assessment ? JSON.stringify(selected.assessment, null, 2) : "none"}
 Completed by: ${selected.completedBy ?? "not completed"}`;
-					const actionSelection = selection.key ? selection : await ctx.ui.custom<MenuSelection>((tui, theme, keys, done) => taskMenuComponent(
+					const actionSelection = selection.key ? selection : await ctx.ui.custom<MenuSelection>((tui, theme, _keys, done) => taskMenuComponent(
 						`#${selected.id} ${statusLabel(selected, ctx)}: ${menuExcerpt(selected.summary, 80)}\nAcceptance: ${menuExcerpt(selected.acceptance, 100)}\n` +
 						`Blocker: ${menuExcerpt(selected.blocker ?? "none", 100)}\nWaiting on: ${menuExcerpt(jobAvailability(selected) === "unavailable" ? "background job unavailable; manual unblock available" : selected.waiting_on ?? selected.review?.reviewer ?? selected.background_job?.id ?? "none", 80)}`,
-						actions, 0, theme, done, () => tui.requestRender(), () => tui.terminal.rows, keys));
+						actions, 0, theme, done, () => tui.requestRender(), () => tui.terminal.rows));
 					if (actionSelection.key === "q") return;
 					if (actionSelection.key === "m") { moreOpen = true; continue; }
 					if (actionSelection.key === "n") { addNext = true; continue; }
