@@ -25,6 +25,9 @@ The bridge runs on Linux with Python 3.11+ and a compatible Pi executable. Exten
 
 ## Latest features
 
+- Optional [session model approval and next-prompt drafting](docs/session-assistants.md), with explicit approval/provider boundaries.
+- Native Pi SelectList navigation (including wrapping) inside bounded menus.
+- Matrix attention delivery preserves authored quotes while stripping recognized reply fallbacks.
 - Bounded, themed extension menus with consistent keyboard help, restored status colors and mouse/encoded-key support.
 - Task-scoped actions and honest request-stop markers; stable HUD widgets without refresh reordering.
 - Colored background-job states and human-readable CPU-time/memory displays.

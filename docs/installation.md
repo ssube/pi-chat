@@ -86,3 +86,11 @@ sharing. It is not a sandbox for hostile executables or imported packages.
 with Enter by default. Read first, target an exact pane ID, and retain the same
 server selector. Sending is not proof of execution or completion. The advanced
 agent-pane reference is manual guidance, not an automatic state classifier.
+
+## Optional session assistants
+
+Load `extensions/model-control.ts` for locally approved, session-only model changes,
+or `extensions/next-prompt/index.ts` for `/suggest-next` draft insertion. The latter
+requires explicit `PI_SUGGEST_PROVIDER` and `PI_SUGGEST_MODEL` before loading; no
+provider is chosen for you. See [setup, approval and disclosure limits](session-assistants.md).
+These helpers are not installed or enabled automatically.

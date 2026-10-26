@@ -218,6 +218,24 @@ test("Matrix reply quotes one attributed original and strips client fallback", (
     .toContain(`> ${"x".repeat(1600)}\n\nMessage:\nMy reply`);
 });
 
+test("reply fallback requires an MXID marker, preserving authored quotes", () => {
+  const room = "!private:example.test";
+  const event = { event_id: "$child", sender: "@peer:example.test", content: {
+    msgtype: "m.text", body: "", "m.relates_to": { "m.in_reply_to": { event_id: "$parent" } },
+  } };
+  const parent = { event_id: "$parent", sender: "@other:example.test", body: "Parent text" };
+  for (const body of ["> An authored quote", "> An authored quote\r\nmore",
+                      "> An authored quote\n\nMy answer", "> <not-a-user> ordinary quote\nMy answer"]) {
+    expect(formatMatrixMessage(room, { ...event, content: { ...event.content, body } }, parent))
+      .toContain(`Message:\n${body}`);
+  }
+  for (const newline of ["\n", "\r\n", "\n\n", "\r\n\r\n"]) {
+    expect(formatMatrixMessage(room, { ...event, content: { ...event.content,
+      body: `> <@other:example.test> earlier${newline}My answer` } }, parent))
+      .toContain("Message:\nMy answer");
+  }
+});
+
 test("lease status shows active ownership and warns when the bridge loses it", async () => {
   const directory = mkdtempSync(join(tmpdir(), "pi-status-test-"));
   const socket = join(directory, "bridge.sock");

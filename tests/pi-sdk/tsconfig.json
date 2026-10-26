@@ -6,11 +6,12 @@
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
     "types": ["node"],
     "typeRoots": ["./node_modules/@types"],
     "paths": {
       "@earendil-works/pi-coding-agent": ["./node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"]
     }
   },
-  "files": ["../../extensions/lib/job-display.ts", "../../extensions/attention-bell.ts", "../../extensions/tasks.ts", "../../extensions/follow-up-questions.ts", "../../extensions/bridge-workload-metrics.ts"]
+  "files": ["../../extensions/lib/job-display.ts", "../../extensions/attention-bell.ts", "../../extensions/tasks.ts", "../../extensions/follow-up-questions.ts", "../../extensions/bridge-workload-metrics.ts", "../../extensions/model-control.ts", "../../extensions/next-prompt/index.ts"]
 }
