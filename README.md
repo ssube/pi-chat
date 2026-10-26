@@ -25,6 +25,10 @@ The bridge runs on Linux with Python 3.11+ and a compatible Pi executable. Exten
 
 ## Latest features
 
+- Bounded, themed extension menus with consistent keyboard help, restored status colors and mouse/encoded-key support.
+- Task-scoped actions and honest request-stop markers; stable HUD widgets without refresh reordering.
+- Colored background-job states and human-readable CPU-time/memory displays.
+
 - Optional [Pi/bridge runtime container](runtime/README.md), managed by Supervisor, with the Python Playwright client but no browser or database services.
 
 - Optional [environment-doctor and tmux skills](skills/README.md) for local diagnostics and controlled pane interaction.

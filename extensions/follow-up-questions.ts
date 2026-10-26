@@ -1,3 +1,5 @@
+import { boundedMenu, MENU_CLOSE } from "./lib/bounded-menu.js";
+import { stableWidget } from "./lib/stable-widget.js";
 import { attentionBell } from "./lib/attention-bell.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -24,8 +26,9 @@ export default function (pi: ExtensionAPI) {
 		query.ids = linked.map(item => item.id);
 		query.waiting_ids = linked.filter(item => item.wait_for_answer === true).map(item => item.id);
 	});
+	const mountQuestions = stableWidget(entryType, "/questions");
 	const showCount = (ctx: ExtensionContext) => {
-		if (ctx.mode === "tui") ctx.ui.setWidget(entryType, questions.length ?
+		mountQuestions(ctx, questions.length ? () =>
 			[`? ${questions.length} question${questions.length === 1 ? "" : "s"} · /questions to answer or clear`] : undefined);
 		pi.events.emit("questions:changed-v1", {});
 	};
@@ -101,12 +104,12 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("questions", {
 		description: "Answer or clear queued follow-up questions",
 		handler: async (_args, ctx) => {
-			if (ctx.mode !== "tui") return;
+			if (ctx.mode !== "tui") { ctx.ui.notify("/questions requires the interactive terminal UI.", "warning"); return; }
 			while (questions.length) {
 				const choices = questions.map((item) => `#${item.id}${item.task_id ? ` [task #${item.task_id}]` : ""}${item.wait_for_answer ? " [waiting]" : ""} ${item.text.replace(/\s+/g, " ")}`);
 				choices.push("Clear all questions");
-				const selected = await ctx.ui.select("Queued follow-up questions", choices);
-				if (selected === undefined) return;
+				const selected = await boundedMenu(ctx, "Queued follow-up questions", choices);
+				if (selected === undefined || selected === MENU_CLOSE) return;
 				if (selected === "Clear all questions") {
 					if (await ctx.ui.confirm("Clear all questions?", `Remove ${questions.length} pending questions?`)) {
 						questions = [];
@@ -118,7 +121,8 @@ export default function (pi: ExtensionAPI) {
 				const item = questions[choices.indexOf(selected)];
 				if (!item) return;
 				const heading = `#${item.id}${item.task_id ? ` [task #${item.task_id}]` : ""} ${item.text}${item.context ? `\n\n${item.context}` : ""}`;
-				const action = await ctx.ui.select(heading, ["Answer", "Clear this question", "Back"]);
+				const action = await boundedMenu(ctx, `Question #${item.id}`, ["Answer", "Clear this question", "Back"], heading, { shortcuts: { a: "Answer", x: "Clear this question" } });
+				if (action === MENU_CLOSE) return;
 				if (action === "Back" || action === undefined) continue;
 				if (action === "Clear this question") {
 					questions = questions.filter((q) => q.id !== item.id);
@@ -126,7 +130,7 @@ export default function (pi: ExtensionAPI) {
 					showCount(ctx);
 					continue;
 				}
-				const answer = (await ctx.ui.editor(`Answer: ${item.text}`))?.trim();
+				const answer = (await ctx.ui.editor(`Answer question #${item.id}`))?.trim();
 				if (!answer) continue;
 				const previous = questions;
 				questions = questions.filter((q) => q.id !== item.id);

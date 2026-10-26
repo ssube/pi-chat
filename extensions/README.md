@@ -31,3 +31,29 @@ The adjacent `.mjs` modules under `web-search/` and `observability/` are impleme
 - **No provider or spending authorization:** do not enable model-backed judging, summaries, naming or search on the strength of installed credentials alone. Loading an extension does not authorize its consequential actions, telemetry disclosure or shell commands.
 
 Extension state, model selections, auth files, telemetry and real transcripts belong outside this public source tree. See [installation](../docs/installation.md) for explicit loading and configuration rather than copying private runtime files here.
+
+
+## Bounded TUI menus and status display
+
+`/tasks`, `/questions`, `/jobs` and `/shell-suggestions` share bounded menus.
+Configured Pi navigation/confirm/cancel/page bindings win over local mnemonics;
+Escape returns one level, `q` closes and `?` shows actual keys. Long details
+scroll independently from actions. Task menus preserve ANSI status colors and
+theme highlighting; encoded key events and list mouse navigation are supported.
+The task HUD retains its styling; stable widgets update without reordering and
+show bounded previews with overflow hints.
+
+Task actions live on the selected task: `e` edit, `s` send, `a` ask AI (explicit
+extra model call), `p` prioritize, `c` request stop and `x` remove. `n` adds a task;
+`m` opens list-wide reminder/cleanup controls. Questions use `a` answer/`x` clear;
+job details use `s` send tail/`c` cancel a safe local job after confirmation;
+shell suggestions use `i` review/insert, never execute on selection. Existing
+list-wide slash commands remain available. See [tasks](../docs/tasks.md) and
+[jobs](../docs/background-jobs.md) for scope and stop boundaries.
+
+Job states use semantic theme colors. CPU is elapsed CPU time (ms/s/min/h), not
+percent; memory uses IEC units. Unknown counters remain unavailable. Helper files
+under `lib/` are implementation modules, not extension entrypoints.
+
+Tests: `node --test tests/bounded-menu.test.cjs tests/stable-widget.test.cjs tests/job-display.test.cjs tests/tasks.test.cjs tests/background-jobs.test.cjs tests/follow-up-questions.test.cjs tests/bash-history.test.cjs`.
+Service tests require a user systemd manager; renderer/unit tests do not.

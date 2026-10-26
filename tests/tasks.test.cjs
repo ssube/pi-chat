@@ -25,7 +25,13 @@ function setup(branch = [], flags = {}, readUrl) {
     } },
     ui: {
       theme: { fg: (_color, value) => value },
-      setWidget: (key, value) => widgets.push(value), notify: (...args) => notices.push(args),
+      setWidget: (key, value) => {
+        if (!value) { widgets.push(undefined); return; }
+        let component;
+        const capture = () => widgets.push(flags['tasks-widget-single-line'] ? () => component : component.render(2000).map(row => row.slice(1)));
+        component = value({ terminal: { rows: 60 }, requestRender: capture }, {});
+        capture();
+      }, notify: (...args) => notices.push(args),
       select: async (title, choices) => {
         titles.push(title);
         const value = selections.shift();
@@ -34,7 +40,7 @@ function setup(branch = [], flags = {}, readUrl) {
       input: async () => inputs.shift(), editor: async (...args) => { editors.push(args); return inputs.shift(); }, confirm: async () => confirms.shift() ?? true,
       custom: async factory => {
         let result, finished = false;
-        const component = await factory({ requestRender() {} }, ctx.ui.theme, {}, value => { result = value; finished = true; });
+        const component = await factory({ terminal: { rows: 24 }, requestRender() {} }, ctx.ui.theme, {}, value => { result = value; finished = true; });
         const original = component.list.getSelectedItem()?.value;
         focuses.push(original);
         const choices = [];
@@ -190,8 +196,9 @@ test('review checkpoint is visible in task menu and clears on resume or changed 
   const future = new Date(Date.now() + 86_400_000).toISOString();
   const mark = () => call(s, 'tasks_review', { task_id: 1, reviewer: 'Reviewer', artifact: 'PR #42', check_at: future });
   await mark();
-  s.select(pickTask(1), 'Back', 'Close'); await s.commands.tasks.handler('', s.ctx);
-  assert.match(s.titles.join('\n'), /Review: Reviewer · PR #42/);
+  s.select(pickTask(1), 'View diagnostics (read-only)', 'Close'); await s.commands.tasks.handler('', s.ctx);
+  assert.match(s.editors.at(-1)[1], /Reviewer/);
+  assert.match(s.editors.at(-1)[1], /PR #42/);
   assert.match(s.titles.join('\n'), /Waiting on: Reviewer/);
   s.select(pickTask(1), 'Resume task', 'Close'); await s.commands.tasks.handler('', s.ctx);
   assert.equal((await list(s)).tasks[0].status, 'pending');
@@ -282,7 +289,7 @@ test('unblock respects stops, paused reminders and the no-progress budget', asyn
   await call(s, 'tasks_unblock', { task_id: 1 });
   assert.equal(settle(s), undefined, 'unblock must not override a stop');
   input(s); // A stopped menu offers Resume; genuine input enables the Pause action.
-  s.select('Pause reminders', 'Close'); await s.commands.tasks.handler('', s.ctx);
+  s.select('More actions…', 'Pause reminders', 'Back', 'Close'); await s.commands.tasks.handler('', s.ctx);
   input(s);
   await call(s, 'tasks_block', { task_id: 1, reason: 'Paused' });
   await call(s, 'tasks_unblock', { task_id: 1 });
@@ -330,7 +337,7 @@ test('progress cannot replenish reminders or override stop/pause and cancels sta
   s.handlers.input({ source: 'interactive', text: 'Stop' }, s.ctx);
   await call(s, 'tasks_progress', { task_id: 1, active: false }); assert.equal(settle(s), undefined);
   input(s); // Exercise the real visible Pause action after the stop assertion.
-  s.select('Pause reminders', 'Close'); await s.commands.tasks.handler('', s.ctx); input(s);
+  s.select('More actions…', 'Pause reminders', 'Back', 'Close'); await s.commands.tasks.handler('', s.ctx); input(s);
   await call(s, 'tasks_progress', { task_id: 1 }); assert.equal((await list(s)).paused, true); assert.equal(settle(s), undefined);
   let resolve; s.judge(() => new Promise(done => { resolve = done; })); const assessment = complete(s);
   await call(s, 'tasks_progress', { task_id: 1, active: false }); assert.equal(s.requests[0][2].signal.aborted, true);
@@ -626,7 +633,7 @@ test('six automatic continuations survive accepted progress and restoration; onl
   await restored.commands.tasks.handler('', restored.ctx);
   assert.equal(restored.sent.length, 0, 'menu add is not a budget reset or unbounded follow-up');
   assert.equal(settle(restored), undefined, 'restoration retained the exhausted count');
-  restored.select('Resume reminders', 'Close');
+  restored.select('More actions…', 'Resume reminders', 'Back', 'Close');
   await restored.commands.tasks.handler('', restored.ctx);
   assert.equal(restored.sent.length, 1, 'explicit Resume starts one counted follow-up');
   assert.equal(restored.branch.at(-1).data.automaticContinuations, 1);
@@ -697,7 +704,7 @@ test('blocked/completed ledgers retire stale reminders and never schedule anothe
     } else assert.equal(messages.length, 1, 'completed-only context needs no task prompt');
     assert.equal(settle(s), undefined);
     s.handlers.agent_settled({}, s.ctx); t.mock.timers.tick(180000); assert.equal(s.sent.length, 0);
-    s.select('Pause reminders', 'Resume reminders', 'Close'); await s.commands.tasks.handler('', s.ctx); assert.equal(s.sent.length, 0);
+    s.select('More actions…', 'Pause reminders', 'Resume reminders', 'Back', 'Close'); await s.commands.tasks.handler('', s.ctx); assert.equal(s.sent.length, 0);
   }
 });
 
@@ -749,7 +756,7 @@ test('task inspector truncates the header and offers full private criteria/evide
   await s.commands.tasks.handler('', s.ctx);
   assert.equal(s.editors[0][1], 'A'.repeat(1000));
   assert.match(s.editors[0][0], /changes discarded/);
-  const inspector = s.titles.find(title => title.includes('Full criteria/evidence'));
+  const inspector = s.titles.find(title => title.includes('View diagnostics (read-only)'));
   assert.ok(inspector, `inspector heading missing; captured title lengths: ${s.titles.map(title => title.length).join(', ')}`);
   // Retain the criteria-only action alongside Edit task: one additional padded menu row.
   assert.ok(inspector.length < 3200, `inspector popup grew to ${inspector.length} characters`);
@@ -803,9 +810,9 @@ test('/tasks is a menu: add, inspect, cancel removal, confirmed removal, IDs nev
 
 test('menu-only override records user authorship, paused state persists, blocked tasks resume', async () => {
   const s = setup(); await add(s); input(s);
-  s.select('Pause reminders', 'Close'); await s.commands.tasks.handler('', s.ctx);
+  s.select('More actions…', 'Pause reminders', 'Back', 'Close'); await s.commands.tasks.handler('', s.ctx);
   assert.equal(settle(s), undefined); assert.equal((await list(setup(s.branch))).paused, true);
-  s.select('Resume reminders', 'Close'); await s.commands.tasks.handler('', s.ctx);
+  s.select('More actions…', 'Resume reminders', 'Back', 'Close'); await s.commands.tasks.handler('', s.ctx);
   assert.equal((await list(s)).paused, false);
   await call(s, 'tasks_block', { task_id: 1, reason: 'Waiting for approval' });
   s.select(pickTask(1), 'Resume task', 'Close'); await s.commands.tasks.handler('', s.ctx);
@@ -879,8 +886,8 @@ test('user add/resume wakes via attributed follow-up; pausing and merely browsin
   await s.commands.tasks.handler('', s.ctx);
   assert.equal(s.sent.length, 1); assert.deepEqual(s.sent[0][1], { deliverAs: 'followUp', triggerTurn: true });
   s.select('Close'); await s.commands.tasks.handler('', s.ctx); assert.equal(s.sent.length, 1);
-  s.select('Pause reminders', 'Close'); await s.commands.tasks.handler('', s.ctx); assert.equal(s.sent.length, 1);
-  s.select('Resume reminders', 'Close'); await s.commands.tasks.handler('', s.ctx); assert.equal(s.sent.length, 2);
+  s.select('More actions…', 'Pause reminders', 'Back', 'Close'); await s.commands.tasks.handler('', s.ctx); assert.equal(s.sent.length, 1);
+  s.select('More actions…', 'Resume reminders', 'Back', 'Close'); await s.commands.tasks.handler('', s.ctx); assert.equal(s.sent.length, 2);
 });
 
 test('accepted completion resets no-progress budget; rejected submissions do not', async () => {
@@ -970,13 +977,13 @@ test('summary slash arguments and menu question both reach the aside; menu list 
   const s = setup(); await add(s); s.judge(async () => summaryResponse());
   await s.commands['tasks-summary'].handler('Why are we stuck?', s.ctx);
   assert.equal(JSON.parse(s.requests[0][1].messages[0].content).question, 'Why are we stuck?');
-  s.select('Summarize tasks with AI'); s.inputs('What help is needed?');
+  s.select(pickTask(1), 'Ask AI about this task… (extra model call)'); s.inputs('What help is needed?');
   await s.commands.tasks.handler('', s.ctx);
   assert.equal(JSON.parse(s.requests[1][1].messages[0].content).question, 'What help is needed?');
   assert.equal(s.sent.length, 2);
-  s.select('Send task list to session'); await s.commands.tasks.handler('', s.ctx);
+  s.select(pickTask(1), 'Send this task to session'); await s.commands.tasks.handler('', s.ctx);
   assert.equal(s.sent.at(-1)[0].customType, 'tasks-list'); assert.equal(s.requests.length, 2);
-  s.select('Summarize tasks with AI'); s.inputs(undefined); await s.commands.tasks.handler('', s.ctx);
+  s.select(pickTask(1), 'Ask AI about this task… (extra model call)'); s.inputs(undefined); await s.commands.tasks.handler('', s.ctx);
   assert.equal(s.requests.length, 2, 'cancelled question does not call a model');
 });
 
@@ -1171,10 +1178,10 @@ test('clear completed confirms exact IDs and atomically retains open tasks and m
   await complete(s, 1); await complete(s, 3);
   const before = await list(s), beforeEntries = s.branch.length, beforeRequests = s.requests.length;
   s.ctx.ui.confirm = async (title, message) => { assert.equal(title, 'Clear completed tasks'); assert.match(message, /#1, #3/); return false; };
-  s.select('Clear completed tasks', 'Close'); await s.commands.tasks.handler('', s.ctx);
+  s.select('More actions…', 'Clear completed tasks', 'Back', 'Close'); await s.commands.tasks.handler('', s.ctx);
   assert.deepEqual(await list(s), before); assert.equal(s.branch.length, beforeEntries);
   s.ctx.ui.confirm = async (title, message) => { assert.equal(title, 'Clear completed tasks'); assert.match(message, /#1, #3/); return true; };
-  s.select('Clear completed tasks', 'Close'); await s.commands.tasks.handler('', s.ctx);
+  s.select('More actions…', 'Clear completed tasks', 'Back', 'Close'); await s.commands.tasks.handler('', s.ctx);
   const after = await list(s);
   assert.deepEqual(after.tasks.map(task => task.id), [2]); assert.equal(after.tasks[0].status, 'pending');
   assert.equal(after.nextId, 4); assert.deepEqual(s.branch.at(-1).data.remove, [1, 3]);
@@ -1188,7 +1195,7 @@ test('clear completed confirms exact IDs and atomically retains open tasks and m
 
   const stale = setup(); await add(stale, 'Done'); await add(stale, 'Not yet'); await complete(stale, 1);
   stale.ctx.ui.confirm = async () => { await complete(stale, 2); return true; };
-  stale.select('Clear completed tasks', 'Close'); await stale.commands.tasks.handler('', stale.ctx);
+  stale.select('More actions…', 'Clear completed tasks', 'Back', 'Close'); await stale.commands.tasks.handler('', stale.ctx);
   assert.deepEqual((await list(stale)).tasks.map(task => task.id), [1, 2]);
   assert.match(stale.notices.at(-1)[0], /Completed tasks changed/);
 
@@ -1197,7 +1204,7 @@ test('clear completed confirms exact IDs and atomically retains open tasks and m
   const snapshot = await list(failed), push = failed.branch.push;
   failed.branch.push = () => { throw new Error('Persistence failed'); };
   failed.ctx.ui.confirm = async () => true;
-  failed.select('Clear completed tasks', 'Close'); await failed.commands.tasks.handler('', failed.ctx);
+  failed.select('More actions…', 'Clear completed tasks', 'Back', 'Close'); await failed.commands.tasks.handler('', failed.ctx);
   failed.branch.push = push;
   assert.deepEqual(await list(failed), snapshot, 'failed append leaves all completed tasks intact');
   assert.match(failed.notices.at(-1)[0], /Persistence failed/);
@@ -1219,7 +1226,7 @@ test('/tasks-add prompts directly without opening the menu and preserves cancell
   await s.commands['tasks-add'].handler('', { ...s.ctx, mode: 'rpc' });
   assert.deepEqual(await list(s), before); assert.match(s.notices.at(-1)[0], /requires interactive/);
 
-  const paused = setup(); input(paused); paused.select('Pause reminders', 'Close'); await paused.commands.tasks.handler('', paused.ctx);
+  const paused = setup(); input(paused); paused.select('More actions…', 'Pause reminders', 'Back', 'Close'); await paused.commands.tasks.handler('', paused.ctx);
   paused.inputs('Paused task', '', ''); await paused.commands['tasks-add'].handler('', paused.ctx);
   assert.equal((await list(paused)).tasks[0].summary, 'Paused task'); assert.equal(paused.sent.length, 0);
 
@@ -1240,7 +1247,7 @@ test('menu n creates a task, q and Escape close, and focus defaults to progress 
   const s = setup(); await add(s, 'First'); await add(s, 'Second');
   await call(s, 'tasks_progress', { task_id: 2 });
   s.select({ key: 'q' }); await s.commands.tasks.handler('', s.ctx);
-  assert.match(s.focuses.at(-1), /^#2 /); assert.equal(s.sent.length, 0);
+  assert.match(s.focuses.at(-1), /^ ?#2 /); assert.equal(s.sent.length, 0);
   await call(s, 'tasks_progress', { task_id: 2, active: false });
   s.select({ key: 'q' }); await s.commands.tasks.handler('', s.ctx);
   assert.equal(s.focuses.at(-1), 'Add task');
@@ -1321,12 +1328,14 @@ test('real menu component navigates with arrows, selects with Enter and scopes s
   const component = taskMenuComponent('Tasks', choices, 1, { fg: (_color, value) => value }, value => results.push(value), () => redraws++);
   assert.equal(component.list.getSelectedItem().value, 'Two');
   component.handleInput('\x1b[B'); assert.equal(component.list.getSelectedItem().value, 'Three');
-  component.handleInput('\x1b[B'); assert.equal(component.list.getSelectedItem().value, 'One');
-  component.handleInput('\x1b[A'); assert.equal(component.list.getSelectedItem().value, 'Three');
+  component.handleInput('\x1b[B'); assert.equal(component.list.getSelectedItem().value, 'Three');
+  component.handleInput('\x1b[A'); assert.equal(component.list.getSelectedItem().value, 'Two');
+  component.handleInput('\x1b[B');
   component.handleInput('p'); assert.deepEqual(results.at(-1), { value: 'Three', key: 'p' });
   component.handleInput('\r'); assert.deepEqual(results.at(-1), { value: 'Three' });
-  component.handleInput('\x1b'); assert.deepEqual(results.at(-1), {});
-  assert.ok(component.render(40).some(row => row.includes('n new'))); assert.ok(redraws >= 3);
+  component.handleInput('\x1b'); assert.deepEqual(results.at(-1), { value: undefined });
+  component.handleInput('?');
+  assert.ok(component.render(80).join('\n').includes('keys')); assert.ok(redraws >= 3);
 });
 
 test('new user controls cannot cross session changes or publish after failed persistence', async () => {
@@ -1355,7 +1364,7 @@ test('criteria reopening preserves the open-task cap and rejected reopen leaves 
 
 test('task inspector also supports cancel and new-task shortcuts, with progress deletion absent', async () => {
   const s = setup(); await add(s); await call(s, 'tasks_progress', { task_id: 1 });
-  s.select(pickTask(1), choices => { assert.equal(choices.includes('Remove task'), false); assert.ok(choices.includes('Cancel task')); return { key: 'c' }; });
+  s.select(pickTask(1), choices => { assert.equal(choices.includes('Remove task'), false); assert.ok(choices.includes('Request stop…')); return { key: 'c' }; });
   await s.commands.tasks.handler('', s.ctx);
   assert.equal((await list(s)).tasks[0].status, 'pending'); assert.equal(s.sent.length, 1);
   s.inputs('From inspector', '', ''); s.select(pickTask(1), { key: 'n' }, { key: 'q' });
@@ -1372,10 +1381,10 @@ test('compact blocked preview keeps its reason separate, wraps at most two lines
   const render = width => s.widgets.at(-1)().render(width);
   const rows = render(40);
   assert.equal(rows.length, 5, 'header + blocked title + two reason lines + second task');
-  assert.match(rows[1], /^#1 \[blocked\]/); assert.doesNotMatch(rows[1], /Blocker:/);
-  assert.match(rows[2], /^ {4}Blocker: Review approval/);
+  assert.match(rows[1], /^ #1 \[blocked\]/); assert.doesNotMatch(rows[1], /Blocker:/);
+  assert.match(rows[2], /^ {5}Blocker: Review approval/);
   assert.ok(rows[3].startsWith('    ')); assert.ok(rows[3].endsWith('…'));
-  assert.match(rows[4], /^#2 /); assert.equal(rows.some(row => row.startsWith('#3 ')), false);
+  assert.match(rows[4], /^ ?#2 /); assert.equal(rows.some(row => row.startsWith('#3 ')), false);
   for (const width of [1, 5, 20, 80]) for (const row of render(width)) assert.ok(visibleWidth(row) <= width);
   assert.deepEqual(render(0), []);
   assert.equal((await list(s)).tasks[0].blocker, reason, 'full reason is stored, not display-truncated');
@@ -1387,7 +1396,7 @@ test('short compact blockers need no ellipsis or spare reason row', async () => 
   const s = setup([], { 'tasks-widget-single-line': true }); await add(s, 'Pending review');
   await call(s, 'tasks_block', { task_id: 1, reason: 'Waiting for review' });
   const rows = s.widgets.at(-1)().render(80);
-  assert.equal(rows.length, 3); assert.equal(rows[2], '    Blocker: Waiting for review');
+  assert.equal(rows.length, 3); assert.equal(rows[2], '     Blocker: Waiting for review');
 });
 
 test('counts-only metrics use effective question states and never expose task content', async () => {
@@ -1556,7 +1565,7 @@ test('missing provider after restore is visible; delayed provider-ready event re
 
 test('restore reconciles terminal jobs already registered before tasks and preserves paused reminders', async () => {
   const s = setup(); await add(s); const p = jobProvider(s, { 'job-1': observedJob() }); await blockOnJob(s);
-  input(s); s.select('Pause reminders', 'Close'); await s.commands.tasks.handler('', s.ctx);
+  input(s); s.select('More actions…', 'Pause reminders', 'Back', 'Close'); await s.commands.tasks.handler('', s.ctx);
   p.jobs.set('job-1', observedJob('succeeded'));
   s.handlers.session_start({}, s.ctx);
   assert.equal((await list(s)).tasks[0].status, 'pending'); assert.equal((await list(s)).paused, true);
@@ -2040,4 +2049,142 @@ test('persisted new blockers ring once, not edits, restores, failed persistence 
     assert.equal(count(), 2);
     s.handlers.session_shutdown({}, s.ctx);
   });
+});
+
+
+test('request stop discloses its boundary before confirmation and persists an honest marker', async () => {
+  const s = setup(); await add(s); await call(s, 'tasks_progress', { task_id: 1 });
+  s.ctx.ui.confirm = async (title, body) => {
+    assert.equal(title, 'Request stop?'); assert.match(body, /Running tools and external jobs may continue/);
+    return false;
+  };
+  s.select({ task: 1, key: 'c' }); await s.commands.tasks.handler('', s.ctx);
+  assert.equal((await list(s)).tasks[0].status, 'progress'); assert.equal(s.sent.length, 0);
+  s.ctx.ui.confirm = async () => true;
+  s.select({ task: 1, key: 'c' }); await s.commands.tasks.handler('', s.ctx);
+  assert.equal((await list(s)).tasks[0].stop_requested, true);
+  assert.match(JSON.stringify(s.widgets.at(-1)), /stop requested/);
+  const restored = setup(s.branch);
+  assert.equal((await list(restored)).tasks[0].stop_requested, true);
+  assert.equal(settle(restored), undefined, 'restoration must not resume a stopped task');
+  assert.match(taskListMarkdown((await list(restored)).tasks), /execution not confirmed stopped/);
+  restored.select(pickTask(1), 'Mark in progress', 'Close');
+  await restored.commands.tasks.handler('', restored.ctx);
+  assert.equal((await list(restored)).tasks[0].stop_requested, undefined);
+});
+
+
+test('Escape returns to the remembered task, q closes and diagnostics stay separate', async () => {
+  const s = setup(); await add(s, 'First'); await add(s, 'Second');
+  s.select(pickTask(2), undefined, { key: 'q' });
+  await s.commands.tasks.handler('', s.ctx);
+  assert.match(s.focuses.at(-1), /^ ?#2 /);
+  assert.equal(s.titles.length, 3, 'list, inspector, then list after Escape');
+  assert.doesNotMatch(s.titles[1], /Assessment:|Completed by:|Evidence:|Review:/);
+  assert.match(s.titles[1], /Acceptance:|Blocker:/);
+  s.select(pickTask(2), 'View diagnostics (read-only)', 'Close');
+  await s.commands.tasks.handler('', s.ctx);
+  assert.match(s.editors.at(-1)[1], /Assessment: none/);
+  assert.match(s.focuses.at(-1), /^ ?#2 /);
+  const before = s.titles.length;
+  s.select(pickTask(2), { key: 'q' }); await s.commands.tasks.handler('', s.ctx);
+  assert.equal(s.titles.length, before + 2, 'q exits directly from the inspector');
+});
+
+
+test('global task actions are grouped behind More actions and Escape returns to the root', async () => {
+  const s = setup(); await add(s);
+  s.select(choices => {
+    assert.deepEqual(choices.slice(1), ['Add task', 'More actions…', 'Close']);
+    return 'More actions…';
+  }, choices => {
+    assert.equal(choices.includes('Send task list to session'), false);
+    assert.equal(choices.includes('Summarize tasks with AI'), false);
+    assert.ok(choices.some(value => /reminders/.test(value)));
+    return undefined;
+  }, 'Close');
+  await s.commands.tasks.handler('', s.ctx);
+  assert.equal(s.titles.length, 3);
+  assert.match(s.titles[1], /reminder settings/);
+  assert.equal(s.sent.length, 0); assert.equal(s.requests.length, 0);
+});
+
+test('task list window shrinks for short terminals', () => {
+  const { taskMenuComponent } = createJiti(__filename)(path.resolve(__dirname, '../extensions/tasks.ts'));
+  const choices = Array.from({ length: 100 }, (_, i) => `Task ${i}`);
+  for (const rows of [8, 12, 24]) {
+    const component = taskMenuComponent('Tasks', choices, 50, { fg: (_color, value) => value }, () => {}, () => {}, rows);
+    assert.ok(component.render(80).length <= rows);
+  }
+});
+
+
+test('task-level send and AI help scope their task data to the selected task', async () => {
+  const s = setup(); await add(s, 'First'); await add(s, 'Second');
+  s.select(pickTask(2), 'Send this task to session'); await s.commands.tasks.handler('', s.ctx);
+  assert.deepEqual(s.sent.at(-1)[0].details.task_ids, [2]);
+  assert.match(s.sent.at(-1)[0].content, /Second/); assert.doesNotMatch(s.sent.at(-1)[0].content, /First/);
+  s.judge(async () => summaryResponse()); s.inputs('What is blocking this task?');
+  s.select(pickTask(2), 'Ask AI about this task… (extra model call)'); await s.commands.tasks.handler('', s.ctx);
+  const data = JSON.parse(s.requests.at(-1)[1].messages[0].content);
+  assert.deepEqual(data.tasks.map(task => task.id), [2]);
+  assert.deepEqual(s.sent.at(-1)[0].details.task_ids, [2]);
+  assert.equal((await list(s)).tasks.length, 2);
+});
+
+test('task mnemonics edit/send/ask AI directly from the selected task and m opens list controls', async () => {
+  const s = setup(); await add(s, 'First'); await add(s, 'Second');
+  s.select({ task: 2, key: 's' }); await s.commands.tasks.handler('', s.ctx);
+  assert.deepEqual(s.sent.at(-1)[0].details.task_ids, [2]);
+  s.judge(async () => summaryResponse()); s.inputs('Next step?');
+  s.select({ task: 2, key: 'a' }); await s.commands.tasks.handler('', s.ctx);
+  assert.deepEqual(s.sent.at(-1)[0].details.task_ids, [2]);
+  s.inputs('Edited second', 'New acceptance'); s.select({ task: 2, key: 'e' }, 'Close');
+  await s.commands.tasks.handler('', s.ctx);
+  assert.equal((await list(s)).tasks[1].summary, 'Edited second');
+  s.select({ key: 'm' }, 'Back', 'Close'); await s.commands.tasks.handler('', s.ctx);
+  assert.match(s.titles.at(-2), /List actions/);
+});
+
+
+test('an authorized tool-based restart clears the stop marker and restores actionable progress', async () => {
+  const s = setup(); await add(s); await call(s, 'tasks_progress', { task_id: 1 });
+  s.select({ task: 1, key: 'c' }); await s.commands.tasks.handler('', s.ctx);
+  const passive = s.handlers.context({ messages: [] }, s.ctx).messages.at(-1).content;
+  assert.match(passive, /Do not resume that task without user authorization/);
+  assert.match(passive, /tasks_progress\(task_id\) clears the marker/);
+  s.handlers.input({ source: 'interactive', text: 'Resume task 1' }, s.ctx);
+  await call(s, 'tasks_progress', { task_id: 1 });
+  const restarted = await list(s);
+  assert.equal(restarted.tasks[0].status, 'progress'); assert.equal(restarted.tasks[0].stop_requested, undefined);
+  assert.ok(settle(s), 'authorized restart restores automatic continuation eligibility');
+  const restored = setup(s.branch); assert.equal((await list(restored)).tasks[0].stop_requested, undefined);
+});
+
+test('task menus cannot bypass the shared cap through the native selector', async () => {
+  const s = setup(); await add(s, 'Long task '.repeat(40));
+  s.ctx.ui.select = async () => { throw Error('Unbounded menu bypass'); };
+  const custom = s.ctx.ui.custom; let frames = 0;
+  s.ctx.ui.custom = factory => custom((tui, theme, keys, done) => {
+    tui.terminal.rows = 8;
+    const view = factory(tui, theme, keys, done);
+    for (const width of [20, 40, 80]) assert.ok(view.render(width).length <= 4);
+    frames++; return view;
+  });
+  s.select(pickTask(1), 'Back', 'More actions…', 'Back', 'Close');
+  await s.commands.tasks.handler('', s.ctx);
+  assert.ok(frames >= 4);
+});
+
+test('actual task menu keeps every status color while the HUD retains its existing styling', async () => {
+  const { stripVTControlCharacters } = require('node:util');
+  const s = setup();
+  s.ctx.ui.theme.fg = (role, value) => `\x1b[${({ accent: 36, mdLink: 34, warning: 33, success: 32, dim: 90 })[role] ?? 37}m${value}\x1b[0m`;
+  await add(s, 'Pending'); await add(s, 'Running'); await add(s, 'Blocked'); await add(s, 'Done');
+  await call(s, 'tasks_progress', { task_id: 2 }); await call(s, 'tasks_block', { task_id: 3, reason: 'Needs input' }); await complete(s, 4);
+  s.select('Close'); await s.commands.tasks.handler('', s.ctx);
+  const menu = s.titles.at(-1);
+  for (const [sgr, status] of [[36, 'pending'], [34, 'progress'], [33, 'blocked'], [32, 'complete']]) assert.ok(menu.includes(`\x1b[${sgr}m[${status}]\x1b[0m`), status);
+  assert.equal(/\[\d+m/.test(stripVTControlCharacters(menu)), false, 'no visible SGR debris');
+  assert.ok(s.widgets.at(-1).join('\n').includes('\x1b[34m[progress]\x1b[0m'), 'existing HUD color preserved');
 });

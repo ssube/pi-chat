@@ -54,3 +54,21 @@ second completion wake. Missing providers, pruned records or mismatched units
 remain blocked for explicit recovery. See [dependency semantics](tasks.md#optional-background-job-dependencies).
 
 Terminal notifications ring once in TUI/TTY only; see [attention bells](attention-bells.md).
+
+### Menu keyboard and bounded detail view
+
+`/jobs` uses the shared bounded extension menu. Configured up/down and confirm
+select; configured cancel returns one level; `q` closes the whole menu; `?`
+shows actual configured keys and actions. Page bindings scroll details, or page
+through the list when no details are open. In job details `s` explicitly steers a
+bounded log tail and `c` requests cancellation of a safe active local job after
+confirmation. Remote jobs are not cancelled. Full bounded details/log tails
+scroll independently from the actions. Outside TUI a warning is sent through the
+available UI protocol (RPC clients receive it; print/JSON no-op UI does not).
+
+
+Job states use theme colors while retaining visible text. CPU usage is displayed
+as accumulated CPU time (ms/s/min/h), not utilization percent; memory uses
+B/KiB/MiB/GiB/etc. Missing/invalid counters stay unavailable rather than zero.
+The tool JSON retains raw values. These presentation changes do not alter local
+job authorization, cancellation or lifecycle behavior.

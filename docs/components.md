@@ -59,3 +59,14 @@ as reply fallbacks. A rejected provider sign-in produces an actionable generic
 notice without retaining its diagnostic text. An authoritative pass marker still
 suppresses a duplicate final after a chat-tool reply, including preserved tool
 narration; new direct requests retain their own reply opportunity.
+
+
+## Interactive menu controls
+
+The task, job, question and shell-suggestion menus share bounded navigation,
+independent detail scrolling, configured Pi keys, `q` close and `?` key help.
+Status labels retain colors and text. These are TUI-only views; headless tools
+keep their existing data and authorization contracts. Task-scoped send/AI-help
+menu actions do not change the existing list-wide slash commands. Requesting a
+task stop does not terminate already-running tools or external jobs. See
+[tasks](tasks.md) and [background jobs](background-jobs.md).

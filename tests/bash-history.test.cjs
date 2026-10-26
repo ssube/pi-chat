@@ -13,7 +13,10 @@ function setup(branch = []) {
   const ui = {
     addAutocompleteProvider(fn) { factory = fn; },
     notify(message) { notices.push(message); },
-    select: async (_title, choices) => selection === undefined ? choices[0] : selection,
+    custom: async factory => {
+      const view = factory({ terminal: { rows: 24 }, requestRender() {} }, {}, {}, () => {});
+      return selection === undefined ? view.choices[0] : selection;
+    },
     confirm: async (...args) => approve(...args),
     getEditorText: () => draft,
     setEditorText(text) { draft = text; inserts.push(text); },
@@ -191,4 +194,18 @@ test('cancelled, failed, stale, or racing command never triggers a turn', async 
   s.branch.push({ type: 'message', id: 'other', parentId: 'different', message: { role: 'bashExecution', command: 'echo race', cancelled: false } });
   await new Promise(setImmediate);
   assert.deepEqual(s.sent, []);
+});
+
+test('shell suggestion menu cannot bypass the shared cap or execute on selection', async () => {
+  const s = setup();
+  for (let i = 0; i < 20; i++) await s.tools.suggest_shell_command.execute('test', { command: `printf '${i} ${'long '.repeat(50)}'`, reason: 'Reason '.repeat(40) });
+  s.ctx.ui.select = async () => { throw Error('Unbounded menu bypass'); };
+  let frames = 0;
+  s.ctx.ui.custom = async factory => {
+    const view = factory({ terminal: { rows: 8 }, requestRender() {} }, {}, {}, () => {});
+    for (const width of [20, 40, 80]) assert.ok(view.render(width).length <= 4);
+    frames++; return undefined;
+  };
+  await s.commands['shell-suggestions'].handler('', s.ctx);
+  assert.equal(frames, 1); assert.equal(s.inserts.length, 0); assert.equal(s.sent.length, 0);
 });
